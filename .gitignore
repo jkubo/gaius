@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+
+# Local/private artifacts — never ship operator-specific data in the public repo.
+# drift-facts.yaml maps canonical config values to your own repo's doc files;
+# the eval archive holds real corpus fact IDs. Both are deployment-specific.
+drift-facts.yaml
+*.jsonl.archive
+benchmarks/eval_set.jsonl*
+.pytest_cache/

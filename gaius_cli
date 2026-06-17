@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""gaius CLI entry point.
+
+Install: install -m 755 /path/to/gaius/gaius_cli ~/.local/bin/gaius
+Or:      pip install gaius-memory  (installs 'gaius' command directly)
+"""
+import sys
+import os
+
+# If gaius package isn't installed, find it via:
+#  1. GAIUS_SRC env var (e.g. export GAIUS_SRC=~/src/gaius)
+#  2. gaius_src in ~/.gaius/config.yaml
+#  3. Relative to this script (works when run directly from the repo, not installed)
+try:
+    import gaius  # noqa: F401
+except ImportError:
+    _src = None
+    # Env var
+    if os.environ.get("GAIUS_SRC"):
+        _src = os.path.expanduser(os.environ["GAIUS_SRC"])
+    # Config file
+    if not _src:
+        try:
+            import yaml as _yaml
+            _cfg_path = os.path.expanduser("~/.gaius/config.yaml")
+            if os.path.exists(_cfg_path):
+                with open(_cfg_path) as _f:
+                    _cfg = _yaml.safe_load(_f) or {}
+                _src = _cfg.get("gaius_src")
+                if _src:
+                    _src = os.path.expanduser(_src)
+        except Exception:
+            pass
+    # Relative to script file (dev: run directly from repo)
+    if not _src:
+        _script_dir = os.path.dirname(os.path.abspath(__file__))
+        for _candidate in [_script_dir, os.path.join(_script_dir, "..")]:
+            if os.path.isdir(os.path.join(_candidate, "gaius")):
+                _src = _candidate
+                break
+    if _src:
+        sys.path.insert(0, _src)
+
+from gaius._core import main
+main()

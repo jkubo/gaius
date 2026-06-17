@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""mnemosyne - Memory file health and maintenance tool.
+
+Usage:
+  mnemosyne [--memory-dir DIR] <command> [args]
+
+Options:
+  --memory-dir DIR  Path to memory root
+                    (env: MNEMOSYNE_MEMORY_DIR, default: ~/.gaius/memory)
+
+Commands:
+  health           Line counts and threshold status for all memory files (domain/, skills/)
+  audit            Scan common.md for entries that belong in domain files
+  split <file>     Propose a split plan for an oversized file (never auto-executes)
+  prune <file>     Identify redundant or stale entries (never auto-deletes)
+"""
+
+import argparse
+import os
+import re
+import sys
+from pathlib import Path
+
+# ── Configuration ────────────────────────────────────────────────────────────
+
+def _default_memory_dir() -> Path:
+    # Priority: env var > gaius config > ~/.gaius/memory
+    if os.environ.get("MNEMOSYNE_MEMORY_DIR"):
+        return Path(os.environ["MNEMOSYNE_MEMORY_DIR"])
+    cfg = Path.home() / ".gaius" / "config.yaml"
+    if cfg.exists():
+        try:
+            import yaml
+            data = yaml.safe_load(cfg.read_text()) or {}
+            p = data.get("mnemosyne", {}).get("memory_dir")
+            if p:
+                return Path(p).expanduser()
+        except Exception:
+            pass
+    return Path.home() / ".gaius" / "memory"
+
+DEFAULT_MEMORY_DIR = _default_memory_dir()
+
+# Thresholds — (warn, error) line counts per file category.
+# GREEN: below warn. YELLOW: warn ≤ lines < error. RED: lines ≥ error.
+THRESHOLDS = {
+    "MEMORY.md":  (180, 200),
+    "common.md":  (80,  100),
+    "domain":     (150, 200),   # applies to all domain/*.md
+    "skills":     (300, 500),   # skills/*.md — longer than domain (no gotchas), shorter than other
+    "other":      (400, 600),   # host-layer topic files (narrative/deep-ref, OK to be long)
+}
+
+# Domain keyword map — used by `audit` to flag common.md entries.
+# key = domain file stem, value = keywords that signal domain-specific content.
+# Loaded from ~/.gaius/config.yaml [mnemosyne.audit_keywords] if present;
+# otherwise uses generic infra/ops defaults below.
+def _load_domain_keywords() -> dict:
+    # Respect GAIUS_CONFIG env var so tests can override with /dev/null
+    cfg_env = os.environ.get("GAIUS_CONFIG")
+    cfg = Path(cfg_env) if cfg_env else (Path.home() / ".gaius" / "config.yaml")
+    if cfg.exists() and cfg != Path("/dev/null"):
+        try:
+            import yaml
+            data = yaml.safe_load(cfg.read_text()) or {}
+            kw = data.get("mnemosyne", {}).get("audit_keywords")
+            if kw and isinstance(kw, dict):
+                return kw
+        except Exception:
+            pass
+    return {
+        "storage":       ["drbd", "pvc", "storageclass", "nfs", "nvme", "sata", "blob",
+                          "minio", "s3", "volume", "persistent"],
+        "networking":    ["flannel", "cilium", "wireguard", "vxlan", "mtu", "cidr", "ingress",
+                          "dns", "cors", "traefik", "http2", "loadbalancer", "tunnel"],
+        "services":      ["helm", "oidc", "oauth2", "cert-manager", "ingress-controller"],
+        "security":      ["vault", "secret", "tls", "cert", "rbac", "token",
+                          "kubeconfig", "credential"],
+        "gitops":        ["flux", "helmrelease", "kustomization", "gitops", "reconcile", "ci/cd"],
+        "observability": ["alert", "metric", "dashboard", "prometheus", "grafana", "loki", "otel"],
+    }
+
+DOMAIN_KEYWORDS = _load_domain_keywords()
+
+# ANSI colors
+GREEN  = "\033[32m"
+YELLOW = "\033[33m"
+RED    = "\033[31m"
+BOLD   = "\033[1m"
+RESET  = "\033[0m"
+
+
+def color_status(lines: int, warn: int, error: int) -> str:
+    if lines >= error:
+        return f"{RED}{BOLD}RED{RESET}"
+    elif lines >= warn:
+        return f"{YELLOW}YELLOW{RESET}"
+    else:
+        return f"{GREEN}GREEN{RESET}"
+
+
+def count_lines(path: Path) -> int:
+    try:
+        return sum(1 for _ in path.open())
+    except Exception:
+        return -1
+
+
+# ── Commands ─────────────────────────────────────────────────────────────────
+
+def cmd_health(memory_dir: Path, args: list):
+    """Print line counts and health status for all memory files."""
+    files = []
+
+    # Named files in root
+    for name in ["MEMORY.md", "common.md"]:
+        p = memory_dir / name
+        if p.exists():
+            warn, error = THRESHOLDS[name]
+            files.append((str(p.relative_to(memory_dir)), count_lines(p), warn, error))
+
+    # Other root-level .md files (not MEMORY.md/common.md/RULES.md)
+    skip_root = {"MEMORY.md", "common.md", "RULES.md"}
+    for p in sorted(memory_dir.glob("*.md")):
+        if p.name not in skip_root:
+            warn, error = THRESHOLDS["other"]
+            files.append((p.name, count_lines(p), warn, error))
+
+    # Domain files
+    domain_dir = memory_dir / "domain"
+    if domain_dir.is_dir():
+        for p in sorted(domain_dir.glob("*.md")):
+            warn, error = THRESHOLDS["domain"]
+            files.append((f"domain/{p.name}", count_lines(p), warn, error))
+
+    # Skills files
+    skills_dir = memory_dir / "skills"
+    if skills_dir.is_dir():
+        for p in sorted(skills_dir.glob("*.md")):
+            warn, error = THRESHOLDS["skills"]
+            files.append((f"skills/{p.name}", count_lines(p), warn, error))
+
+    # Print table
+    col_file  = max(len(r[0]) for r in files) + 2
+    col_lines = 7
+    print(f"\n{'File':<{col_file}} {'Lines':>{col_lines}}  Threshold   Status")
+    print("─" * (col_file + col_lines + 22))
+    for fname, lines, warn, error in files:
+        status = color_status(lines, warn, error)
+        thresh = f"warn={warn}/err={error}"
+        print(f"{fname:<{col_file}} {lines:>{col_lines}}  {thresh:<14} {status}")
+
+    print()
+
+    # Summary
+    reds    = [r for r in files if r[1] >= r[3]]
+    yellows = [r for r in files if r[2] <= r[1] < r[3]]
+    if reds:
+        print(f"{RED}{BOLD}⚠  {len(reds)} file(s) over limit:{RESET} "
+              + ", ".join(r[0] for r in reds))
+    if yellows:
+        print(f"{YELLOW}⚡  {len(yellows)} file(s) approaching limit:{RESET} "
+              + ", ".join(r[0] for r in yellows))
+    if not reds and not yellows:
+        print(f"{GREEN}✓  All files within threshold.{RESET}")
+    print()
+
+
+def cmd_audit(memory_dir: Path, args: list):
+    """Scan common.md for entries that belong in domain files instead."""
+    common = memory_dir / "common.md"
+    if not common.exists():
+        print(f"ERROR: {common} not found", file=sys.stderr)
+        sys.exit(1)
+
+    lines = common.read_text().splitlines()
+    findings = []  # list of (line_num, line_text, suggested_domain)
+
+    for i, line in enumerate(lines, 1):
+        stripped = line.strip()
+        # Only check bullet-point lines (agents write bullet facts)
+        if not stripped.startswith("-") and not stripped.startswith("*"):
+            continue
+        lower = stripped.lower()
+        matches = []
+        for domain, keywords in DOMAIN_KEYWORDS.items():
+            for kw in keywords:
+                if kw.lower() in lower:
+                    matches.append(domain)
+                    break
+        # Only flag if matched and the content seems too specific for common.md
+        # (common.md is for cross-cutting hard rules; domain-specific gotchas belong elsewhere)
+        if matches:
+            # Skip if line is a universal hard rule (never, always, all agents)
+            is_universal = any(w in lower for w in ["never", "always", "all agents", "hard rule"])
+            if not is_universal:
+                findings.append((i, stripped[:100], matches[0]))
+
+    if not findings:
+        print(f"{GREEN}✓  No domain-specific entries found in common.md.{RESET}")
+        return
+
+    print(f"\n{YELLOW}⚡  {len(findings)} entries in common.md may belong in domain files:{RESET}\n")
+    by_domain: dict[str, list] = {}
+    for lineno, text, domain in findings:
+        by_domain.setdefault(domain, []).append((lineno, text))
+
+    for domain in sorted(by_domain):
+        print(f"  → {BOLD}domain/{domain}.md{RESET}")
+        for lineno, text in by_domain[domain]:
+            print(f"     line {lineno:3d}: {text[:90]}")
+        print()
+
+    print("These are suggestions only. Review before moving.\n")
+
+
+def cmd_split(memory_dir: Path, args: list):
+    """Propose a split plan for an oversized file. Never auto-executes."""
+    if not args:
+        print("Usage: mnemosyne split <file>", file=sys.stderr)
+        sys.exit(1)
+
+    target = Path(args[0])
+    if not target.is_absolute():
+        target = memory_dir / args[0]
+    if not target.exists():
+        print(f"ERROR: {target} not found", file=sys.stderr)
+        sys.exit(1)
+
+    lines = target.read_text().splitlines()
+    total = len(lines)
+    print(f"\n{BOLD}Split proposal for {target.name}{RESET} ({total} lines)\n")
+
+    # Parse sections by H2 (##) headers
+    sections = []  # list of (header_text, start_line, line_count)
+    current_header = "(preamble)"
+    current_start = 1
+    current_lines = 0
+
+    for i, line in enumerate(lines, 1):
+        if line.startswith("## "):
+            if current_lines > 0:
+                sections.append((current_header, current_start, current_lines))
+            current_header = line[3:].strip()
+            current_start = i
+            current_lines = 1
+        else:
+            current_lines += 1
+
+    if current_lines > 0:
+        sections.append((current_header, current_start, current_lines))
+
+    # Print section breakdown
+    col_h = max(len(s[0]) for s in sections) + 2
+    print(f"  {'Section':<{col_h}} {'Lines':>6}  {'Start':>6}")
+    print("  " + "─" * (col_h + 16))
+    for header, start, count in sections:
+        flag = f"  {YELLOW}←{RESET}" if count > 30 else ""
+        print(f"  {header:<{col_h}} {count:>6}  {start:>6}{flag}")
+
+    print()
+
+    # Identify move candidates (sections > 30 lines that look like gotcha/troubleshooting content)
+    TROUBLESHOOTING_MARKERS = [
+        "gotcha", "issue", "fix", "debug", "troubleshoot", "problem", "error",
+        "broken", "caveat", "warning", "boot", "race", "drift", "leak"
+    ]
+    TOPIC_FILE_MARKERS = {
+        "storage":      ["storage", "drbd", "pvc", "s3", "volume"],
+        "networking":   ["network", "flannel", "cilium", "dns", "tunnel", "ingress"],
+        "observability":["observ", "metric", "alert", "grafana", "loki"],
+        "services":     ["service", "oauth", "helm", "cert"],
+    }
+
+    candidates = []
+    for header, start, count in sections:
+        if count < 15:
+            continue
+        lower = header.lower()
+        # Check if section looks like troubleshooting content
+        if any(m in lower for m in TROUBLESHOOTING_MARKERS):
+            candidates.append((header, start, count, "troubleshooting.md"))
+            continue
+        # Check topic file matches
+        for topic, markers in TOPIC_FILE_MARKERS.items():
+            if any(m in lower for m in markers):
+                candidates.append((header, start, count, f"{topic}.md"))
+                break
+
+    if candidates:
+        print(f"{YELLOW}Suggested moves (lines {total} → target <{int(total*0.6)}):{RESET}\n")
+        saved = 0
+        for header, start, count, dest in candidates:
+            print(f"  Move '{header}' ({count} lines, starts at {start}) → {dest}")
+            saved += count
+        remaining = total - saved
+        print(f"\n  After moves: ~{remaining} lines remaining in {target.name}")
+        if remaining <= 180:
+            print(f"  {GREEN}✓ Would bring file within threshold.{RESET}")
+        else:
+            print(f"  {YELLOW}⚡ Still over warn threshold — consider further consolidation.{RESET}")
+    else:
+        print(f"{YELLOW}No obvious split candidates found. Review sections manually.{RESET}")
+
+    print(f"\n{BOLD}This is a proposal only.{RESET} Apply changes manually.\n")
+
+
+def cmd_prune(memory_dir: Path, args: list):
+    """Identify redundant or stale entries in a memory file. Never auto-deletes."""
+    if not args:
+        print("Usage: mnemosyne prune <file>", file=sys.stderr)
+        sys.exit(1)
+
+    target = Path(args[0])
+    if not target.is_absolute():
+        target = memory_dir / args[0]
+    if not target.exists():
+        print(f"ERROR: {target} not found", file=sys.stderr)
+        sys.exit(1)
+
+    lines = target.read_text().splitlines()
+    total = len(lines)
+    findings = []
+
+    # Patterns that signal stale or speculative content
+    STALE_PATTERNS = [
+        (r"\bpending\b",               "pending implementation"),
+        (r"\bnot yet (built|implemented|functional|wired)\b", "unbuilt feature"),
+        (r"\bdeferred\b",              "deferred item"),
+        (r"\bfuture\b",                "future/speculative"),
+        (r"\bdesign intent\b",         "design intent (not reality)"),
+        (r"\bTODO\b",                  "TODO marker"),
+        (r"\bWIP\b",                   "work in progress"),
+        (r"\btemporary\b",             "marked temporary"),
+        (r"#\d{1,3}\b.*\bpending\b",   "open issue (pending)"),
+        (r"\bfixed\b.*\b20\d\d-\d\d-\d\d\b", "dated fix (verify still relevant)"),
+    ]
+
+    # Duplicate detection — track H2 section headers
+    seen_headers = {}
+    current_section = None
+    seen_bullet_keys = {}
+
+    for i, line in enumerate(lines, 1):
+        stripped = line.strip()
+
+        # Track section headers for duplicate detection
+        if line.startswith("## "):
+            header = line[3:].strip()
+            if header in seen_headers:
+                findings.append((i, line.strip(), f"duplicate section header (first at line {seen_headers[header]})"))
+            seen_headers[header] = i
+            current_section = header
+            continue
+
+        # Check stale patterns
+        lower = stripped.lower()
+        for pattern, label in STALE_PATTERNS:
+            if re.search(pattern, lower):
+                findings.append((i, stripped[:100], label))
+                break
+
+        # Track bullet keys for rough duplicate detection (first 6 words as key)
+        if stripped.startswith("-") or stripped.startswith("*"):
+            words = lower.split()[:6]
+            key = " ".join(words)
+            if key in seen_bullet_keys and key not in {"- **", "- use", "- never", "- all"}:
+                findings.append((i, stripped[:100],
+                                  f"possible duplicate of line {seen_bullet_keys[key]}"))
+            else:
+                seen_bullet_keys[key] = i
+
+    if not findings:
+        print(f"\n{GREEN}✓  No obvious stale or redundant entries found in {target.name}.{RESET}\n")
+        return
+
+    print(f"\n{YELLOW}⚡  {len(findings)} candidate(s) for pruning in {target.name}:{RESET}\n")
+    for lineno, text, reason in findings:
+        print(f"  line {lineno:4d}: [{reason}]")
+        print(f"           {text[:95]}")
+        print()
+
+    print(f"{BOLD}This is a proposal only.{RESET} Review each entry before removing.\n")
+
+
+# ── Dispatch ─────────────────────────────────────────────────────────────────
+
+COMMANDS = {
+    "health": cmd_health,
+    "audit":  cmd_audit,
+    "split":  cmd_split,
+    "prune":  cmd_prune,
+}
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Memory file health and maintenance",
+        usage="mnemosyne [--memory-dir DIR] <command> [args]",
+    )
+    parser.add_argument("--memory-dir", type=str, default=None,
+                        help="Override memory root directory (env: MNEMOSYNE_MEMORY_DIR)")
+    parser.add_argument("command", choices=list(COMMANDS.keys()),
+                        help="Command to run")
+    parser.add_argument("args", nargs="*", help="Command arguments")
+
+    parsed = parser.parse_args()
+
+    # Resolve memory dir: flag > env > default
+    memory_dir = DEFAULT_MEMORY_DIR
+    if parsed.memory_dir:
+        memory_dir = Path(parsed.memory_dir)
+    elif os.environ.get("MNEMOSYNE_MEMORY_DIR"):
+        memory_dir = Path(os.environ["MNEMOSYNE_MEMORY_DIR"])
+
+    if not memory_dir.is_dir():
+        print(f"ERROR: memory directory not found: {memory_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    COMMANDS[parsed.command](memory_dir, parsed.args)
+
+
+if __name__ == "__main__":
+    main()

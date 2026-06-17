@@ -1,0 +1,51 @@
+# gaius preset: default
+# ─────────────────────────────────────────────────────────────────────────────
+# Minimal config for any software project — no K8s-specific patterns.
+# Copy to ~/.gaius/config.yaml and customize.
+#
+# Usage:
+#   cp presets/default.yaml ~/.gaius/config.yaml
+#   # then edit for your project
+
+operator:
+  name: operator          # your name/handle (shown in stats output)
+
+# Claude Code project directory containing session JSONLs.
+sessions_dir: ~/.claude/projects
+
+# Domain directory — your memory files (domain/*.md)
+# domain_dir: ~/my-project/memory/domain
+
+# Skills directory — prospective how-to guides
+# skills_dir: ~/my-project/memory/skills
+
+# ── Principals ────────────────────────────────────────────────────────────────
+principals:
+  default: operator
+
+  # Session format per agent (claude | gemini | ollama | pentagi)
+  # formats:
+  #   my-gemini-agent: gemini
+
+  # Principal groupings for cross-agent corroboration score boost (1.5x)
+  # mapping:
+  #   my-claude-agent: operator
+  #   my-gemini-agent: researcher
+
+# ── Entity Extraction ─────────────────────────────────────────────────────────
+entities:
+  preset: none    # disable built-in K8s patterns for non-K8s projects
+
+  # Add your project-specific entities here.
+  patterns:
+    # Example: match your services
+    # service: '\b(?:api-server|worker|scheduler)\b'
+
+    # Example: match your environments
+    # namespace: '\b(?:prod|staging|dev|test)\b'
+
+# ── Domain Keywords ───────────────────────────────────────────────────────────
+# domain_keywords:
+#   my-domain:
+#     - keyword1
+#     - keyword2

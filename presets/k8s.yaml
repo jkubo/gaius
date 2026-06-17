@@ -1,0 +1,115 @@
+# gaius preset: k8s
+# ─────────────────────────────────────────────────────────────────────────────
+# Entity extraction patterns and agent mappings for a typical K8s cluster.
+# Copy relevant sections into ~/.gaius/config.yaml and customize.
+#
+# Usage:
+#   cp presets/k8s.yaml ~/.gaius/config.yaml
+#   # then edit for your cluster
+
+operator:
+  name: operator          # your name/handle (shown in stats output)
+
+# Claude Code project directory containing session JSONLs.
+# Set to your specific project dir for faster scanning, or leave as
+# ~/.claude/projects to auto-discover all projects.
+sessions_dir: ~/.claude/projects
+
+# Domain directory — your memory files (domain/*.md, troubleshooting/*.md)
+# domain_dir: ~/Projects/my-memory/domain
+
+# Skills directory — prospective how-to guides
+# skills_dir: ~/Projects/my-memory/skills
+
+# ── Principals ────────────────────────────────────────────────────────────────
+# Map agent names → logical groups for scoring and corpus weighting.
+# Unknown agents default to the "default" principal.
+principals:
+  default: operator
+
+  # Session format per agent (claude | gemini | ollama | pentagi)
+  # Only needed for non-Claude agents — content detection handles most cases.
+  formats:
+    # gemini-agent: gemini
+    # my-ollama-agent: ollama
+
+  # Principal groupings — agents sharing a group get cross-agent score boost (1.5x)
+  # when confirming the same fact.
+  mapping:
+    # my-claude-agent: operator
+    # my-gemini-agent: researcher
+
+  # Per-agent size thresholds (bytes) for session inclusion
+  # thresholds:
+  #   researcher: 10485760   # 10MB for long research sessions
+  #   default: 2097152       # 2MB default
+
+# ── Entity Extraction ─────────────────────────────────────────────────────────
+# Regex patterns for KG entity extraction. Merged with built-in baseline.
+# Set preset: none to disable built-ins entirely and use only custom patterns.
+entities:
+  preset: k8s   # use built-in K8s baseline patterns
+
+  # Add your cluster-specific services, namespaces, and models here.
+  patterns:
+    # Example: match your node naming scheme
+    # node: '\bprod-[\w]+-node-\d+\b'
+
+    # Example: match your cluster services
+    # service: '\b(?:my-api|my-worker|my-scheduler)\b'
+
+    # Example: match your namespaces
+    # namespace: '\b(?:prod|staging|dev|data-pipeline)\b'
+
+    # Example: match your AI models
+    # model: '\b(?:my-model-7b|my-model-70b)\b'
+
+    # Example: match your agent names (for cross-agent corroboration)
+    # agent: '\b(?:my-claude-agent|my-gemini-agent)\b'
+
+# ── Domain Keywords ───────────────────────────────────────────────────────────
+# Domain routing for facts. Built-in domains: networking, security, storage,
+# services, observability, gitops, quality.
+# Add custom domains here — any domain/*.md file is auto-discovered.
+# domain_keywords:
+#   my-domain:
+#     - keyword1
+#     - keyword2
+
+# ── Skill Aliases ─────────────────────────────────────────────────────────────
+# Map common task/topic words → the canonical skill name they should match when
+# injecting session handoffs. Ships empty.
+# skill_aliases:
+#   storage: linstor-drbd
+#   drbd: linstor-drbd
+#   networking: cluster-networking
+
+# ── Skill → Domain Boost Map ──────────────────────────────────────────────────
+# When a task mentions one of these skill keywords, boost facts from the listed
+# domains during inject. Merged onto generic defaults.
+# skill_domain_map:
+#   my-skill: ["storage", "networking"]
+
+# ── Internal Agents ───────────────────────────────────────────────────────────
+# Agent names whose sessions are EXCLUDED from extraction (e.g. noisy bots).
+# Ships empty (mine everything). Matching is case-insensitive and ignores a
+# trailing '-agent' suffix.
+# internal_agents:
+#   - my-noisy-bot
+#   - another-automation
+
+# ── Handoffs ──────────────────────────────────────────────────────────────────
+# Directory of session handoff notes (*.md) injected at task start (<48h old).
+# Default: ~/.gaius/handoffs
+# handoffs_dir: ~/.gaius/handoffs
+
+# ── Council / Agent Orchestrator ─────────────────────────────────────────────
+# Required for `gaius sync-council` and `gaius sync-alerts`.
+# council:
+#   base_url: https://my-orchestrator.example.com
+#   api_key: my-api-key
+
+# ── S3 / rclone (for gaius s3-retire) ────────────────────────────────────────
+# s3:
+#   remote: my-rclone-remote   # rclone remote name (configured in ~/.config/rclone/rclone.conf)
+#   prefix: sessions            # bucket/path prefix

@@ -64,7 +64,7 @@ Storage: sqlite-vec (384-dim, all-MiniLM-L6-v2) + BM25 in a single SQLite file. 
 
 ```bash
 # Option 1: development install (editable, reads from repo)
-git clone https://github.com/kub0-ai/gaius
+git clone https://github.com/jkubo/gaius
 cd gaius
 pip install -e ".[semantic]"   # includes sentence-transformers + sqlite-vec
 
@@ -75,15 +75,11 @@ install -m 755 gaius_cli ~/.local/bin/gaius
 ### Initialize
 
 ```bash
-# Create config dir
-mkdir -p ~/.gaius
+# Guided first-run setup: creates ~/.gaius/config.yaml and memory dirs
+gaius init
 
-# Copy example config
-cp presets/k8s.yaml ~/.gaius/config.yaml   # for K8s clusters
-# or: cp presets/default.yaml ~/.gaius/config.yaml
-
-# Edit to set your sessions_dir and domain_dir
-$EDITOR ~/.gaius/config.yaml
+# Or copy a preset manually:
+# cp presets/k8s.yaml ~/.gaius/config.yaml && $EDITOR ~/.gaius/config.yaml
 ```
 
 ### First Run
@@ -179,23 +175,29 @@ See `presets/k8s.yaml` for a full annotated example.
 
 | Command | Description |
 |---------|-------------|
-| `gaius retire` | Scan local sessions → stage new summaries (Claude/Gemini/vLLM) |
-| `gaius record` | Capture chat sessions into gaius JSONL (vLLM, any OpenAI-compatible endpoint) |
-| `gaius s3-retire <agent>` | Retire from S3-archived agent sessions (rclone) |
+| `gaius init` | Guided first-run setup (config + memory dirs) |
+| `gaius retire` | Scan local sessions and stage new summaries (Claude/Gemini/vLLM) |
+| `gaius record` | Capture chat sessions into gaius JSONL (any OpenAI-compatible endpoint) |
+| `gaius s3-retire` | Retire from S3-archived sessions (rclone) |
 | `gaius harvest` | Scan cold Gemini CLI sessions (`.json` format) |
-| `gaius next` | Print oldest unreviewed summary |
-| `gaius batch` | Print all unreviewed summaries in sequence |
-| `gaius done <uuid>` | Mark summary as reviewed |
-| `gaius show` | List all staged summaries |
+| `gaius batch` / `next` / `show` | Review staged summaries |
+| `gaius done` / `confirm` / `reject` / `defer` `<uuid>` | Advance a summary through review |
 | `gaius stats` | Extraction and corpus statistics |
-| `gaius inject` | Inject ranked corpus + skills into active session |
-| `gaius kg query <entity>` | Query knowledge graph for an entity |
-| `gaius kg timeline <entity>` | Show temporal changes for an entity |
-| `gaius governor` | Cross-agent knowledge gap analysis |
-| `gaius embed` | Build/rebuild semantic embedding index |
-| `gaius index` | Rebuild memory index |
-| `gaius landscape` | Show memory system landscape |
-| `gaius skills` | List available skills with scores |
+| `gaius inject` | Inject ranked corpus, skills, and recent handoffs into the session |
+| `gaius kg query` / `kg timeline` `<entity>` | Query or time-line the knowledge graph |
+| `gaius embed` / `index` | Build embeddings / rebuild the index |
+| `gaius decay` / `rescore` | Time-decay or recompute fact scores |
+| `gaius suggest` | Surface skill candidates from fact domains |
+| `gaius snapshot` | Maturity + readiness snapshot (JSON) |
+| `gaius governor` | Cross-agent knowledge-gap analysis |
+| `gaius skills` / `landscape` | List skills / show the memory landscape |
+
+Run `gaius --help` for the full list, including optional integrations.
+
+**Session handoffs:** `gaius inject` also surfaces recent handoff notes — any `*.md` file
+under `handoffs_dir` (configurable in `~/.gaius/config.yaml`, ships empty) less than 48h
+old is injected ahead of memory files. Write them with your own tooling, or just drop
+Markdown files into that directory.
 
 ---
 

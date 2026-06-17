@@ -40,8 +40,8 @@ all = [
 gaius = "gaius._core:main"
 
 [project.urls]
-Homepage = "https://github.com/kub0-ai/gaius"
-Issues = "https://github.com/kub0-ai/gaius/issues"
+Homepage = "https://github.com/jkubo/gaius"
+Issues = "https://github.com/jkubo/gaius/issues"
 
 [project.optional-dependencies.dev]
 dev = [

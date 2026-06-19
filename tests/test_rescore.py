@@ -44,7 +44,7 @@ def fresh_db(tmp_path, monkeypatch):
         ("finding-1", "security", "finding", "auto-mined", "CVE-2024-1234 exploitable in container"),
         ("procedure-1", "operational", "procedure", "auto-mined", "To fix etcd: stop kubelet, restore snapshot, restart"),
         ("security-1", "security", "security", "auto-mined", "Tetragon policy blocks reverse shells on all nodes"),
-        ("ops-1", "operational", "operational", "auto-mined", "Node node-01 has 128GB RAM"),
+        ("ops-1", "operational", "operational", "auto-mined", "Node aus-fwd-gpu-01 has 128GB RAM"),
         ("struct-1", "general", "structural", "auto-mined", "Flannel uses VXLAN backend"),
         ("obs-1", "general", "observation", "auto-mined", "Saw a warning in the logs once"),
     ]

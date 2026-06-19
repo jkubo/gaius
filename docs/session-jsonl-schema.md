@@ -1,6 +1,6 @@
 # gaius Session JSONL Schema
 
-gaius consumes session transcripts in JSONL format (one JSON object per line). Two schemas are supported:
+gaius consumes session transcripts from several AI coding agents — **Claude Code**, **Gemini CLI**, **Grok CLI**, **Codex CLI**, and **vLLM/local models** (plus Ollama and PentAGI). The primary JSONL schemas are documented below; Grok and Codex use directory / date-nested layouts (sections 4–5).
 
 ## 1. Simple Turn Format (recommended for vLLM/open models)
 
@@ -67,10 +67,61 @@ See `parse_gemini_events()` in `gaius/_core.py` for the full parser.
 
 ---
 
+## 4. Grok CLI Format (directory layout)
+
+Grok CLI stores each session as a **directory**, not a single file:
+
+```
+~/.grok/sessions/<urlencoded-cwd>/<session-uuid>/
+├── chat_history.jsonl   # one message per line
+└── summary.json         # metadata (id, current_model_id, updated_at) — optional
+```
+
+`chat_history.jsonl` entries:
+
+```jsonl
+{"type": "user", "content": "<user_query>check the cluster flannel MTU</user_query>"}
+{"type": "assistant", "content": "Flannel MTU is 1050 on cross-site Tailscale paths.", "model_id": "grok-composer-2.5-fast"}
+```
+
+- `type: "user"` — queries are wrapped in `<user_query>...</user_query>` (the wrapper is stripped).
+- `type: "assistant"` — entries **with** `tool_calls` are mid-turn narration (skipped); entries **without** are terminal answers (extracted as decision facts).
+- `content` — a string, or a list of `{type, text}` blocks.
+
+Parser: `parse_grok_events()`; discovery: `_discover_grok_sessions()` (both in `gaius/parsers.py`).
+Ingest with `gaius grok-retire [--sessions-dir ...] [--dry-run]`, or let plain `gaius retire` auto-sweep it.
+
+---
+
+## 5. Codex CLI Format (date-nested JSONL)
+
+Codex CLI stores rollouts as date-nested JSONL files:
+
+```
+~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<uuid>.jsonl
+```
+
+```jsonl
+{"type": "session_meta", "payload": {"id": "cdx-1", "timestamp": "2026-03-11T12:34:38Z"}}
+{"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "which storageclass for a new DRBD PVC?"}]}}
+{"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "block-sata for RPi DRBD; block-nvme for fwd-gpu nodes."}]}}
+```
+
+- Line 0 is `session_meta`.
+- `response_item` with `payload.type: "message"` carries the turn; `payload.role` is `user`, `assistant`, or `developer`; `payload.content` is a list of `{type: "input_text" | "output_text", text}` blocks.
+- Injected system context (`<environment_context`, `<permissions`, `# AGENTS.md`, `<INSTRUCTIONS`) and `developer`-role messages are skipped; assistant output blocks are extracted.
+
+Parser: `parse_codex_events()`; discovery: `_discover_codex_sessions()` (both in `gaius/parsers.py`).
+Ingest with `gaius codex-retire [--sessions-dir ...] [--dry-run]`, or let plain `gaius retire` auto-sweep it.
+
+---
+
 ## File naming
 
 - **Location**: configurable via `sessions_dir` in `~/.gaius/config.yaml`
 - **Default (Claude)**: `~/.claude/projects/<project-hash>/*.jsonl`
+- **Default (Grok)**: `~/.grok/sessions/<urlencoded-cwd>/<uuid>/chat_history.jsonl`
+- **Default (Codex)**: `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`
 - **Default (vLLM)**: `~/.gaius/sessions/<uuid>.jsonl`
 - **Convention**: UUID or timestamp-based filenames. gaius uses the filename stem as `session_uuid`.
 

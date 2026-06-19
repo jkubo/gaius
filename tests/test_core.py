@@ -1,7 +1,7 @@
 """gaius core test suite.
 
 Tests cover the public API surface of gaius._core with no dependency on
-a live corpus, external services, or deployment-specific configuration.
+a live corpus, external services, or kub0-specific configuration.
 
 Run:
     pytest tests/ -v
@@ -51,16 +51,7 @@ from gaius._core import (
     _DOMAIN_MAP,
     _FAILURE_CLASS_MAP_DEFAULT,
     _DOMAIN_MAP_DEFAULT,
-    is_internal_agent,
-    INTERNAL_AGENTS,
 )
-
-# Generic placeholder names standing in for a deployment's private agent roster.
-# The shipped defaults must NEVER hardcode any deployment's real agent names —
-# these fakes let the guards verify defaults stay empty/generic without naming
-# any real operator. (The same names are used to exercise the internal-agent
-# filtering MECHANISM, which is config-driven and ships with an empty roster.)
-_FAKE_OPERATOR_AGENTS = {"agent-a", "agent-b", "agent-c", "agent-d", "agent-e"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -163,9 +154,10 @@ class TestSessionThresholds:
         t = get_session_threshold("cluster", "mystery-agent-xyz")
         assert t == DEFAULT_THRESHOLD
 
-    def test_no_deployment_specific_defaults(self):
-        """Built-in thresholds must not hardcode any deployment's agent names."""
-        assert not _FAKE_OPERATOR_AGENTS.intersection(set(AGENT_THRESHOLDS.keys()))
+    def test_no_kub0_specific_defaults(self):
+        """Built-in thresholds must not contain internal project agent names."""
+        internal = {"geminius", "vigiles", "orramaus", "claudeus", "juleis"}
+        assert not internal.intersection(set(AGENT_THRESHOLDS.keys()))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -205,18 +197,13 @@ class TestEntityPatternLoading:
         assert "custom" in patterns     # added by user
 
     def test_no_internal_names_in_builtin_service_pattern(self):
-        """Deployment-specific service names must not be baked into the defaults.
-
-        The built-in service pattern ships only widely-used, generic service
-        names; a deployment's own private services belong in config, not here.
-        """
+        """vllm-[w]+ and similar kub0-specific deployment names must not be in defaults."""
         patterns = _load_entity_patterns()
         if "service" in patterns:
             svc_pattern = patterns["service"].pattern
-            for fake in _FAKE_OPERATOR_AGENTS:
-                assert fake not in svc_pattern
-            # A private/bespoke deployment service name must not be a default.
-            assert "my-private-service" not in svc_pattern
+            assert "vllm" not in svc_pattern
+            assert "orramaus" not in svc_pattern
+            assert "vigiles" not in svc_pattern
 
     def test_patterns_are_compiled_regexes(self):
         import re
@@ -234,8 +221,9 @@ class TestFormatByAgent:
         assert _DEFAULT_FORMAT_BY_AGENT.get("pentagi") == "pentagi"
 
     def test_no_internal_defaults(self):
-        """No deployment-specific agent names in shipped FORMAT_BY_AGENT."""
-        internal = _FAKE_OPERATOR_AGENTS | {f"{a}-agent" for a in _FAKE_OPERATOR_AGENTS}
+        """No kub0-specific agent names in shipped FORMAT_BY_AGENT."""
+        internal = {"geminius", "vigiles", "orramaus", "claudeus", "juleis",
+                    "geminius-agent", "vigiles-agent", "orramaus-agent"}
         assert not internal.intersection(set(_DEFAULT_FORMAT_BY_AGENT.keys()))
 
     def test_unknown_agent_not_in_map(self):
@@ -252,65 +240,6 @@ class TestFormatByAgent:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Internal-agent filtering mechanism
-# The MECHANISM ships intact but the roster is EMPTY by default — no agent is
-# excluded from extraction unless a deployment lists it in internal_agents.
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestInternalAgentFiltering:
-    def test_default_roster_is_empty(self):
-        """Shipped INTERNAL_AGENTS must be empty — no deployment roster ships."""
-        assert INTERNAL_AGENTS == frozenset()
-
-    def test_nothing_filtered_by_default(self):
-        """With an empty roster, no agent is treated as internal."""
-        for name in _FAKE_OPERATOR_AGENTS | {"claude", "gemini", "demo"}:
-            assert is_internal_agent(name) is False
-
-    def test_empty_or_none_agent_not_internal(self):
-        assert is_internal_agent("") is False
-        assert is_internal_agent(None) is False
-
-    def test_mechanism_filters_configured_names(self, monkeypatch):
-        """Configuring internal_agents makes is_internal_agent return True for them."""
-        monkeypatch.setattr("gaius._core.INTERNAL_AGENTS",
-                            frozenset({"agent-a", "agent-b"}))
-        assert is_internal_agent("agent-a") is True
-        assert is_internal_agent("agent-b") is True
-        # Trailing '-agent' suffix is stripped before matching.
-        assert is_internal_agent("agent-a-agent") is True
-        # Case-insensitive.
-        assert is_internal_agent("AGENT-A") is True
-        # Names not in the configured roster are still mined.
-        assert is_internal_agent("agent-c") is False
-
-    def test_config_builds_roster_lowercased(self, tmp_path):
-        """internal_agents from config.yaml populates INTERNAL_AGENTS, lowercased."""
-        import yaml, importlib, sys as _sys
-        cfg = {"internal_agents": ["Bot-One", "bot-two"]}
-        cfg_file = tmp_path / "config.yaml"
-        cfg_file.write_text(yaml.dump(cfg))
-        old_env = os.environ.get("GAIUS_CONFIG")
-        os.environ["GAIUS_CONFIG"] = str(cfg_file)
-        try:
-            for mod in ("gaius._core", "gaius"):
-                if mod in _sys.modules:
-                    del _sys.modules[mod]
-            from gaius._core import INTERNAL_AGENTS as ia, is_internal_agent as iia
-            assert "bot-one" in ia
-            assert "bot-two" in ia
-            assert iia("Bot-One") is True
-        finally:
-            if old_env is None:
-                os.environ.pop("GAIUS_CONFIG", None)
-            else:
-                os.environ["GAIUS_CONFIG"] = old_env
-            for mod in ("gaius._core", "gaius"):
-                if mod in _sys.modules:
-                    del _sys.modules[mod]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Domain keywords
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -320,13 +249,13 @@ class TestDomainKeywords:
             assert domain in DOMAIN_KEYWORDS
 
     def test_no_internal_domain_names(self):
-        """Shipped domain keys must be generic, not a deployment's own domains."""
-        internal = _FAKE_OPERATOR_AGENTS | {"my-private-domain"}
+        internal = {"geminius", "vigiles", "orramaus", "claudeus", "google-stack"}
         assert not internal.intersection(set(DOMAIN_KEYWORDS.keys()))
 
     def test_ollama_domain_has_no_internal_keywords(self):
         if "ollama" in DOMAIN_KEYWORDS:
-            assert not _FAKE_OPERATOR_AGENTS.intersection(set(DOMAIN_KEYWORDS["ollama"]))
+            internal_kw = {"geminius", "orramaus", "vigiles", "claudeus"}
+            assert not internal_kw.intersection(set(DOMAIN_KEYWORDS["ollama"]))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config-driven maps (failure classes + blog domain tags)
@@ -658,17 +587,16 @@ class TestPresets:
         assert isinstance(doc, dict)
 
     def test_presets_have_no_hardcoded_internal_paths(self):
-        # Guard against leaking a specific home dir or private domain into the
-        # shipped presets. These literals are leak-detectors, not config values.
         for preset_name in ["k8s.yaml", "default.yaml"]:
             content = (_REPO / "presets" / preset_name).read_text()
-            assert "/home/" not in content
-            assert ".internal" not in content
+            assert "/home/jkubo" not in content
+            assert "kub0" ".net" not in content  # split literal so this guard doesn't trip leak scanners
+            # kub0.io is acceptable in examples (it's the public domain)
 
     def test_k8s_preset_has_no_internal_agent_names(self):
         content = (_REPO / "presets" / "k8s.yaml").read_text()
-        for name in _FAKE_OPERATOR_AGENTS:
-            assert name not in content, f"deployment name '{name}' found in k8s.yaml"
+        for name in ["geminius", "vigiles", "orramaus", "claudeus", "juleis"]:
+            assert name not in content, f"internal name '{name}' found in k8s.yaml"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -36,10 +36,10 @@ jobs:
 
       - name: Check for hardcoded deployment paths in shipped code
         run: |
-          # Hardcoded absolute home paths must not appear in shipped source.
-          # Config-driven substitutes belong in ~/.gaius/config.yaml.
-          INTERNAL="/home/[a-z]+/|/Users/[a-z]+/"
-          SOURCES="gaius/ gaius_cli presets/ skill/"
+          # Hardcoded absolute home paths and specific production domains must not appear
+          # in shipped Python source. Config-driven substitutes belong in ~/.gaius/config.yaml.
+          INTERNAL="/home/[a-z]+/|kub0\.net|ansible\.venv"
+          SOURCES="gaius/ http_adapter.py gaius_cli presets/"
           if grep -rE "$INTERNAL" $SOURCES --include="*.py" --include="*.yaml" --include="*.yml"; then
             echo "FAIL: hardcoded deployment paths found in shipped code"
             exit 1

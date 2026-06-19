@@ -42,7 +42,7 @@ if [[ -n "$CWD" && -d "$CWD" ]]; then
     DIFF_FILES=$(git -C "$CWD" diff --name-only HEAD 2>/dev/null | head -10)
     STAGED_FILES=$(git -C "$CWD" diff --name-only --cached 2>/dev/null | head -10)
     COMBINED=$(printf '%s\n%s' "$DIFF_FILES" "$STAGED_FILES" | sort -u | tr '\n' ' ')
-    # Add cwd directory name as a weak signal (e.g. "infra", "my-service")
+    # Add cwd directory name as a weak signal (e.g. "ansible", "cctv-api")
     COMBINED="$COMBINED $(basename "${CWD:-/}")"
     CONTEXT_TERMS=$(printf '%s' "$COMBINED" | tr '/' ' ')
 fi

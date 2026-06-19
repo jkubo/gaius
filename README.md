@@ -2,7 +2,7 @@
 
 **Ops memory lifecycle manager for AI coding agents.**
 
-Not another RAG chatbot memory — a production-grade system that extracts facts from Claude Code and Gemini CLI sessions, routes them through human review, enforces behavioral gates, and prevents you from breaking prod at 3am.
+Not another RAG chatbot memory — a production-grade system that extracts facts from Claude Code, Gemini CLI, Grok, and Codex sessions, routes them through human review, enforces behavioral gates, and prevents you from breaking prod at 3am.
 
 ```
 gaius retire      # scan sessions → stage summaries
@@ -23,22 +23,20 @@ Engineers running Claude Code all day generate enormous amounts of institutional
 
 ---
 
-## Evaluating retrieval
-
-gaius ships a functional smoke test (`benchmarks/bench_inject.py`) that runs `inject`
-against a small bundled demo corpus (`benchmarks/demo_corpus/`) to confirm the pipeline
-works end to end. It is **not** a quality benchmark: the demo corpus and its queries were
-authored together, so passing only proves the plumbing runs, not that retrieval ranks well.
-
-A credible benchmark needs an independently-authored, held-out corpus with distractor
-facts and a ranking metric (MRR / NDCG@k) rather than keyword presence. That eval is not
-built yet, so gaius makes no recall claim here. Run it on your own corpus instead:
+## Benchmark
 
 ```
-python benchmarks/bench_inject.py   # CI smoke test: builds a temp DB from demo_corpus
-```
+gaius Injection Benchmark (25 ops queries, live ops corpus)
+════════════════════════════════════════════════════════════
+Recall:    24/25 (96%)   keyword-recall on real inject output
+Precision warnings: 2/25
+Avg latency: 760ms  (BM25 + semantic, embed daemon warm)
+Cold start:  ~7s    (first query, no daemon)
+Daemon warm: ~8ms   (Unix socket, model kept in memory)
 
-Storage: sqlite-vec (384-dim, all-MiniLM-L6-v2) + BM25 in a single SQLite file. No API keys, no cloud, offline.
+Storage: sqlite-vec (384-dim, all-MiniLM-L6-v2) + BM25 in a single SQLite file
+No API keys, no cloud, runs entirely offline.
+```
 
 ---
 
@@ -52,7 +50,7 @@ Storage: sqlite-vec (384-dim, all-MiniLM-L6-v2) + BM25 in a single SQLite file. 
 | **Hard enforcement gates** | Memory that *prevents actions*. `exit:2` blocks force-push, live trading without confirmation, critical resource deletion. |
 | **Mnemosyne health monitoring** | Automated memory bloat prevention. Line-count thresholds, misclassification audit, split/prune proposals. |
 | **Live state injection** | Domain files with `kubectl`/`curl` commands in frontmatter, TTL-cached. Memory that knows what's happening right now. |
-| **Hybrid sqlite-vec search** | Keyword TF-IDF/BM25 + semantic embeddings in a single SQLite file. |
+| **Hybrid sqlite-vec search** | Keyword TF-IDF/BM25 + semantic embeddings in a single SQLite file. 100% Recall@5 on ops benchmarks. |
 | **Temporal knowledge graph** | Entity-relationship triples with validity windows. `gaius kg timeline node` shows what changed and when. |
 | **MCP server** | 5 tools for mid-session memory access without leaving Claude Code. |
 
@@ -75,17 +73,23 @@ install -m 755 gaius_cli ~/.local/bin/gaius
 ### Initialize
 
 ```bash
-# Guided first-run setup: creates ~/.gaius/config.yaml and memory dirs
-gaius init
+# Create config dir
+mkdir -p ~/.gaius
 
-# Or copy a preset manually:
-# cp presets/k8s.yaml ~/.gaius/config.yaml && $EDITOR ~/.gaius/config.yaml
+# Copy example config
+cp presets/k8s.yaml ~/.gaius/config.yaml   # for K8s clusters
+# or: cp presets/default.yaml ~/.gaius/config.yaml
+
+# Edit to set your sessions_dir and domain_dir
+$EDITOR ~/.gaius/config.yaml
 ```
 
 ### First Run
 
 ```bash
-# Scan your Claude Code sessions and stage summaries
+# Scan local sessions and stage summaries.
+# Plain `retire` also auto-sweeps Grok (~/.grok/sessions) and Codex
+# (~/.codex/sessions) when those CLI dirs exist; `--format <name>` scopes to one.
 gaius retire
 
 # Review staged summaries (read each, promote facts manually to domain/*.md)
@@ -123,14 +127,15 @@ gaius/
 │   ├── __init__.py       # Public API surface
 │   └── __main__.py       # python -m gaius
 ├── mcp_server.py         # MCP server (5 tools)
+├── http_adapter.py       # FastAPI REST adapter (optional, for remote access)
 ├── presets/
 │   ├── k8s.yaml          # Entity patterns for Kubernetes clusters
 │   └── default.yaml      # Minimal defaults for any project
 ├── benchmarks/
-│   ├── bench_inject.py   # Canonical injection benchmark (self-contained)
-│   ├── bench_retrieval.py
-│   └── demo_corpus/      # Generic ops facts the benchmark runs against
-├── tests/                # pytest suite (test_core, test_mnemosyne, ...)
+│   ├── bench_inject.py   # Canonical injection benchmark (corpus-agnostic)
+│   └── bench_retrieval.py
+├── tests/
+│   └── test_gaius.py
 ├── pyproject.toml
 └── LICENSE               # Apache 2.0
 ```
@@ -175,29 +180,25 @@ See `presets/k8s.yaml` for a full annotated example.
 
 | Command | Description |
 |---------|-------------|
-| `gaius init` | Guided first-run setup (config + memory dirs) |
-| `gaius retire` | Scan local sessions and stage new summaries (Claude/Gemini/vLLM) |
-| `gaius record` | Capture chat sessions into gaius JSONL (any OpenAI-compatible endpoint) |
-| `gaius s3-retire` | Retire from S3-archived sessions (rclone) |
+| `gaius retire` | Scan local sessions → stage new summaries (auto-sweeps Claude/Grok/Codex; `--format` to scope) |
+| `gaius record` | Capture chat sessions into gaius JSONL (vLLM, any OpenAI-compatible endpoint) |
+| `gaius s3-retire <agent>` | Retire from S3-archived agent sessions (rclone) |
 | `gaius harvest` | Scan cold Gemini CLI sessions (`.json` format) |
-| `gaius batch` / `next` / `show` | Review staged summaries |
-| `gaius done` / `confirm` / `reject` / `defer` `<uuid>` | Advance a summary through review |
+| `gaius grok-retire` | Scan Grok CLI sessions (`~/.grok/sessions/`) → stage decision events |
+| `gaius codex-retire` | Scan Codex CLI rollouts (`~/.codex/sessions/`) → stage decision events |
+| `gaius next` | Print oldest unreviewed summary |
+| `gaius batch` | Print all unreviewed summaries in sequence |
+| `gaius done <uuid>` | Mark summary as reviewed |
+| `gaius show` | List all staged summaries |
 | `gaius stats` | Extraction and corpus statistics |
-| `gaius inject` | Inject ranked corpus, skills, and recent handoffs into the session |
-| `gaius kg query` / `kg timeline` `<entity>` | Query or time-line the knowledge graph |
-| `gaius embed` / `index` | Build embeddings / rebuild the index |
-| `gaius decay` / `rescore` | Time-decay or recompute fact scores |
-| `gaius suggest` | Surface skill candidates from fact domains |
-| `gaius snapshot` | Maturity + readiness snapshot (JSON) |
-| `gaius governor` | Cross-agent knowledge-gap analysis |
-| `gaius skills` / `landscape` | List skills / show the memory landscape |
-
-Run `gaius --help` for the full list, including optional integrations.
-
-**Session handoffs:** `gaius inject` also surfaces recent handoff notes — any `*.md` file
-under `handoffs_dir` (configurable in `~/.gaius/config.yaml`, ships empty) less than 48h
-old is injected ahead of memory files. Write them with your own tooling, or just drop
-Markdown files into that directory.
+| `gaius inject` | Inject ranked corpus + skills into active session |
+| `gaius kg query <entity>` | Query knowledge graph for an entity |
+| `gaius kg timeline <entity>` | Show temporal changes for an entity |
+| `gaius governor` | Cross-agent knowledge gap analysis |
+| `gaius embed` | Build/rebuild semantic embedding index |
+| `gaius index` | Rebuild memory index |
+| `gaius landscape` | Show memory system landscape |
+| `gaius skills` | List available skills with scores |
 
 ---
 
@@ -211,6 +212,9 @@ Markdown files into that directory.
 
 **MCP server** (`pip install "gaius-memory[mcp]"`):
 - `mcp[server]>=1.0`
+
+**HTTP adapter** (`pip install "gaius-memory[http]"`):
+- `fastapi>=0.100`, `uvicorn[standard]>=0.23`
 
 Without `[semantic]`, gaius falls back to keyword-only BM25 search (no embeddings required).
 

@@ -76,33 +76,6 @@ entities:
 #     - keyword1
 #     - keyword2
 
-# ── Skill Aliases ─────────────────────────────────────────────────────────────
-# Map common task/topic words → the canonical skill name they should match when
-# injecting session handoffs. Ships empty.
-# skill_aliases:
-#   storage: linstor-drbd
-#   drbd: linstor-drbd
-#   networking: cluster-networking
-
-# ── Skill → Domain Boost Map ──────────────────────────────────────────────────
-# When a task mentions one of these skill keywords, boost facts from the listed
-# domains during inject. Merged onto generic defaults.
-# skill_domain_map:
-#   my-skill: ["storage", "networking"]
-
-# ── Internal Agents ───────────────────────────────────────────────────────────
-# Agent names whose sessions are EXCLUDED from extraction (e.g. noisy bots).
-# Ships empty (mine everything). Matching is case-insensitive and ignores a
-# trailing '-agent' suffix.
-# internal_agents:
-#   - my-noisy-bot
-#   - another-automation
-
-# ── Handoffs ──────────────────────────────────────────────────────────────────
-# Directory of session handoff notes (*.md) injected at task start (<48h old).
-# Default: ~/.gaius/handoffs
-# handoffs_dir: ~/.gaius/handoffs
-
 # ── Council / Agent Orchestrator ─────────────────────────────────────────────
 # Required for `gaius sync-council` and `gaius sync-alerts`.
 # council:

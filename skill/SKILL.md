@@ -1,7 +1,7 @@
-# memory-maintenance — Memory System Maintenance
+# mnemos — Memory System Maintenance
 
 > Session mode for maintaining, healing, and improving the agent memory system.
-> Install: copy this directory to `~/.claude/skills/memory-maintenance/` (Claude Code) or
+> Install: copy this directory to `~/.claude/skills/mnemos/` (Claude Code) or
 > configure as a system prompt prefix (Gemini CLI, vLLM-served models).
 
 ## Role
@@ -96,6 +96,8 @@ gaius supports multiple AI coding agent backends:
 |---------|---------------|----------|-------|
 | Claude Code | JSONL | `~/.claude/projects/*/` | Native `isCompactSummary` marker |
 | Gemini CLI | JSON | `~/.gemini/tmp/` | Auto-detected by extension |
+| Grok CLI | JSONL (`chat_history.jsonl` + `summary.json`) | `~/.grok/sessions/<cwd>/<uuid>/` | First-class peer; auto-swept by `gaius retire` |
+| Codex CLI | JSONL (`rollout-*.jsonl`) | `~/.codex/sessions/YYYY/MM/DD/` | First-class peer; auto-swept by `gaius retire` |
 | vLLM/local | JSONL | configurable | `gaius retire --format vllm` |
 
 Cross-model corroboration (1.5x score boost) fires when both Claude and Gemini sessions confirm the same fact. This works out of the box when both backends write to the same gaius instance.

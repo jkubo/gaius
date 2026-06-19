@@ -318,20 +318,18 @@ def gaius_prime_session(session_type: str) -> str:
     Each type has a distinct mindset, pre-action checklist, and completion standard.
 
     Args:
-        session_type: name of a session-mode skill in your skills directory.
-                      The available types are discovered from the *.md files in
-                      SKILLS_DIR (e.g. ops, audit) — each is a behavioral priming
-                      skill. Pass the file stem, e.g. "ops" for ops.md.
+        session_type: One of: ops (ops triage), quant (trading/execution),
+                      malware (security/malware), pentest (red team),
+                      audit (security audits), console (UI), mnemos (memory maintenance)
     """
+    valid_types = ["ops", "quant", "malware", "pentest", "audit", "console", "mnemos"]
     session_type = session_type.lower().strip()
-    # Valid types are whatever skill files the deployment actually ships — no
-    # hardcoded roster, so this works for any user's set of session modes.
-    valid_types = sorted(p.stem for p in SKILLS_DIR.glob("*.md")) if SKILLS_DIR.is_dir() else []
+    if session_type not in valid_types:
+        return f"Unknown session type '{session_type}'. Valid types: {', '.join(valid_types)}"
 
     skill_file = SKILLS_DIR / f"{session_type}.md"
     if not skill_file.exists():
-        hint = f" Valid types: {', '.join(valid_types)}" if valid_types else ""
-        return f"Unknown session type '{session_type}'.{hint}"
+        return f"Skill file not found: {skill_file}"
 
     text = skill_file.read_text()
     fm, body = _parse_frontmatter(text)
@@ -456,7 +454,7 @@ def threat_tp_status(node: str = "", tp: str = "") -> str:
     """TP priority assignments per node — which TPs are assigned and why.
 
     Args:
-        node: Optional node name to filter (e.g., node-01)
+        node: Optional node name to filter (e.g., web-prod-01)
         tp: Optional TP name to filter from results
     """
     data = json.loads(_threat_fetch("/api/threat/tp-status", {"node": node}))

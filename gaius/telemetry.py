@@ -102,14 +102,14 @@ def _seed_coaching_tips(conn: sqlite3.Connection):
          "Gaius needs semantic signal to find relevant context. Short prompts like "
          "\"fix it\" or \"what's next\" produce zero BM25 matches.\n\n"
          "**Try instead:** Include the subsystem, symptom, or goal — "
-         "\"fix DRBD split-brain on node-01\" gives gaius 4 useful search terms.",
+         "\"fix DRBD split-brain on toa\" gives gaius 4 useful search terms.",
          "prompt", "info"),
 
         ("no_terms_after_filter", "All meaningful words were filtered as stop words",
          "After removing common English words, your prompt had zero search terms. "
          "This means gaius couldn't find relevant context to inject.\n\n"
          "**Tip:** Use specific technical terms — service names, error messages, "
-         "component names. \"deploy oauth2-proxy on example.com\" has 4 useful terms; "
+         "component names. \"Deploy oauth2 proxy on prod\" has 4 useful terms; "
          "\"set up the new thing\" has zero.",
          "prompt", "warning"),
 

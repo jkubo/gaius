@@ -32,8 +32,12 @@ semantic = [
 mcp = [
     "mcp[server]>=1.0",
 ]
+http = [
+    "fastapi>=0.100",
+    "uvicorn[standard]>=0.23",
+]
 all = [
-    "gaius-memory[semantic,mcp]",
+    "gaius-memory[semantic,mcp,http]",
 ]
 
 [project.scripts]

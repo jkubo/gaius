@@ -233,28 +233,6 @@ ALIAS_BLOCKLIST: frozenset = _DEFAULT_ALIAS_BLOCKLIST | frozenset(
     _gaius_cfg.get("alias_blocklist", [])
 )
 
-# Internal agents — agent names whose sessions are excluded from extraction.
-# Useful when some session-producing agents are bots/automation whose chatter
-# you don't want mined into the corpus. Ships EMPTY (mine everything); populate
-# internal_agents in ~/.gaius/config.yaml with the agent names to skip.
-# Matching is case-insensitive and ignores a trailing '-agent' suffix.
-_DEFAULT_INTERNAL_AGENTS: frozenset = frozenset()
-INTERNAL_AGENTS: frozenset = _DEFAULT_INTERNAL_AGENTS | frozenset(
-    a.lower() for a in _gaius_cfg.get("internal_agents", [])
-)
-
-
-def is_internal_agent(agent_name: str) -> bool:
-    """True if agent_name is configured as internal (excluded from extraction).
-
-    The MECHANISM ships intact but the roster is empty by default — no agent
-    is filtered unless the operator lists it in internal_agents.
-    """
-    if not agent_name:
-        return False
-    base = agent_name.lower().replace("-agent", "")
-    return base in INTERNAL_AGENTS or agent_name.lower() in INTERNAL_AGENTS
-
 SPECS_DIR = Path(__file__).resolve().parent.parent / "domain" / "specs"
 GEMINI_DIR = Path.home() / ".gemini" / "tmp"
 GEMINI_COLD_THRESHOLD_HOURS = 4
@@ -365,6 +343,8 @@ MODEL_INFO: dict = {
     "gemini":  {"family": "gemini",  "default_version": "2.5-pro"},
     "pentagi": {"family": "qwen",    "default_version": "2.5-32b"},
     "ollama":  {"family": "ollama",  "default_version": "unknown"},
+    "grok":    {"family": "grok",    "default_version": "grok-composer-2.5"},
+    "codex":   {"family": "codex",   "default_version": "unknown"},
 }
 FORMAT_BY_AGENT: dict = {
     **_DEFAULT_FORMAT_BY_AGENT,
@@ -519,20 +499,17 @@ _DOMAIN_KEYWORDS_DEFAULT = {
                       "node-exporter", "grafana", "prometheus", "loki"],
     "gitops":        ["flux", "helmrelease", "kustomization", "gitops", "reconcile", "deploy"],
     "quality":       ["test", "lint", "ci", "pipeline", "review", "coverage"],
+    "finint":        ["polymarket", "trading", "executor", "portfolio", "equity", "philosopher",
+                      "kelly", "odds", "autotrade", "alpaca", "schwab", "ibkr", "finint",
+                      "updown", "maker", "taker", "adverse selection", "fill rate"],
+    "malint":        ["malware", "detonate", "sandbox", "vigiles", "yara", "tetragon",
+                      "tracingpolicy", "sigkill", "ebpf", "bpf_lsm", "malint", "assay",
+                      "bazaar", "mwdb", "triage", "corpus", "verdict", "sample"],
 }
 DOMAIN_KEYWORDS: dict = {
     **_DOMAIN_KEYWORDS_DEFAULT,
     **_gaius_cfg.get("domain_keywords", {}),
 }
-
-# Skill aliases — map common task/topic words → the canonical skill name they
-# should match when injecting session handoffs. Ships empty; configure your own.
-# Example (in ~/.gaius/config.yaml):
-#   skill_aliases:
-#     storage: linstor-drbd
-#     drbd: linstor-drbd
-#     networking: cluster-networking
-_SKILL_ALIASES: dict = _gaius_cfg.get("skill_aliases", {})
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -558,9 +535,9 @@ def load_staged() -> dict:
 
 
 # Operational state transitions only exist in session history — dismissing
-# them at review as "derivable from code" is a common failure mode that lets
-# project memory rot. The keyword list flags likely state-change facts so they
-# surface for review; false positives just surface earlier.
+# them at review as "derivable from code" is the failure mode that rotted the
+# JDT project files twice (2026-05-18, 05-20). Keyword list is the agreed spec
+# from project_gaius_promotion_gap.md; false positives just surface earlier.
 _STATE_CHANGE_RE = re.compile(
     r'\b(deleted|decommissioned|migrated|completed|shipped|torn down|removed|'
     r'deprecated|cutover|flipped|promoted|scaled down|terminated)\b',
@@ -1200,15 +1177,6 @@ def init_db(db_path: Path = None) -> sqlite3.Connection:
     return conn
 
 
-def detect_format(path: Path) -> str:
-    """Return 'claude' for .jsonl, 'gemini' for .json, None to skip."""
-    if path.suffix == '.jsonl':
-        return 'claude'
-    if path.suffix == '.json':
-        return 'gemini'
-    return None
-
-
 def load_domain_specs() -> dict:
     """Load domain YAML specs from domain/specs/*.yaml.
     Falls back to DOMAIN_KEYWORDS for domains without spec files."""
@@ -1240,323 +1208,12 @@ def is_gemini_cold(path: Path, threshold_hours: float = GEMINI_COLD_THRESHOLD_HO
     return age_hours >= threshold_hours
 
 
-def parse_gemini_events(path: Path) -> list[dict]:
-    """Parse a cold Gemini CLI session JSON into typed events.
-
-    Returns list of events with keys:
-      type: 'decision' | 'discovery' | 'response'
-      provenance: 'structured_reasoning' | 'automated'
-      agent: 'gemini'
-      session_uuid: str (from sessionId)
-      timestamp: str (ISO, approximated from file mtime)
-      subject: str (for decision)
-      description: str (for decision)
-      tool: str (for discovery)
-      args: dict (for discovery)
-      output: str | None (for discovery)
-    """
-    try:
-        with open(path) as f:
-            data = json.load(f)
-    except Exception as e:
-        print(f"  warning: failed to parse {path.name}: {e}", file=sys.stderr)
-        return []
-
-    if not isinstance(data, dict):
-        return []
-
-    session_uuid = data.get("sessionId", path.stem)
-    # Approximate timestamp from file mtime
-    mtime_iso = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
-
-    events = []
-    for msg in data.get("messages", []):
-        if not isinstance(msg, dict):
-            continue
-
-        # thoughts[] → decision events (structured reasoning)
-        for thought in msg.get("thoughts", []):
-            if not isinstance(thought, dict):
-                continue
-            subject = thought.get("subject", "").strip()
-            description = thought.get("description", "").strip()
-            if not subject and not description:
-                continue
-            # Drop navigation/orientation noise — secondary agent orienting itself,
-            # not domain knowledge worth keeping.
-            if subject.lower() in GEMINI_NOISE_SUBJECTS:
-                continue
-            # fact_key: hash of subject for cross-session dedup
-            fact_key = hashlib.sha256(subject.lower().encode()).hexdigest()[:16]
-            events.append({
-                "type": "decision",
-                "provenance": "structured_reasoning",
-                "agent": "gemini",
-                "session_uuid": session_uuid,
-                "timestamp": mtime_iso,
-                "fact_key": fact_key,
-                "subject": subject,
-                "description": description,
-                "outcome": None,  # reviewer assigns at merge time
-            })
-
-        # toolCalls[] → discovery events (production reality)
-        for tc in msg.get("toolCalls", []):
-            if not isinstance(tc, dict):
-                continue
-            tool_name = tc.get("name", "")
-            args = tc.get("args", {})
-            # Navigate nested result structure defensively
-            output = None
-            result = tc.get("result")
-            if isinstance(result, list) and len(result) > 0:
-                try:
-                    output = result[0]["functionResponse"]["response"]["output"]
-                except (KeyError, TypeError):
-                    pass
-            if not output and not tool_name:
-                continue
-            # Drop discoveries whose output contains credential-like patterns.
-            if output and any(pat in output for pat in GEMINI_CREDENTIAL_PATTERNS):
-                continue
-            # fact_key: hash of tool_name + args for cross-session dedup
-            args_str = json.dumps(args, sort_keys=True) if args else ""
-            fact_key = hashlib.sha256(f"{tool_name}:{args_str}".encode()).hexdigest()[:16]
-            events.append({
-                "type": "discovery",
-                "provenance": "automated",
-                "agent": "gemini",
-                "session_uuid": session_uuid,
-                "timestamp": mtime_iso,
-                "fact_key": fact_key,
-                "tool": tool_name,
-                "args": args,
-                "output": str(output)[:2000] if output else None,
-                "outcome": None,
-            })
-
-    return events
-
-
 # ── Credential patterns (shared across parsers) ─────────────────────────────
 CREDENTIAL_PATTERNS = GEMINI_CREDENTIAL_PATTERNS  # alias for use by all parsers
 
 
-def parse_pentagi_flow(flow_data: dict, logs: dict) -> list[dict]:
-    """Convert a PentAGI flow's logs into gaius events.
-
-    Args:
-        flow_data: {id, status, title, createdAt, updatedAt}
-        logs: {agentLogs, terminalLogs, searchLogs, messageLogs}
-
-    Returns: list of event dicts with type/provenance/fact_key/model_family etc.
-    """
-    flow_id = str(flow_data.get("id", ""))
-    timestamp = flow_data.get("createdAt", "")
-    events = []
-    model_family = MODEL_INFO["pentagi"]["family"]
-    model_version = MODEL_INFO["pentagi"]["default_version"]
-
-    # AgentLogs
-    for log in logs.get("agentLogs", []):
-        log_id = str(log.get("id", ""))
-        executor = log.get("executor", "unknown")
-        result = (log.get("result") or "")[:500].strip()
-        task = (log.get("task") or "").strip()
-        if not result or len(result) < 20:
-            continue
-        if any(pat in result for pat in CREDENTIAL_PATTERNS):
-            continue
-
-        if executor in ("pentester", "coder"):
-            ev_type, prov = "discovery", "automated"
-            fact_text = f"[pentest:{executor}] {result}"
-        else:
-            ev_type, prov = "decision", "structured_reasoning"
-            fact_text = f"[plan] {task}: {result}" if task else f"[plan] {result}"
-
-        fact_key = hashlib.sha256(f"agent:{log_id}".encode()).hexdigest()[:16]
-        events.append({
-            "type": ev_type,
-            "provenance": prov,
-            "agent": "pentagi",
-            "session_uuid": f"pentagi-flow-{flow_id}",
-            "timestamp": timestamp,
-            "fact_key": fact_key,
-            "subject": task[:200] if ev_type == "decision" else fact_text[:200],
-            "description": result if ev_type == "decision" else "",
-            "tool": f"pentagi-{executor}" if ev_type == "discovery" else None,
-            "output": result if ev_type == "discovery" else None,
-            "outcome": None,
-            "model_family": model_family,
-            "model_version": model_version,
-        })
-
-    # TerminalLogs — stdout only, skip short entries and stdin
-    for log in logs.get("terminalLogs", []):
-        log_id = str(log.get("id", ""))
-        log_type = log.get("type", "")
-        text = (log.get("text") or "").strip()
-        if log_type != "stdout" or len(text) < 50:
-            continue
-        if any(pat in text for pat in CREDENTIAL_PATTERNS):
-            continue
-
-        fact_key = hashlib.sha256(f"terminal:{log_id}".encode()).hexdigest()[:16]
-        events.append({
-            "type": "discovery",
-            "provenance": "automated",
-            "agent": "pentagi",
-            "session_uuid": f"pentagi-flow-{flow_id}",
-            "timestamp": timestamp,
-            "fact_key": fact_key,
-            "tool": "terminal",
-            "output": text[:500],
-            "outcome": None,
-            "model_family": model_family,
-            "model_version": model_version,
-        })
-
-    # SearchLogs
-    for log in logs.get("searchLogs", []):
-        log_id = str(log.get("id", ""))
-        engine = log.get("engine", "unknown")
-        query = (log.get("query") or "").strip()
-        result = (log.get("result") or "")[:300].strip()
-        if not result:
-            continue
-        if any(pat in result for pat in CREDENTIAL_PATTERNS):
-            continue
-
-        fact_key = hashlib.sha256(f"search:{log_id}".encode()).hexdigest()[:16]
-        events.append({
-            "type": "discovery",
-            "provenance": "automated",
-            "agent": "pentagi",
-            "session_uuid": f"pentagi-flow-{flow_id}",
-            "timestamp": timestamp,
-            "fact_key": fact_key,
-            "tool": f"search-{engine}",
-            "output": f"{query}: {result}",
-            "outcome": None,
-            "model_family": model_family,
-            "model_version": model_version,
-        })
-
-    # MessageLogs — thoughts and reports only
-    for log in logs.get("messageLogs", []):
-        log_id = str(log.get("id", ""))
-        msg_type = log.get("type", "")
-        message = (log.get("message") or "").strip()
-        if msg_type not in ("thoughts", "report", "done"):
-            continue
-        if not message or len(message) < 20:
-            continue
-        if any(pat in message for pat in CREDENTIAL_PATTERNS):
-            continue
-
-        fact_key = hashlib.sha256(f"message:{log_id}".encode()).hexdigest()[:16]
-        events.append({
-            "type": "decision",
-            "provenance": "structured_reasoning",
-            "agent": "pentagi",
-            "session_uuid": f"pentagi-flow-{flow_id}",
-            "timestamp": timestamp,
-            "fact_key": fact_key,
-            "subject": f"[{msg_type}]",
-            "description": message[:500],
-            "outcome": None,
-            "model_family": model_family,
-            "model_version": model_version,
-        })
-
-    return events
-
-
-def parse_pentagi_flow_from_jsonl(path: Path) -> list[dict]:
-    """Parse a local PentAGI flow JSONL (written by pentagi-retire fetch phase) into events.
-
-    JSONL format: first line is _meta header with flow_data, subsequent lines are log entries.
-    """
-    try:
-        with open(path) as f:
-            lines = [line.strip() for line in f if line.strip()]
-    except Exception as e:
-        print(f"  warning: failed to read {path.name}: {e}", file=sys.stderr)
-        return []
-
-    if not lines:
-        return []
-
-    # First line is _meta header
-    try:
-        meta = json.loads(lines[0])
-    except json.JSONDecodeError:
-        return []
-
-    flow_data = meta.get("_meta", meta)
-    logs: dict = {"agentLogs": [], "terminalLogs": [], "searchLogs": [], "messageLogs": []}
-
-    for line in lines[1:]:
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        log_type = entry.get("_log_type", "")
-        if log_type in logs:
-            logs[log_type].append(entry)
-
-    return parse_pentagi_flow(flow_data, logs)
-
-
-def parse_ollama_events(path: Path) -> list[dict]:
-    """Parse Ollama inference session JSONL into gaius events.
-
-    Each line is a {ts, query, response, model, domain, tokens, latency_ms} entry
-    written by k0 ops ask.
-    """
-    model_family = MODEL_INFO["ollama"]["family"]
-    default_version = MODEL_INFO["ollama"]["default_version"]
-    events = []
-
-    try:
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                query = entry.get("query", "")
-                response = entry.get("response", "")
-                if not response or len(response) < 20:
-                    continue
-                if any(pat in response for pat in CREDENTIAL_PATTERNS):
-                    continue
-
-                fact_key = hashlib.sha256(f"ollama:{query[:100]}".encode()).hexdigest()[:16]
-                events.append({
-                    "type": "decision",
-                    "provenance": "inference",
-                    "agent": "ollama",
-                    "session_uuid": path.stem,
-                    "timestamp": entry.get("ts", ""),
-                    "fact_key": fact_key,
-                    "subject": query[:200],
-                    "description": response[:2000],
-                    "model_family": model_family,
-                    "model_version": entry.get("model", default_version),
-                    "outcome": None,
-                    "source": entry.get("source", "human"),
-                    "session_type": entry.get("session_type", "interactive"),
-                })
-    except Exception as e:
-        print(f"  warning: failed to read {path.name}: {e}", file=sys.stderr)
-
-    return events
+#   ~/.grok/sessions/<urlencoded-cwd>/<uuid>/chat_history.jsonl  (+ summary.json)
+#   ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl
 
 
 def register_session(conn: sqlite3.Connection, uuid: str, origin: str, agent: str,
@@ -1862,7 +1519,7 @@ def tag_domains_from_specs(text: str, domain_specs: dict) -> list[str]:
 _BUILTIN_ENTITY_PATTERNS: dict[str, str] = {
     # K8s node naming convention — customize node_pattern in config for your scheme
     "node":      r'\b(?:[a-z]+-[a-z]+-[\w]+-[\w]+-\d+)\b',
-    # Common K8s services (widely used, not deployment-specific)
+    # Common K8s services (widely used, not kub0-specific)
     "service":   r'\b(?:traefik|nginx|cert-manager|oauth2-proxy|grafana|prometheus|loki|mimir|alloy|otel-collector|jupyterlab|gitea|forgejo|timescaledb|postgresql|mysql|redis|mongodb|elasticsearch|kibana|jaeger|tempo)\b',
     "namespace": r'\b(?:kube-system|kube-public|default|monitoring|logging|networking|security|storage|cert-manager|ingress-nginx)\b',
     # Incident / failure vocabulary (generic)
@@ -2502,75 +2159,6 @@ def _promote_mined_to_facts(conn: sqlite3.Connection, session_stem: str,
     return count
 
 
-
-
-def parse_claude_events(path: Path) -> list[dict]:
-    """Extract high-signal facts from compact summaries and significant tool-result pairs."""
-    events = []
-    summaries = []
-    try:
-        with open(path) as f:
-            for line in f:
-                entry = json.loads(line)
-                # Capture existing compact summaries first (highest signal)
-                if entry.get("isCompactSummary"):
-                    text = entry.get("message", {}).get("content", "")
-                    if text:
-                        # Split by section headers to create individual facts
-                        sections = re.split(r'\n\d+\.\s+[A-Z][^\n]*\n', text)
-                        for s in sections:
-                            if len(s.strip()) > 100:
-                                summaries.append(s.strip())
-                
-                # Capture significant tool results
-                if entry.get("type") == "user":
-                    msg_content = entry.get("message", {}).get("content", [])
-                    if isinstance(msg_content, list):
-                        for item in msg_content:
-                            if item.get("type") == "tool_result" and not item.get("is_error"):
-                                res_text = str(item.get("content"))
-                                if len(res_text) > 500 and len(res_text) < 5000:
-                                    events.append({
-                                        "signal": "Observed cluster state/output",
-                                        "source": f"tool_result({item.get('tool_use_id')})",
-                                        "outcome": res_text[:2000],
-                                        "source_type": "claude",
-                                        "verification_cmd": ""
-                                    })
-    except Exception:
-        pass
-    
-    # Map summaries to event format
-    for s in summaries:
-        events.append({
-            "signal": s[:500],
-            "source": "CompactSummary",
-            "outcome": s,
-            "source_type": "claude",
-            "verification_cmd": ""
-        })
-        
-    # Strict deduplication and boilerplate filtering
-    high_signal = []
-    seen_hashes = set()
-    for ev in events:
-        ignore = ["I will read", "I will list", "Checking file", "Searching for"]
-        if any(p in ev["signal"] for p in ignore):
-            continue
-        # Apply noise filter
-        if _is_noise(ev["signal"]):
-            continue
-
-        h = hashlib.sha256(ev["outcome"].encode()).hexdigest()
-        if h in seen_hashes:
-            continue
-        seen_hashes.add(h)
-        high_signal.append(ev)
-
-    return high_signal
-
-
-
 def cmd_retire(args):
 
 
@@ -2581,6 +2169,11 @@ def cmd_retire(args):
       gemini: delegate to harvest
       ollama: parse ~/.ollama/sessions/ JSONL
       pentagi: parse ~/.pentagi/sessions/ JSONL
+      grok: parse ~/.grok/sessions/<cwd>/<uuid>/chat_history.jsonl
+      codex: parse ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
+
+    Plain `retire` (no --format) also auto-sweeps local Grok + Codex sessions
+    when those CLIs are installed — they are peers of Claude Code.
     """
     # --all: run all retire paths in sequence
     clean_args = list(args)
@@ -2674,6 +2267,12 @@ def cmd_retire(args):
             return
         elif fmt_flag == "pentagi":
             cmd_pentagi_retire(clean_args)
+            return
+        elif fmt_flag == "grok":
+            cmd_grok_retire(clean_args)
+            return
+        elif fmt_flag == "codex":
+            cmd_codex_retire(clean_args)
             return
         else:
             print(f"Unknown format: {fmt_flag}. Supported: {', '.join(sorted(SUPPORTED_FORMATS))}", file=sys.stderr)
@@ -2816,6 +2415,19 @@ def cmd_retire(args):
             if extra_mined:
                 parts.append(f"{extra_mined} sessions mined")
             print(f"\nExtra:     {', '.join(parts)} from {EXTRA_SESSIONS_DIR}")
+
+    # Peer coding-agent sessions (Grok, Codex) — first-class local sessions,
+    # swept on every retire like Claude. Deduped by session UUID, so re-scans
+    # are cheap. Silently skipped for users without these CLIs installed.
+    for _pname, _pdir, _pparser, _pdiscover, _psub in (
+        ("Grok",  Path.home() / ".grok"  / "sessions", parse_grok_events,  _discover_grok_sessions,  "grok-facts"),
+        ("Codex", Path.home() / ".codex" / "sessions", parse_codex_events, _discover_codex_sessions, "codex-facts"),
+    ):
+        if _pdir.exists():
+            _pcount = _retire_event_sessions(_pdir, _pparser, _psub, _pname.lower(),
+                                             conn, discover_fn=_pdiscover)
+            if _pcount:
+                print(f"{_pname + ':':<10} {_pcount} events staged from {_pdir}")
 
 
 def _scan_extra_sessions(conn: sqlite3.Connection, staged: dict) -> tuple[int, int, int]:
@@ -3113,9 +2725,6 @@ def cmd_s3_retire(args):
     parsed = parser.parse_args(args)
 
     agent_name = parsed.agent_name
-    if is_internal_agent(agent_name):
-        print(f"[s3] skipping '{agent_name}' — listed in internal_agents (excluded from extraction)")
-        return
     fmt = parsed.format or FORMAT_BY_AGENT.get(agent_name, "claude")
 
     # Verify rclone is available
@@ -3490,7 +3099,7 @@ def _run_landscape(domain: str) -> str | None:
 def cmd_landscape(args):
     """Hydrate live state for a domain and print the landscape block."""
     parser = argparse.ArgumentParser(prog="gaius landscape")
-    parser.add_argument("domain", nargs="?", default=None, help="Domain name (e.g. networking, storage)")
+    parser.add_argument("domain", nargs="?", default=None, help="Domain name (e.g. finint, networking)")
     parser.add_argument("--invalidate", action="store_true", help="Force re-run even if cache is fresh")
     parsed = parser.parse_args(args)
 
@@ -3534,7 +3143,7 @@ def cmd_inject(args):
     parser.add_argument("--sop", type=str, default=None, help="Explicit SOP name to inject")
     parser.add_argument("--scopes", type=str, default=None, help="Comma-separated scope labels for SOP matching")
     parser.add_argument("--landscape", type=str, default=None, help="Domain name to hydrate live state for (runs landscape: commands from domain file)")
-    parser.add_argument("--task", type=str, default=None, help="Task description for BM25 relevance ranking (e.g. 'fix DRBD split-brain on node-01')")
+    parser.add_argument("--task", type=str, default=None, help="Task description for BM25 relevance ranking (e.g. 'fix DRBD split-brain on toa-fwd')")
     parser.add_argument("--no-semantic", action="store_true", help="Disable semantic (embedding) scoring even if available")
     parser.add_argument("--no-always-skills", action="store_true", help="Skip gate:always skills (use when session-start already injected them)")
     parser.add_argument("--format", type=str, default="claude", choices=["claude", "gemini", "plain"],
@@ -3640,14 +3249,26 @@ def cmd_inject(args):
     # Handoffs are structured notes left by previous sessions for skill continuity.
     # Injected BEFORE memory files (1.5) because handoffs are direct session context.
     # Only inject the most recent handoff per skill, and only if <48h old.
-    # Handoffs dir is configurable via handoffs_dir in ~/.gaius/config.yaml.
-    _handoffs_cfg = _gaius_cfg.get("handoffs_dir")
-    _HANDOFF_DIR = (
-        Path(_handoffs_cfg).expanduser() if _handoffs_cfg
-        else Path.home() / ".gaius" / "handoffs"
-    )
-    # Alias map: common task names → canonical skill names they should match.
-    # Config-driven (skill_aliases in ~/.gaius/config.yaml); ships empty.
+    _HANDOFF_DIR = Path.home() / "Projects" / "agent-memory" / "handoffs"
+    # Alias map: common task names → canonical skill names they should match
+    _SKILL_ALIASES = {
+        "jdt": "jetint",
+        "japan deluxe": "jetint",
+        "japandeluxe": "jetint",
+        "malware": "malint",
+        "detonation": "malint",
+        "trading": "finint",
+        "autotrade": "finint",
+        "polymarket": "finint",
+        "memory": "mnemos",
+        "surgeon": "mnemos",
+        "frontend": "vantage",
+        "console": "vantage",
+        "kub0.ai": "vantage",
+        "storage": "linstor-drbd",
+        "drbd": "linstor-drbd",
+        "linstor": "linstor-drbd",
+    }
     injected_handoffs = []
     if parsed.task and _HANDOFF_DIR.is_dir():
         _ho_task_lower = parsed.task.lower()
@@ -3955,19 +3576,24 @@ def cmd_inject(args):
     if parsed.task:
         task_terms = re.sub(r'[^\w\s]', ' ', parsed.task.lower()).split()
         bm25_df, bm25_avg_len = _build_bm25_doc_freq(entries, set(task_terms))
-        # Map skill keywords to domains for boosting. Generic defaults; extend
-        # with project-specific skills via skill_domain_map in ~/.gaius/config.yaml.
+        # Map skill keywords to domains for boosting
         _SKILL_DOMAIN_MAP = {
             "ops": {"operational", "general"},
+            "quant": {"finint", "operational"},
+            "finint": {"finint"},
+            "malware": {"security"},
+            "malint": {"malint", "security"},
             "audit": {"security"},
-            "security": {"security"},
             "gaius": {"general", "operational"},
             "maint": {"general", "operational"},
             "storage": {"storage"},
-            "networking": {"networking"},
-            "gitops": {"gitops"},
+            "linstor": {"storage"},
+            "tetragon": {"security"},
+            "cctv": {"cctv", "operational"},
+            "adsb": {"adsb", "operational"},
+            "console": {"services", "frontend"},
+            "jdt": {"services"},
         }
-        _SKILL_DOMAIN_MAP.update(_gaius_cfg.get("skill_domain_map", {}))
         _task_lower = parsed.task.lower()
         for skill_kw, domains in _SKILL_DOMAIN_MAP.items():
             if skill_kw in _task_lower:
@@ -6998,8 +6624,13 @@ def cmd_raft(args):
 
 def _retire_event_sessions(sessions_dir: Path, parser_fn, staging_subdir: str,
                            agent: str, conn: sqlite3.Connection,
-                           dry_run: bool = False) -> int:
-    """Scan a directory of JSONL session files, parse events, domain-tag, stage.
+                           dry_run: bool = False, discover_fn=None) -> int:
+    """Scan a directory of session files, parse events, domain-tag, stage.
+
+    By default sessions are flat ``*.jsonl`` files. Pass ``discover_fn`` to
+    enumerate a non-flat layout (e.g. Grok session dirs, Codex date-nested
+    rollouts) — it receives ``sessions_dir`` and yields Path objects (files or
+    directories) understood by ``parser_fn``.
 
     Returns count of new events staged.
     """
@@ -7007,16 +6638,19 @@ def _retire_event_sessions(sessions_dir: Path, parser_fn, staging_subdir: str,
         print(f"  No sessions directory: {sessions_dir}")
         return 0
 
-    jsonl_files = sorted(sessions_dir.glob("*.jsonl"))
-    if not jsonl_files:
-        print(f"  No .jsonl files in {sessions_dir}")
+    session_paths = (
+        sorted(discover_fn(sessions_dir)) if discover_fn
+        else sorted(sessions_dir.glob("*.jsonl"))
+    )
+    if not session_paths:
+        print(f"  No sessions found in {sessions_dir}")
         return 0
 
     staged_dir = STAGING_DIR / staging_subdir
     staged_dir.mkdir(parents=True, exist_ok=True)
     total_events = 0
 
-    for path in jsonl_files:
+    for path in session_paths:
         session_id = path.stem
         # Check if already processed
         existing = conn.execute(
@@ -7205,6 +6839,44 @@ def cmd_ollama_retire(args):
         "ollama-facts", "ollama", conn, dry_run=parsed.dry_run,
     )
     print(f"[ollama] Staged {count} events total")
+
+
+def cmd_grok_retire(args):
+    """Parse Grok CLI session directories and stage decision events for review."""
+    import argparse
+    parser = argparse.ArgumentParser(prog="gaius grok-retire")
+    parser.add_argument("--sessions-dir", default=str(Path.home() / ".grok" / "sessions"))
+    parser.add_argument("--dry-run", action="store_true")
+    parsed = parser.parse_args(args)
+
+    sessions_dir = Path(parsed.sessions_dir)
+    conn = init_db()
+
+    print(f"[grok] Parsing sessions in {sessions_dir}...")
+    count = _retire_event_sessions(
+        sessions_dir, parse_grok_events, "grok-facts", "grok", conn,
+        dry_run=parsed.dry_run, discover_fn=_discover_grok_sessions,
+    )
+    print(f"[grok] Staged {count} events total")
+
+
+def cmd_codex_retire(args):
+    """Parse Codex CLI rollout sessions and stage decision events for review."""
+    import argparse
+    parser = argparse.ArgumentParser(prog="gaius codex-retire")
+    parser.add_argument("--sessions-dir", default=str(Path.home() / ".codex" / "sessions"))
+    parser.add_argument("--dry-run", action="store_true")
+    parsed = parser.parse_args(args)
+
+    sessions_dir = Path(parsed.sessions_dir)
+    conn = init_db()
+
+    print(f"[codex] Parsing sessions in {sessions_dir}...")
+    count = _retire_event_sessions(
+        sessions_dir, parse_codex_events, "codex-facts", "codex", conn,
+        dry_run=parsed.dry_run, discover_fn=_discover_codex_sessions,
+    )
+    print(f"[codex] Staged {count} events total")
 
 
 def cmd_skills(args):
@@ -8458,7 +8130,7 @@ def _generate_skill_draft(candidate: dict) -> str:
     return f"""---
 name: {domain}
 description: "Auto-suggested skill for {domain} domain ({candidate['facts']} facts)"
-origin: gaius
+origin: kub0
 domain: {domain}
 gate: mandate
 trigger: "{domain} operations, debugging, configuration"
@@ -8468,7 +8140,7 @@ also_load: verification-gate
 # Session Mode: {domain.replace('-', ' ').title()}
 
 > Auto-generated by `gaius suggest`. Review and edit before promoting.
-> Promote: move this file into your skills_dir (see ~/.gaius/config.yaml), then re-run gaius.
+> Promote: `mv this-file ~/Projects/agent-memory/skills/ && gaius commands`
 
 ## Context (top facts from corpus)
 
@@ -8513,7 +8185,7 @@ def cmd_drift(args):
 
     parser = _ap.ArgumentParser(prog="gaius drift")
     parser.add_argument("--registry", default=None,
-                        help="Path to drift-facts.yaml (default: drift_registry in config, else gaius source dir)")
+                        help="Path to drift-facts.yaml (default: gaius source dir)")
     parser.add_argument("--post-council", action="store_true",
                         help="POST drift findings to council alerts channel")
     parser.add_argument("--json", dest="json_out", action="store_true",
@@ -8523,20 +8195,17 @@ def cmd_drift(args):
     parsed = parser.parse_args(args)
 
     # --- Locate registry ---
-    # Precedence: --registry flag > drift_registry in config > drift-facts.yaml
-    # alongside the gaius package source. There is no built-in registry: drift
-    # detection is opt-in — you author drift-facts.yaml for your own configs.
     if parsed.registry:
         registry_path = Path(parsed.registry).expanduser()
-    elif _gaius_cfg.get("drift_registry"):
-        registry_path = Path(_gaius_cfg["drift_registry"]).expanduser()
     else:
+        # Default: alongside the gaius package source
         registry_path = Path(__file__).parent.parent / "drift-facts.yaml"
+        if not registry_path.exists():
+            registry_path = Path.home() / "Projects" / "agent-memory" / "gaius" / "drift-facts.yaml"
 
     if not registry_path.exists():
         print(f"[drift] ERROR: registry not found at {registry_path}", file=sys.stderr)
-        print("[drift] Create drift-facts.yaml, set drift_registry in "
-              "~/.gaius/config.yaml, or pass --registry PATH", file=sys.stderr)
+        print("[drift] Create drift-facts.yaml or pass --registry PATH", file=sys.stderr)
         sys.exit(1)
 
     try:
@@ -8738,6 +8407,27 @@ def cmd_record(args):
     record_main(args)
 
 
+# ── Session-format adapters (extracted to gaius/parsers.py) ──────────────────
+# Imported at module end (not top) so parsers.py can import shared scoring/config
+# from this module without a circular-import error. Re-exported here to preserve
+# the public contract: `from gaius._core import parse_grok_events`, etc.
+from gaius.parsers import (  # noqa: E402
+    detect_format,
+    parse_claude_events,
+    parse_gemini_events,
+    parse_pentagi_flow,
+    parse_pentagi_flow_from_jsonl,
+    parse_ollama_events,
+    _content_blocks_to_text,
+    parse_grok_events,
+    parse_codex_events,
+    _discover_grok_sessions,
+    _discover_codex_sessions,
+    PEER_AGENT_MIN_RESPONSE,
+    _CODEX_CONTEXT_MARKERS,
+)
+
+
 COMMANDS = {
     "init":       cmd_init,
     "retire":     cmd_retire,
@@ -8766,6 +8456,8 @@ COMMANDS = {
     "raft":            cmd_raft,
     "pentagi-retire":  cmd_pentagi_retire,
     "ollama-retire":   cmd_ollama_retire,
+    "grok-retire":     cmd_grok_retire,
+    "codex-retire":    cmd_codex_retire,
     "skills":          cmd_skills,
     "commands":        cmd_commands,
     "landscape":       cmd_landscape,
@@ -8781,7 +8473,7 @@ COMMANDS = {
     "rescore":         cmd_rescore,
 }
 
-SUPPORTED_FORMATS = {"claude", "gemini", "ollama", "vllm", "pentagi"}
+SUPPORTED_FORMATS = {"claude", "gemini", "ollama", "vllm", "pentagi", "grok", "codex"}
 
 
 def main():

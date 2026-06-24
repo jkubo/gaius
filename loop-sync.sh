@@ -36,4 +36,12 @@ else
   echo "[$(ts)] corpus-audit FAILED (non-fatal)" >>"$LOG"
 fi
 
+# 3. Source reconcile: promote curated source-of-truth facts (insert-once, flagged-unverified)
+#    + log dev<->mirror divergence. Closes the promotion gap; mechanical, no LLM, no billing.
+if "$GAIUS" reconcile --promote >>"$LOG" 2>&1; then
+  echo "[$(ts)] reconcile ok" >>"$LOG"
+else
+  echo "[$(ts)] reconcile FAILED (non-fatal)" >>"$LOG"
+fi
+
 echo "[$(ts)] loop-sync done" >>"$LOG"

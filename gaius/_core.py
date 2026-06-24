@@ -8903,8 +8903,38 @@ def source_divergence(dev_path, mirror_path):
             "dev_files": len(dev)}
 
 
-def reconcile_source(conn, src, promote):
-    """Promote a source's curated facts (insert-once, flagged-unverified) + check divergence."""
+def _remote_head(url, branch="main", timeout=15):
+    """SHA of <branch> at a remote via `git ls-remote` over HTTPS (uses the configured git credential
+    helper, so it avoids a passphrase-locked SSH key). Returns None on failure/timeout."""
+    import subprocess
+    try:
+        out = subprocess.run(["git", "ls-remote", "--heads", url, branch],
+                             capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0 or not out.stdout.strip():
+        return None
+    return out.stdout.split()[0]
+
+
+def remote_divergence(remotes, branch="main", head_fn=None):
+    """Compare a source's `main` HEAD across remotes (e.g. a Forgejo dev repo vs its GitHub mirror).
+    remotes = {label: https-url}. Mechanical — `git ls-remote` only, no fetch. Catches the drift the
+    tree-vs-tree check can't see (two remotes on one working tree). An unreachable remote yields
+    in_sync=False (fail-safe — don't silently claim sync when a side is unknown). head_fn defaults to
+    the module-level _remote_head looked up dynamically (so it stays patchable)."""
+    fn = head_fn or _remote_head
+    heads = {label: fn(url, branch) for label, url in remotes.items()}
+    present = [h for h in heads.values() if h]
+    reachable = bool(present) and len(present) == len(heads)
+    in_sync = reachable and len(set(present)) == 1
+    return {"in_sync": in_sync, "reachable": reachable, "branch": branch,
+            "heads": {k: (v[:9] if v else None) for k, v in heads.items()}}
+
+
+def reconcile_source(conn, src, promote, head_fn=None):
+    """Promote a source's curated facts (insert-once, flagged-unverified) + check divergence.
+    head_fn is injectable for tests (defaults to the real git ls-remote probe)."""
     name = src["name"]
     results = []
     for i, text in enumerate(src.get("facts", [])):
@@ -8921,7 +8951,9 @@ def reconcile_source(conn, src, promote):
         else:
             results.append("would-insert")
     div = source_divergence(src["dev_path"], src["mirror_path"]) if src.get("mirror_path") else None
-    return {"name": name, "facts": results, "divergence": div, "publish_cmd": src.get("publish_cmd")}
+    rdiv = remote_divergence(src["remotes"], head_fn=head_fn) if src.get("remotes") else None
+    return {"name": name, "facts": results, "divergence": div, "remote_divergence": rdiv,
+            "publish_cmd": src.get("publish_cmd")}
 
 
 def cmd_reconcile(args):
@@ -8978,6 +9010,14 @@ def cmd_reconcile(args):
                 print(f"        - {f}")
             if r.get("publish_cmd"):
                 print(f"      → sync: {r['publish_cmd']}")
+        rd = r.get("remote_divergence")
+        if rd is not None:
+            if not rd["reachable"]:
+                print(f"    ⚠ remote: UNREACHABLE (can't verify): {rd['heads']}")
+            elif rd["in_sync"]:
+                print(f"    ✓ remote: IN SYNC (main {next(iter(rd['heads'].values()))})")
+            else:
+                print(f"    ⚠ remote DRIFT — main differs across remotes: {rd['heads']}")
     print()
 
 

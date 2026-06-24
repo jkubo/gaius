@@ -5,7 +5,7 @@ from pathlib import Path
 
 from gaius._core import (
     load_source_registry, source_divergence, reconcile_source,
-    _reconcile_excluded, _dir_fingerprint, init_db,
+    _reconcile_excluded, _dir_fingerprint, init_db, remote_divergence,
 )
 
 
@@ -86,6 +86,36 @@ def test_promote_insert_once_no_count_inflation():
         outcome, source = conn.execute(
             "SELECT outcome, source FROM facts WHERE fact_key='reconcile:t:0'").fetchone()
         assert outcome is None and source == "reconcile"
+
+
+def test_remote_divergence_in_sync():
+    heads = {"forgejo": "https://f/x", "github": "https://g/x"}
+    div = remote_divergence(heads, head_fn=lambda url, br: "abc1234567")
+    assert div["in_sync"] and div["reachable"]
+
+
+def test_remote_divergence_drift():
+    fakes = {"https://f/x": "aaaaaaa111", "https://g/x": "bbbbbbb222"}
+    div = remote_divergence({"forgejo": "https://f/x", "github": "https://g/x"},
+                            head_fn=lambda url, br: fakes[url])
+    assert div["reachable"] and not div["in_sync"]  # both reachable, HEADs differ → drift
+
+
+def test_remote_divergence_unreachable_fails_safe():
+    # one side returns None (e.g. auth/network failure) → never claim in_sync
+    div = remote_divergence({"forgejo": "https://f/x", "github": "https://g/x"},
+                            head_fn=lambda url, br: "abc" if "f" in url else None)
+    assert not div["reachable"] and not div["in_sync"]
+
+
+def test_reconcile_source_runs_remote_divergence():
+    with tempfile.TemporaryDirectory() as d:
+        conn = init_db(Path(d) / "facts.db")
+        src = {"name": "ao", "remotes": {"a": "https://a", "b": "https://b"}, "facts": ["f"]}
+        # inject head_fn (deterministic, no network) — both remotes report the same HEAD → in sync
+        r = reconcile_source(conn, src, promote=False, head_fn=lambda url, br="main": "deadbeef99")
+        assert r["remote_divergence"] is not None and r["remote_divergence"]["in_sync"]
+        assert r["divergence"] is None  # no mirror_path → no tree check
 
 
 def test_dry_run_writes_nothing():

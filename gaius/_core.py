@@ -1503,12 +1503,26 @@ def upsert_fact(conn: sqlite3.Connection, domain: str, fact_key: str, fact_text:
 
 
 def tag_domains_from_specs(text: str, domain_specs: dict) -> list[str]:
-    """Return domains whose keywords appear in text. Uses loaded specs."""
+    """Return domains whose keywords appear in text, ranked best-match-first.
+
+    Ranking = number of distinct keyword hits (desc), ties broken by spec
+    order (earlier wins). Callers that take ``domains[0]`` get the DOMINANT
+    topic instead of whichever domain merely happens to be first in the dict.
+    The old boolean-OR-in-dict-order behaviour let a single incidental keyword
+    (e.g. 'dns' in a malware C2 description) hijack threat-intel facts to
+    'networking'; a fact with 3 'security' hits now beats it. Single-match
+    and no-match results are unchanged, so no correctly-formed (two-arg)
+    caller regresses: the domains[0] consumers get the dominant topic and
+    order-insensitive aggregating callers are unaffected.
+    """
     text_lower = text.lower()
-    return [
-        domain for domain, keywords in domain_specs.items()
-        if any(kw in text_lower for kw in keywords)
-    ]
+    scored = []
+    for pos, (domain, keywords) in enumerate(domain_specs.items()):
+        hits = sum(1 for kw in keywords if kw in text_lower)
+        if hits:
+            scored.append((hits, -pos, domain))  # hits desc, then earlier spec pos
+    scored.sort(reverse=True)
+    return [domain for _hits, _pos, domain in scored]
 
 
 # ── Knowledge Graph: Entity Extraction & Triple Management ───────────────────
@@ -4342,8 +4356,9 @@ def cmd_ansible(args):
                     fact_text = fact_text[:500] + "..."
 
                 if not parsed_args.dry_run:
-                    # Auto-tag domain
-                    derived_domain = tag_domains_from_specs(fact_text) or domain
+                    # Auto-tag domain (best-match; fall back to the section domain)
+                    _doms = tag_domains_from_specs(fact_text, load_domain_specs())
+                    derived_domain = _doms[0] if _doms else domain
                     # Distillation pattern: SHA256 first 16 chars
                     fk = hashlib.sha256(fact_text.lower().encode()).hexdigest()[:16]
 
@@ -4487,9 +4502,10 @@ def cmd_aliases(args):
 
                 if not parsed_args.dry_run:
                     fk = hashlib.sha256(fact_text.lower().encode()).hexdigest()[:16]
+                    _doms = tag_domains_from_specs(fact_text, load_domain_specs())
                     upsert_fact(
                         conn,
-                        domain=tag_domains_from_specs(fact_text) or "general",
+                        domain=_doms[0] if _doms else "general",
                         fact_key=fk,
                         fact_text=fact_text,
                         agent="gaius-aliases",
@@ -6683,10 +6699,32 @@ def _retire_event_sessions(sessions_dir: Path, parser_fn, staging_subdir: str,
             for ev in events:
                 f.write(json.dumps(ev) + "\n")
 
+        # Promote to the corpus: peer parity with the Claude retire path,
+        # which auto-promotes via _promote_mined_to_facts. Without this, peer
+        # (Grok/Codex) events stage but never reach facts.db (search/injection).
+        # Run BEFORE register_session: upsert_fact is idempotent on fact_key, so
+        # a crash mid-loop just re-promotes next run; the session is marked
+        # processed only once promotion has run.
+        promoted = 0
+        for ev in events:
+            try:
+                upsert_fact(
+                    conn, domain=ev.get("domain", "general"),
+                    fact_key=ev["fact_key"], fact_text=ev.get("description", ""),
+                    agent=agent, session_uuid=ev.get("session_uuid", session_id),
+                    provenance=ev.get("provenance", "inference"),
+                    model_family=ev.get("model_family", agent),
+                    model_version=ev.get("model_version", ""),
+                    outcome=ev.get("outcome"), source=agent,
+                )
+                promoted += 1
+            except Exception as e:
+                print(f"  warn: promote {ev.get('fact_key', '?')}: {e}", file=sys.stderr)
+
         register_session(conn, session_id, "local", agent,
                          "cluster", path.stat().st_size)
         total_events += len(events)
-        print(f"  Staged {len(events)} events from {path.name}")
+        print(f"  Staged {len(events)} events ({promoted} promoted) from {path.name}")
 
     return total_events
 
@@ -8428,6 +8466,348 @@ from gaius.parsers import (  # noqa: E402
 )
 
 
+# --- Phase 1b: production-outcome ingestion (closed self-improvement loop) ---
+# Pulls completed-task outcomes from the orchestrator GET /outcomes into facts.db's
+# task_outcomes table. ADDITIVE — never touches the facts table; idempotent by task key.
+# Foundation for outcome-grounded corpus scoring (Phase 2) + the gaius router (Phase 3).
+# Scope: ~/ansible/drafts/closed-loop-self-improvement-scope-20260623.md
+
+def _ensure_outcomes_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS task_outcomes (
+            key           TEXT PRIMARY KEY,
+            scope         TEXT,
+            model         TEXT,
+            status        TEXT,
+            result_status TEXT,
+            success       INTEGER,
+            summary       TEXT,
+            cost_usd      REAL,
+            verdicts      TEXT,
+            at            TEXT,
+            ingested_at   TEXT
+        )
+        """
+    )
+    conn.commit()
+
+
+def ingest_outcomes(conn: sqlite3.Connection, records: list) -> tuple:
+    """Upsert orchestrator task-outcome records into task_outcomes. Idempotent by key;
+    never touches the facts table. Records lacking a key are skipped. Returns (inserted, updated)."""
+    _ensure_outcomes_table(conn)
+    now = datetime.now(timezone.utc).isoformat()
+    ins = upd = 0
+    for r in records:
+        key = (r.get("key") or "").strip()
+        if not key:
+            continue
+        existed = conn.execute("SELECT 1 FROM task_outcomes WHERE key = ?", (key,)).fetchone()
+        conn.execute(
+            """
+            INSERT INTO task_outcomes
+                (key, scope, model, status, result_status, success, summary, cost_usd, verdicts, at, ingested_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                scope=excluded.scope, model=excluded.model, status=excluded.status,
+                result_status=excluded.result_status, success=excluded.success,
+                summary=excluded.summary, cost_usd=excluded.cost_usd,
+                verdicts=excluded.verdicts, at=excluded.at, ingested_at=excluded.ingested_at
+            """,
+            (
+                key, r.get("scope"), r.get("model"), r.get("status"), r.get("result_status"),
+                1 if r.get("success") else 0, (r.get("summary") or "")[:500],
+                float(r.get("cost_usd") or 0), json.dumps(r.get("verdicts") or []),
+                r.get("at"), now,
+            ),
+        )
+        if existed:
+            upd += 1
+        else:
+            ins += 1
+    conn.commit()
+    return ins, upd
+
+
+def outcome_winrates(conn: sqlite3.Connection) -> list:
+    """Per-scope success rate over task_outcomes — the routing/grounding signal."""
+    _ensure_outcomes_table(conn)
+    rows = conn.execute(
+        "SELECT COALESCE(scope,''), COUNT(*), COALESCE(SUM(success),0) "
+        "FROM task_outcomes GROUP BY scope ORDER BY scope"
+    ).fetchall()
+    return [
+        {"scope": scope, "total": total, "success": success,
+         "rate": (success / total) if total else 0.0}
+        for scope, total, success in rows
+    ]
+
+
+def cmd_ingest_outcomes(args):
+    """Pull completed-task outcomes from the orchestrator into facts.db task_outcomes.
+
+    Additive (never touches facts); idempotent by key. Foundation for outcome-grounded
+    corpus scoring. Usage: gaius ingest-outcomes [--orch URL] [--limit N] [--dry-run]
+    """
+    import urllib.request
+    p = argparse.ArgumentParser(prog="gaius ingest-outcomes")
+    p.add_argument("--orch", default=os.environ.get("AGENT_ORCH_URL", "http://localhost:8080"),
+                   help="orchestrator base URL (or set AGENT_ORCH_URL)")
+    p.add_argument("--limit", type=int, default=500)
+    p.add_argument("--dry-run", action="store_true", help="fetch + print; write nothing")
+    ns = p.parse_args(args)
+
+    url = ns.orch.rstrip("/") + f"/outcomes?limit={ns.limit}"
+    try:
+        with urllib.request.urlopen(url, timeout=20) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception as e:
+        print(f"fetch {url}: {e}", file=sys.stderr)
+        sys.exit(1)
+    records = data.get("recent") or []
+    print(f"fetched {len(records)} outcomes (orchestrator count={data.get('count')}) from {url}")
+    if ns.dry_run:
+        for r in records[:10]:
+            print(f"  {r.get('key')}  {r.get('scope')}  success={r.get('success')}")
+        print("(--dry-run: nothing written)")
+        return
+    conn = init_db()
+    ins, upd = ingest_outcomes(conn, records)
+    print(f"task_outcomes: +{ins} new, {upd} updated")
+    for wr in outcome_winrates(conn):
+        print(f"  {wr['scope'] or '(none)'}: {wr['success']}/{wr['total']} ({wr['rate']*100:.0f}%)")
+
+
+# --- Phase 2 (shadow): corpus integrity / self-poison audit ---
+# READ-ONLY. Surfaces the risk the operator named: facts corroborated by REPETITION but never
+# outcome- or human-verified, plus contradiction clusters (same fact_key, divergent live facts).
+# This is the shadow half of outcome-grounding — it MUTATES NOTHING. Enforcement (demote/
+# tombstone) is a later, operator-gated step once the retrieval->outcome linkage exists.
+
+REPETITION_THRESHOLD = 2  # confirmation_count at/above which a fact is "rewarded by repetition"
+
+
+def repetition_candidates(conn: sqlite3.Connection, limit: int = 20) -> list:
+    """List repetition-only facts (corroborated by repeats, never outcome/human-verified) — the
+    candidates an operator-gated enforcement pass would demote. Read-only; worst (most-repeated) first."""
+    rows = conn.execute(
+        "SELECT id, domain, confirmation_count, COALESCE(score,0), substr(fact_text,1,140) "
+        "FROM facts WHERE tombstoned_at IS NULL AND confirmation_count >= ? "
+        "AND outcome IS NULL AND (confidence_source IS NULL OR confidence_source != 'human') "
+        "ORDER BY confirmation_count DESC, COALESCE(score,0) DESC LIMIT ?",
+        (REPETITION_THRESHOLD, limit)).fetchall()
+    return [{"id": r[0], "domain": r[1], "confirmation_count": r[2], "score": r[3], "text": r[4]}
+            for r in rows]
+
+
+def corpus_audit_stats(conn: sqlite3.Connection) -> dict:
+    """Compute read-only corpus integrity signals over the facts table. Never writes."""
+    def scalar(q, *a):
+        row = conn.execute(q, a).fetchone()
+        return (row[0] if row and row[0] is not None else 0)
+
+    stats = {
+        "live_facts": scalar("SELECT COUNT(*) FROM facts WHERE tombstoned_at IS NULL"),
+        "human_verified": scalar(
+            "SELECT COUNT(*) FROM facts WHERE tombstoned_at IS NULL AND confidence_source='human'"),
+        "outcome_verified": scalar(
+            "SELECT COUNT(*) FROM facts WHERE tombstoned_at IS NULL AND outcome IS NOT NULL AND outcome != 'rejected'"),
+        "rejected": scalar("SELECT COUNT(*) FROM facts WHERE outcome='rejected'"),
+        # corroborated by repeats, never outcome- or human-verified — the self-poison surface
+        "repetition_unverified": scalar(
+            "SELECT COUNT(*) FROM facts WHERE tombstoned_at IS NULL AND confirmation_count >= ? "
+            "AND outcome IS NULL AND (confidence_source IS NULL OR confidence_source != 'human')",
+            REPETITION_THRESHOLD),
+        # same fact_key, more than one live fact → divergent claims under one key
+        "contradiction_keys": scalar(
+            "SELECT COUNT(*) FROM (SELECT fact_key FROM facts WHERE tombstoned_at IS NULL "
+            "GROUP BY fact_key HAVING COUNT(*) > 1)"),
+        "contradiction_facts": scalar(
+            "SELECT COALESCE(SUM(c),0) FROM (SELECT COUNT(*) c FROM facts WHERE tombstoned_at IS NULL "
+            "GROUP BY fact_key HAVING COUNT(*) > 1)"),
+        "conflict_flagged": scalar(
+            "SELECT COUNT(*) FROM facts WHERE tombstoned_at IS NULL AND conflict_with IS NOT NULL"),
+    }
+    # Outcome cross-ref, only if task_outcomes exists (avoids a write on a read-only conn).
+    has_to = scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='task_outcomes'")
+    if has_to:
+        stats["task_outcomes"] = scalar("SELECT COUNT(*) FROM task_outcomes")
+        rows = conn.execute(
+            "SELECT COALESCE(scope,''), COUNT(*), COALESCE(SUM(success),0) "
+            "FROM task_outcomes GROUP BY scope ORDER BY scope").fetchall()
+        stats["outcome_by_scope"] = [
+            {"scope": s, "total": t, "success": su, "rate": (su / t if t else 0.0)}
+            for s, t, su in rows
+        ]
+    return stats
+
+
+def cmd_corpus_audit(args):
+    """Read-only corpus integrity / self-poison shadow audit (Phase 2 — mutates nothing).
+
+    Surfaces facts rewarded by repetition but never outcome/human-verified, contradiction
+    clusters, and (with --candidates N) the prune candidates an operator-gated enforcement pass
+    would demote. Usage: gaius corpus-audit [--json] [--samples N] [--candidates N]
+    """
+    p = argparse.ArgumentParser(prog="gaius corpus-audit")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--samples", type=int, default=5)
+    p.add_argument("--candidates", type=int, default=0,
+                   help="list the top-N repetition-only prune candidates (read-only)")
+    ns = p.parse_args(args)
+
+    # READ-ONLY connection — Phase 2 shadow MUST NOT mutate the corpus (enforced at the SQLite layer).
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    stats = corpus_audit_stats(conn)
+    samples = conn.execute(
+        "SELECT fact_key, COUNT(*) c FROM facts WHERE tombstoned_at IS NULL "
+        "GROUP BY fact_key HAVING c > 1 ORDER BY c DESC LIMIT ?", (ns.samples,)).fetchall()
+    cands = repetition_candidates(conn, ns.candidates) if ns.candidates > 0 else []
+
+    if ns.json:
+        print(json.dumps({**stats,
+                          "contradiction_samples": [{"fact_key": k, "count": c} for k, c in samples],
+                          "repetition_candidates": cands}, indent=2))
+        return
+
+    live = stats["live_facts"] or 1
+    pct = lambda n: f"{n / live * 100:.1f}%"
+    print("\nCORPUS AUDIT (read-only shadow — Phase 2, mutates nothing)")
+    print(f"  live facts:           {stats['live_facts']}")
+    print(f"  human-verified:       {stats['human_verified']} ({pct(stats['human_verified'])})")
+    print(f"  outcome-verified:     {stats['outcome_verified']} ({pct(stats['outcome_verified'])})")
+    print(f"  ⚠ repetition-only:    {stats['repetition_unverified']} ({pct(stats['repetition_unverified'])})  — corroborated by REPEATS, never outcome/human-verified")
+    print(f"  ⚠ contradiction:      {stats['contradiction_keys']} keys / {stats['contradiction_facts']} facts (same fact_key, divergent)")
+    print(f"  conflict-flagged:     {stats['conflict_flagged']}")
+    if "task_outcomes" in stats:
+        print(f"  task_outcomes:        {stats['task_outcomes']}")
+    if samples:
+        print("  top contradiction keys:")
+        for k, c in samples:
+            print(f"    {c}x  {k}")
+    if cands:
+        print(f"  repetition-only prune candidates (top {len(cands)}, operator-gated to enforce):")
+        for c in cands:
+            print(f"    [{c['id']}] cc={c['confirmation_count']} {c['domain']}: {c['text']}")
+    print()
+
+
+# --- Phase 3: gaius-grounded router (retrieval-augmented, read-only) ---
+# Augments the keyword router (route_domains) with the ACTUAL corpus facts behind each domain
+# + task_outcomes win-rates, so a route is grounded in own history and TRANSPARENT (returns the
+# supporting facts) — vs Fugu's trained black box. Crucially flags how many supporting facts are
+# UNVERIFIED (repetition-only), tying routing to the Phase 2 self-poison signal. Read-only;
+# mutates nothing. The orchestrator adopting this for real routing is a later, flag-gated step.
+
+def _corpus_domain_search(conn: sqlite3.Connection, query: str, limit: int = 8):
+    """Cheap corpus-CONTENT retrieval signal: live facts whose text contains query terms,
+    grouped by domain. BM25-lite over the corpus itself (not the hardcoded keyword map), so
+    routing reflects what the corpus actually knows — covering the keyword router's blind spots.
+    Read-only. Returns (domains_ranked, facts)."""
+    terms = re.findall(r"[a-z0-9-]{4,}", query.lower())[:10]
+    if not terms:
+        return [], []
+    where = " OR ".join(["LOWER(fact_text) LIKE ?"] * len(terms))
+    rows = conn.execute(
+        "SELECT id, domain, fact_text, confirmation_count, COALESCE(score,0), outcome, confidence_source "
+        "FROM facts WHERE tombstoned_at IS NULL AND (" + where + ") "
+        "ORDER BY COALESCE(score,0) DESC, confirmation_count DESC LIMIT ?",
+        [f"%{t}%" for t in terms] + [limit]).fetchall()
+    ranked = [d for d, _ in Counter(r[1] for r in rows).most_common()]
+    facts = [{
+        "id": r[0], "domain": r[1], "text": (r[2] or "")[:160],
+        "confirmation_count": r[3], "score": r[4],
+        "verified": bool(r[5] and r[5] != "rejected") or r[6] == "human",
+    } for r in rows]
+    return ranked, facts
+
+
+def route_suggest(conn: sqlite3.Connection, query: str, hint: str = None, max_facts: int = 5) -> dict:
+    """Retrieval-augmented routing recommendation (read-only). Combines the keyword router with a
+    corpus-content search so the route reflects what the corpus actually knows; returns supporting
+    facts (each with a verified flag), how many are UNVERIFIED, and task_outcomes win-rates. Never writes."""
+    kw_domains = route_domains(query, primary_hint=hint, max_files=3, max_chars=8000)
+    corpus_domains, corpus_facts = _corpus_domain_search(conn, query, limit=max_facts)
+
+    # Prefer the keyword router when it hits (cheap, precise); else the corpus-content signal
+    # (covers the keyword router's blind spots); else the explicit hint.
+    primary = (kw_domains[0]["domain"] if kw_domains
+               else corpus_domains[0] if corpus_domains
+               else hint)
+
+    # Supporting facts: the corpus-matched facts (they matched the query content); else the
+    # top facts of the primary domain.
+    facts = corpus_facts[:max_facts]
+    if not facts and primary:
+        rows = conn.execute(
+            "SELECT id, fact_text, confirmation_count, COALESCE(score,0), outcome, confidence_source "
+            "FROM facts WHERE domain = ? AND tombstoned_at IS NULL "
+            "ORDER BY COALESCE(score,0) DESC, confirmation_count DESC LIMIT ?",
+            (primary, max_facts)).fetchall()
+        facts = [{
+            "id": fid, "domain": primary, "text": (text or "")[:160],
+            "confirmation_count": cc, "score": score,
+            "verified": bool(outcome and outcome != "rejected") or csrc == "human",
+        } for fid, text, cc, score, outcome, csrc in rows]
+
+    winrates = []
+    has_to = conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='task_outcomes'").fetchone()[0]
+    if has_to:
+        rows = conn.execute(
+            "SELECT COALESCE(scope,''), COUNT(*), COALESCE(SUM(success),0) "
+            "FROM task_outcomes GROUP BY scope ORDER BY 3 DESC").fetchall()
+        winrates = [{"scope": s, "total": t, "success": su, "rate": (su / t if t else 0.0)}
+                    for s, t, su in rows]
+
+    return {
+        "query": query,
+        "domains": kw_domains,
+        "corpus_domains": corpus_domains,
+        "primary_domain": primary,
+        "supporting_facts": facts,
+        "unverified_supporting": sum(1 for f in facts if not f["verified"]),
+        "outcome_winrates": winrates,
+    }
+
+
+def cmd_route_suggest(args):
+    """Retrieval-augmented routing recommendation grounded in corpus facts (read-only).
+
+    Unlike 'route' (keyword domains only), this returns the supporting facts + how many are
+    UNVERIFIED + outcome win-rates. Usage: gaius route-suggest <task...> [--hint D] [--json]
+    """
+    p = argparse.ArgumentParser(prog="gaius route-suggest")
+    p.add_argument("query", nargs="+", help="task / query text to route")
+    p.add_argument("--hint", default=None, help="primary domain hint")
+    p.add_argument("--max-facts", type=int, default=5)
+    p.add_argument("--json", action="store_true")
+    ns = p.parse_args(args)
+    query = " ".join(ns.query)
+
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)  # read-only: routing never mutates
+    res = route_suggest(conn, query, hint=ns.hint, max_facts=ns.max_facts)
+
+    if ns.json:
+        print(json.dumps(res, indent=2))
+        return
+    print(f"\nROUTE: {query[:100]}{'...' if len(query) > 100 else ''}")
+    print(f"  primary domain: {res['primary_domain']}")
+    if res["domains"]:
+        print("  candidates: " + ", ".join(f"{d['domain']}({d['score']:.2f})" for d in res["domains"]))
+    if res["supporting_facts"]:
+        print(f"  supporting facts ({res['unverified_supporting']}/{len(res['supporting_facts'])} UNVERIFIED — repetition-only):")
+        for f in res["supporting_facts"]:
+            mark = "✓" if f["verified"] else "⚠"
+            print(f"    {mark} [{f['id']}] {f['text']}")
+    if res["outcome_winrates"]:
+        print("  scope win-rates (from task_outcomes):")
+        for w in res["outcome_winrates"][:5]:
+            print(f"    {w['scope'] or '(none)'}: {w['success']}/{w['total']} ({w['rate']*100:.0f}%)")
+    print()
+
+
 COMMANDS = {
     "init":       cmd_init,
     "retire":     cmd_retire,
@@ -8471,6 +8851,9 @@ COMMANDS = {
     "drift":           cmd_drift,
     "record":          cmd_record,
     "rescore":         cmd_rescore,
+    "ingest-outcomes": cmd_ingest_outcomes,
+    "corpus-audit":    cmd_corpus_audit,
+    "route-suggest":   cmd_route_suggest,
 }
 
 SUPPORTED_FORMATS = {"claude", "gemini", "ollama", "vllm", "pentagi", "grok", "codex"}

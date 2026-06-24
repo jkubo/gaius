@@ -51,6 +51,7 @@ from gaius._core import (
     _embed_text,
     _maturity_score,
     init_db,
+    route_suggest,
 )
 
 # ── Pillar config ────────────────────────────────────────────────────────────
@@ -436,6 +437,22 @@ async def snapshot(request: Request):
         "total_domains": len(all_domains),
         "domains": domains_out,
     }
+
+
+@app.get("/route-suggest")
+async def route_suggest_endpoint(
+    request: Request,
+    q: str = Query(..., description="task / query to route"),
+    hint: str = Query(None, description="primary domain hint"),
+    max_facts: int = Query(5, ge=1, le=25),
+):
+    """Phase 3 — retrieval-augmented routing recommendation (read-only). Returns the primary
+    domain, supporting corpus facts (each with a verified flag), the UNVERIFIED count, and
+    task_outcomes win-rates. The orchestrator adopts this (flag-gated) for grounded, transparent
+    routing. Read-only: route_suggest issues only SELECTs."""
+    _check_auth(request)
+    conn = _get_db()
+    return route_suggest(conn, q, hint=hint, max_facts=max_facts)
 
 
 @app.get("/recent")

@@ -149,3 +149,33 @@ class TestContentDefects:
         p.write_text("- **Header**: " + ("accretion " * 230) + "\n")  # >2000 chars, no merge
         kinds = [k for _, k, _ in mn.scan_content_defects(p)]
         assert "long-line" in kinds and "joined-line" not in kinds
+
+
+class TestMemoryByteBudget:
+    """MEMORY.md injection-budget check (16KB warn / 20KB error). Regressed once
+    when an installed-only copy was overwritten by source — now tested so it can't
+    silently vanish again. Bodies use <180 short lines to isolate bytes from the
+    line-count and runaway-line checks."""
+
+    def _write(self, d, total_bytes, line_len=100):
+        line = "z" * (line_len - 1) + "\n"
+        n = total_bytes // line_len
+        (d / "MEMORY.md").write_text(line * n)
+
+    def test_over_16kb_is_yellow_advisory(self, tmp_path, capsys):
+        self._write(tmp_path, 17000)                 # 170 lines, GREEN on lines
+        mn.cmd_health(tmp_path, [])
+        out = capsys.readouterr().out
+        assert "YELLOW" in out and "injection-budget" in out
+        assert "within threshold" not in out
+
+    def test_over_20kb_emits_blocking_red_marker(self, tmp_path, capsys):
+        self._write(tmp_path, 22100, line_len=130)   # 170 lines, RED on bytes only
+        mn.cmd_health(tmp_path, [])
+        out = capsys.readouterr().out
+        assert "\033[31m\033[1mRED\033[0m" in out     # pre-commit hook greps this -> blocks
+
+    def test_under_16kb_clean(self, tmp_path, capsys):
+        self._write(tmp_path, 5100, line_len=51)     # 100 lines, all GREEN
+        mn.cmd_health(tmp_path, [])
+        assert "within threshold" in capsys.readouterr().out

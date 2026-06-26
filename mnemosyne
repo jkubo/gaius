@@ -182,6 +182,24 @@ def cmd_health(memory_dir: Path, args: list):
 
     print()
 
+    # ── MEMORY.md byte budget (injection budget; a few long lines can blow it
+    #    while staying under the line cap, so it is checked separately) ──
+    BYTE_WARN, BYTE_ERR = 16 * 1024, 20 * 1024
+    byte_red = byte_yellow = False
+    _mem = memory_dir / "MEMORY.md"
+    if _mem.exists():
+        _sz = _mem.stat().st_size
+        if _sz >= BYTE_ERR:
+            _bs = f"{RED}{BOLD}RED{RESET}"; byte_red = True
+        elif _sz >= BYTE_WARN:
+            _bs = f"{YELLOW}YELLOW{RESET}"; byte_yellow = True
+        else:
+            _bs = f"{GREEN}GREEN{RESET}"
+        print(f"{'File':<{col_file}} {'Size':>7}  Threshold              Status")
+        print("─" * (col_file + 30))
+        print(f"{'MEMORY.md':<{col_file}} {_sz / 1024:>6.1f}KB  warn=16.0KB/err=20.0KB {_bs}")
+        print()
+
     # ── Content defects: structural corruption invisible to line/byte checks ──
     paths = []
     for name in ["MEMORY.md", "common.md"]:
@@ -221,7 +239,13 @@ def cmd_health(memory_dir: Path, args: list):
               f"(accretion — compress to a pointer):{RESET}")
         for rel, lineno, detail in longish:
             print(f"   {rel}:{lineno}  {detail}")
-    if not reds and not yellows and not joined and not longish:
+    if byte_yellow:
+        print(f"{YELLOW}⚡  MEMORY.md over the 16KB injection-budget warn — compress.{RESET}")
+    if byte_red:
+        red = f"{RED}{BOLD}RED{RESET}"
+        print(f"{RED}{BOLD}⚠  MEMORY.md over the 20KB error{RESET} [{red}] — compress before commit.")
+    if (not reds and not yellows and not joined and not longish
+            and not byte_red and not byte_yellow):
         print(f"{GREEN}✓  All files within threshold.{RESET}")
     print()
 

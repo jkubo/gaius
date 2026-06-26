@@ -117,3 +117,35 @@ class TestAudit:
     def test_missing_common_md_exits(self, tmp_path):
         with pytest.raises(SystemExit):
             mn.cmd_audit(tmp_path, [])
+
+
+class TestContentDefects:
+    """scan_content_defects catches structural corruption line/byte checks miss."""
+
+    def test_detects_joined_bullet(self, tmp_path):
+        p = tmp_path / "x.md"
+        p.write_text("- **A**: text ending (2026-06-08).- **B**: merged on one line\n")
+        kinds = [k for _, k, _ in mn.scan_content_defects(p)]
+        assert "joined-line" in kinds
+
+    def test_clean_file_no_defects(self, tmp_path):
+        p = tmp_path / "x.md"
+        p.write_text("- **A**: a fact.\n- **B**: another fact.\n")
+        assert mn.scan_content_defects(p) == []
+
+    def test_legit_inline_dash_not_flagged(self, tmp_path):
+        # space before the dash => legitimate inline emphasis, not a merged bullet
+        p = tmp_path / "x.md"
+        p.write_text("- **A**: uses X - **bold** mid sentence.\n")
+        assert all(k != "joined-line" for _, k, _ in mn.scan_content_defects(p))
+
+    def test_internal_hyphen_date_not_flagged(self, tmp_path):
+        p = tmp_path / "x.md"
+        p.write_text("- **Window**: 2026-06-29/30 genesis-config window pending.\n")
+        assert mn.scan_content_defects(p) == []
+
+    def test_detects_runaway_line(self, tmp_path):
+        p = tmp_path / "x.md"
+        p.write_text("- **Header**: " + ("accretion " * 230) + "\n")  # >2000 chars, no merge
+        kinds = [k for _, k, _ in mn.scan_content_defects(p)]
+        assert "long-line" in kinds and "joined-line" not in kinds

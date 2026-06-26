@@ -613,3 +613,95 @@ class TestSectionExtraction:
     def test_missing_section_returns_empty(self):
         from gaius._core import extract_section
         assert extract_section("No sections here", "Nonexistent Section") == ""
+
+
+class TestCmdDoneDisambiguation:
+    """`gaius done` auto-resolves a colliding prefix to the single unreviewed match.
+
+    Short `mined-XX` labels collide across sessions; before this the command
+    refused with 'Ambiguous prefix'. Now: if exactly one match is unreviewed,
+    use it; only error when 0 or >=2 unreviewed share the prefix.
+    """
+
+    def _stage(self, monkeypatch, tmp_path, *entries):
+        from gaius import _core
+        monkeypatch.setattr(_core, "STAGING_DIR", tmp_path)
+        for uid, reviewed, ts in entries:
+            _core.save_staged({"uuid": uid, "timestamp": ts,
+                               "reviewed": reviewed, "sections": {}})
+        return _core
+
+    def test_collision_one_unreviewed_auto_marks(self, tmp_path, monkeypatch, capsys):
+        _core = self._stage(monkeypatch, tmp_path,
+                            ("ab12aaaa-1111", True,  "2026-06-26T00:00:00"),
+                            ("ab12bbbb-2222", False, "2026-06-26T00:00:01"))
+        _core.cmd_done(["ab12"])
+        assert "Marked reviewed" in capsys.readouterr().out
+        assert _core.load_staged()["ab12bbbb-2222"]["reviewed"] is True
+
+    def test_collision_multiple_unreviewed_still_errors(self, tmp_path, monkeypatch):
+        _core = self._stage(monkeypatch, tmp_path,
+                            ("ab12aaaa-1111", False, "2026-06-26T00:00:00"),
+                            ("ab12bbbb-2222", False, "2026-06-26T00:00:01"))
+        with pytest.raises(SystemExit):
+            _core.cmd_done(["ab12"])
+
+    def test_unique_prefix_unaffected(self, tmp_path, monkeypatch, capsys):
+        _core = self._stage(monkeypatch, tmp_path,
+                            ("cd34eeee-3333", False, "2026-06-26T00:00:00"))
+        _core.cmd_done(["cd34"])
+        assert "Marked reviewed" in capsys.readouterr().out
+        assert _core.load_staged()["cd34eeee-3333"]["reviewed"] is True
+
+
+class TestDriftLive:
+    """`gaius drift --live` validates memory claims against live probes.
+
+    Hermetic: probes are `echo`/`false` (no cluster, no ssh) via an empty
+    probe_prefix, so these test the extract/compare/bucket logic only.
+    """
+
+    def _run(self, tmp_path, monkeypatch, mem_text, claim):
+        import yaml as _y
+        from gaius import _core
+        mem = tmp_path / "mem"
+        mem.mkdir()
+        (mem / "MEMORY.md").write_text(mem_text)
+        monkeypatch.setattr(_core, "MEMORY_DIR", mem)
+        reg = tmp_path / "live-claims.yaml"
+        reg.write_text(_y.safe_dump({"claims": [claim]}))
+        with pytest.raises(SystemExit) as exc:
+            _core.cmd_drift(["--live", "--registry", str(reg)])
+        return exc.value.code
+
+    def test_ok_when_value_matches(self, tmp_path, monkeypatch, capsys):
+        code = self._run(tmp_path, monkeypatch, "- Cluster: 18 nodes all Ready\n",
+            {"id": "n", "file": "MEMORY.md",
+             "pattern": r"Cluster: (\d+) nodes all Ready", "probe": "echo 18", "compare": "eq"})
+        assert code == 0 and "OK" in capsys.readouterr().out
+
+    def test_stale_when_value_mismatches(self, tmp_path, monkeypatch, capsys):
+        code = self._run(tmp_path, monkeypatch, "- Cluster: 18 nodes all Ready\n",
+            {"id": "n", "file": "MEMORY.md",
+             "pattern": r"Cluster: (\d+) nodes all Ready", "probe": "echo 19", "compare": "eq"})
+        assert code == 1 and "STALE" in capsys.readouterr().out
+
+    def test_probe_failure_is_uncheckable_not_stale(self, tmp_path, monkeypatch, capsys):
+        code = self._run(tmp_path, monkeypatch, "- Cluster: 18 nodes all Ready\n",
+            {"id": "n", "file": "MEMORY.md",
+             "pattern": r"Cluster: (\d+) nodes all Ready", "probe": "false", "compare": "eq"})
+        # a flaky/failed probe must NEVER fail the run or alert
+        assert code == 0 and "uncheckable" in capsys.readouterr().out.lower()
+
+    def test_missing_anchor_is_uncheckable(self, tmp_path, monkeypatch, capsys):
+        code = self._run(tmp_path, monkeypatch, "- nothing relevant\n",
+            {"id": "n", "file": "MEMORY.md",
+             "pattern": r"Cluster: (\d+) nodes", "probe": "echo 18", "compare": "eq"})
+        assert code == 0 and "uncheckable" in capsys.readouterr().out.lower()
+
+    def test_contains_comparator_matches_substring(self, tmp_path, monkeypatch, capsys):
+        code = self._run(tmp_path, monkeypatch, "- Traefik on **aus-fwd-gpu-02** not gpu-01\n",
+            {"id": "t", "file": "MEMORY.md",
+             "pattern": r"Traefik on \*\*(aus-fwd-gpu-\d+)\*\*",
+             "probe": "echo k8s-aus-fwd-gpu-02", "compare": "contains"})
+        assert code == 0 and "OK" in capsys.readouterr().out

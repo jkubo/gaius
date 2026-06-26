@@ -5066,11 +5066,19 @@ def cmd_done(args):
         print(f"No summary matching prefix: {prefix}", file=sys.stderr)
         sys.exit(1)
     if len(matches) > 1:
-        print(f"Ambiguous prefix '{prefix}' matches {len(matches)} summaries:",
-              file=sys.stderr)
-        for uid, _ in matches:
-            print(f"  {uid}", file=sys.stderr)
-        sys.exit(1)
+        # Short labels (e.g. `mined-XX`) collide across sessions, but the intent
+        # is almost always the one still UNREVIEWED. Auto-disambiguate to it;
+        # only error if the collision is itself ambiguous (0 or >=2 unreviewed).
+        unreviewed = [(uid, e) for uid, e in matches if not e.get("reviewed")]
+        if len(unreviewed) == 1:
+            matches = unreviewed
+        else:
+            print(f"Ambiguous prefix '{prefix}' matches {len(matches)} summaries "
+                  f"({len(unreviewed)} unreviewed):", file=sys.stderr)
+            for uid, e in matches:
+                state = "reviewed" if e.get("reviewed") else "UNREVIEWED"
+                print(f"  {uid}  [{state}]", file=sys.stderr)
+            sys.exit(1)
 
     uid, e = matches[0]
     if e.get("reviewed"):
@@ -8198,6 +8206,159 @@ also_load: verification-gate
 """
 
 
+def _drift_live(parsed):
+    """Validate memory-file claims against LIVE cluster state.
+
+    Companion to cmd_drift (which does config-file <-> doc-file matching). Reads a
+    live-claims.yaml registry: each claim names a memory file + a regex anchor
+    (asserted value = first capture group), a shell probe (live value), and a
+    comparator. Three outcomes per claim:
+      OK          - asserted matches live.
+      STALE       - asserted != live  -> reported, exit 1, --post-council alerts.
+      UNCHECKABLE - probe failed or anchor not found -> never alerts (a flaky
+                    kubectl must not page); reported in its own bucket.
+
+    Probes run through the registry's 'probe_prefix' (e.g. an ssh-to-genesis
+    wrapper); the probe string is shell-quoted so pipes/jsonpath run intact on
+    the far side. Usage: gaius drift --live [--registry P] [--post-council] [--quiet]
+    """
+    import re
+    import shlex
+    import subprocess
+    import urllib.request
+    import urllib.error
+
+    GREEN = "\033[0;32m"; YELLOW = "\033[1;33m"; RED = "\033[0;31m"; RESET = "\033[0m"
+
+    # Registry holds cluster topology (node names, genesis IP) -> internal-only,
+    # excluded from the OSS mirror exactly like drift-facts.yaml.
+    if parsed.registry:
+        reg_path = Path(parsed.registry).expanduser()
+    else:
+        reg_path = Path(__file__).parent.parent / "live-claims.yaml"
+        if not reg_path.exists():
+            reg_path = Path.home() / ".gaius" / "live-claims.yaml"
+    if not reg_path.exists():
+        print(f"[drift --live] ERROR: registry not found at {reg_path}", file=sys.stderr)
+        print("[drift --live] Create live-claims.yaml or pass --registry PATH", file=sys.stderr)
+        sys.exit(1)
+    try:
+        with open(reg_path) as _f:
+            registry = yaml.safe_load(_f) or {}
+    except Exception as e:
+        print(f"[drift --live] ERROR: cannot load registry: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    claims = registry.get("claims", [])
+    if not claims:
+        print("[drift --live] No claims defined in registry.")
+        return
+    prefix = (registry.get("probe_prefix") or "").strip()
+    timeout = registry.get("probe_timeout", 30)
+    mem_base = MEMORY_DIR or (Path.home() / ".claude" / "projects"
+                              / "-home-jkubo-ansible" / "memory")
+
+    def _asserted(fil, pattern):
+        p = Path(fil).expanduser()
+        if not p.is_absolute():
+            p = mem_base / fil
+        if not p.exists() or not pattern:
+            return None, None
+        try:
+            text = p.read_text(errors="replace")
+        except Exception:
+            return None, None
+        rx = re.compile(pattern, re.IGNORECASE)
+        for lineno, line in enumerate(text.splitlines(), 1):
+            m = rx.search(line)
+            if m:
+                for g in m.groups():
+                    if g is not None:
+                        return g.strip(), lineno
+        return None, None
+
+    def _probe(cmd):
+        if not cmd:
+            return None, "no probe command"
+        full = f"{prefix} {shlex.quote(cmd)}" if prefix else cmd
+        try:
+            r = subprocess.run(full, shell=True, capture_output=True,
+                               text=True, timeout=timeout)
+            if r.returncode != 0:
+                return None, (r.stderr or r.stdout or "nonzero exit").strip()[:100]
+            return r.stdout.strip(), None
+        except Exception as e:
+            return None, str(e)[:100]
+
+    def _match(op, asserted, live):
+        a, l = asserted.strip(), live.strip()
+        if op == "contains":
+            return bool(a) and (a in l or l in a)
+        if op == "ge":
+            try:
+                return float(l) >= float(a)
+            except ValueError:
+                return False
+        return a == l   # default: eq
+
+    ok, stale, uncheck = [], [], []
+    for c in claims:
+        cid = c.get("id", "?")
+        fil = c.get("file", "")
+        asserted, lineno = _asserted(fil, c.get("pattern", ""))
+        if asserted is None:
+            uncheck.append((cid, f"anchor not found in {fil}"))
+            continue
+        live, err = _probe(c.get("probe", ""))
+        if live is None:
+            uncheck.append((cid, f"probe failed ({err})"))
+            continue
+        if _match(c.get("compare", "eq"), asserted, live):
+            ok.append((cid, asserted, live))
+        else:
+            stale.append((cid, fil, lineno, asserted, live, c.get("compare", "eq")))
+
+    print(f"\n  live-claims registry: {reg_path}")
+    if not parsed.quiet:
+        for cid, a, l in ok:
+            print(f"  {GREEN}OK{RESET}    {cid}: memory={a!r} == live={l!r}")
+    for cid, msg in uncheck:
+        print(f"  {YELLOW}SKIP{RESET}  {cid}: {msg} [uncheckable — not counted]")
+    for cid, fil, lineno, a, l, op in stale:
+        print(f"  {RED}STALE{RESET} {cid}: {fil}:{lineno} asserts {a!r} but live is {l!r} [{op}]")
+    print(f"\n  {len(ok)} ok | {RED}{len(stale)} STALE{RESET} | {len(uncheck)} uncheckable\n")
+
+    if parsed.post_council and stale:
+        cfg_council = _gaius_cfg.get("council", {})
+        base_url = cfg_council.get("base_url", "").rstrip("/")
+        api_key = cfg_council.get("api_key", "")
+        if base_url and api_key:
+            items = [f"{cid}: {fil} asserts {a!r} but live is {l!r}"
+                     for cid, fil, _, a, l, _ in stale]
+            payload = json.dumps({
+                "type": "alert", "channel": "alerts", "agents": ["ops-watchdog"],
+                "content": {
+                    "title": "gaius live-claim drift (memory vs cluster)",
+                    "stale_count": len(stale), "items": items,
+                    "source": "gaius drift --live --post-council (nightly)",
+                },
+            }).encode()
+            req = urllib.request.Request(
+                f"{base_url}/council/log", data=payload,
+                headers={"Content-Type": "application/json", "X-API-Key": api_key},
+                method="POST")
+            try:
+                urllib.request.urlopen(req, timeout=10)
+                print(f"[drift --live] Posted {len(stale)} stale claim(s) to council alerts.")
+            except urllib.error.HTTPError as e:
+                print(f"[drift --live] WARNING: council POST failed: {e.code}", file=sys.stderr)
+        else:
+            print("[drift --live] --post-council: council.base_url/api_key not set in ~/.gaius/config.yaml",
+                  file=sys.stderr)
+
+    sys.exit(1 if stale else 0)
+
+
 def cmd_drift(args):
     """Check canonical cluster facts for cross-agent drift.
 
@@ -8230,7 +8391,12 @@ def cmd_drift(args):
                         help="Emit JSON report")
     parser.add_argument("--quiet", action="store_true",
                         help="Only show drift/warnings, suppress clean lines")
+    parser.add_argument("--live", action="store_true",
+                        help="Validate memory claims against LIVE cluster state (live-claims.yaml)")
     parsed = parser.parse_args(args)
+
+    if parsed.live:
+        return _drift_live(parsed)
 
     # --- Locate registry ---
     if parsed.registry:

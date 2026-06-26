@@ -106,6 +106,36 @@ def count_lines(path: Path) -> int:
         return -1
 
 
+# A "- **bold bullet" merged mid-line (a missing newline between two facts).
+# Requires a non-space char immediately before "- **" so legit " - **inline**"
+# prose and internal hyphens in dates ("2026-06-08") don't false-positive.
+JOINED_BULLET = re.compile(r"\S- \*\*")
+LONG_LINE_CHARS = 2000   # a single line this long is accretion (changelog / mega-hook), not a fact
+
+
+def scan_content_defects(path: Path):
+    """Structural defects invisible to line/byte thresholds.
+
+    Returns [(lineno, kind, detail)] where kind is 'joined-line' (corruption —
+    a bullet got merged onto the previous line, hiding a fact) or 'long-line'
+    (one runaway line; index/header accretion). Joined-line is blocking; long-line
+    is advisory.
+    """
+    defects = []
+    try:
+        for i, raw in enumerate(path.open(), 1):
+            line = raw.rstrip("\n")
+            m = JOINED_BULLET.search(line)
+            if m:
+                start = max(0, m.start() - 22)
+                defects.append((i, "joined-line", "…" + line[start:m.start() + 24].strip()))
+            elif len(line) > LONG_LINE_CHARS:
+                defects.append((i, "long-line", f"{len(line)} chars on one line"))
+    except Exception:
+        pass
+    return defects
+
+
 # ── Commands ─────────────────────────────────────────────────────────────────
 
 def cmd_health(memory_dir: Path, args: list):
@@ -152,16 +182,46 @@ def cmd_health(memory_dir: Path, args: list):
 
     print()
 
+    # ── Content defects: structural corruption invisible to line/byte checks ──
+    paths = []
+    for name in ["MEMORY.md", "common.md"]:
+        p = memory_dir / name
+        if p.exists():
+            paths.append(p)
+    for p in sorted(memory_dir.glob("*.md")):
+        if p.name not in skip_root:
+            paths.append(p)
+    for sub in ("domain", "skills"):
+        d = memory_dir / sub
+        if d.is_dir():
+            paths.extend(sorted(d.glob("*.md")))
+    joined, longish = [], []
+    for p in paths:
+        for lineno, kind, detail in scan_content_defects(p):
+            rel = p.relative_to(memory_dir)
+            (joined if kind == "joined-line" else longish).append((rel, lineno, detail))
+
     # Summary
     reds    = [r for r in files if r[1] >= r[3]]
     yellows = [r for r in files if r[2] <= r[1] < r[3]]
     if reds:
         print(f"{RED}{BOLD}⚠  {len(reds)} file(s) over limit:{RESET} "
               + ", ".join(r[0] for r in reds))
+    if joined:
+        red = f"{RED}{BOLD}RED{RESET}"   # exact token the pre-commit hook greps to block
+        print(f"{RED}{BOLD}⚠  {len(joined)} joined-line defect(s){RESET} [{red}] — "
+              "a merged bullet hides a fact; fix the missing newline before commit:")
+        for rel, lineno, detail in joined:
+            print(f"   {rel}:{lineno}  {detail}")
     if yellows:
         print(f"{YELLOW}⚡  {len(yellows)} file(s) approaching limit:{RESET} "
               + ", ".join(r[0] for r in yellows))
-    if not reds and not yellows:
+    if longish:
+        print(f"{YELLOW}⚡  {len(longish)} runaway line(s) >{LONG_LINE_CHARS} chars "
+              f"(accretion — compress to a pointer):{RESET}")
+        for rel, lineno, detail in longish:
+            print(f"   {rel}:{lineno}  {detail}")
+    if not reds and not yellows and not joined and not longish:
         print(f"{GREEN}✓  All files within threshold.{RESET}")
     print()
 

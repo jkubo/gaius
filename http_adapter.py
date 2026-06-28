@@ -572,6 +572,12 @@ class FactAddRequest(BaseModel):
     fact_text: str
     domain: str
     source: str = "session"
+    # Real writer identity, threaded into corroboration (agents/sessions/principals arrays).
+    # When a multi-tenant router (or any caller) supplies these, two distinct writers of the
+    # same fact corroborate as two — instead of collapsing into one "http-adapter" session.
+    # Omitted → the legacy defaults below, so existing callers are byte-for-byte unchanged.
+    agent: Optional[str] = None
+    session_uuid: Optional[str] = None
 
 
 @app.post("/facts")
@@ -594,7 +600,8 @@ async def fact_add(request: Request, body: FactAddRequest):
     ).fetchone()
 
     upsert_fact(conn, body.domain, fact_key, body.fact_text,
-                agent=body.source or "http", session_uuid="http-adapter",
+                agent=body.agent or body.source or "http",
+                session_uuid=body.session_uuid or "http-adapter",
                 provenance="mcp-session", score=0.6,
                 source=body.source or "session")
 

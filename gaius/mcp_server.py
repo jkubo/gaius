@@ -294,8 +294,12 @@ def gaius_fact_add(fact_text: str, domain: str, source: str = "session") -> str:
         (fact_key,)
     ).fetchone()
 
+    # Real writer identity from the per-session/per-workspace environment so distinct writers
+    # corroborate distinctly (GAIUS_AGENT defeats the old hardcoded agent="operator" collapse).
+    # Unset → legacy defaults ("operator" / source|"mcp"), so behavior is unchanged by default.
     upsert_fact(conn, domain, fact_key, fact_text,
-                agent="operator", session_uuid=source or "mcp",
+                agent=os.getenv("GAIUS_AGENT", "operator"),
+                session_uuid=source or os.getenv("GAIUS_SESSION_UUID", "mcp"),
                 provenance="mcp-session", score=0.6, source=source)
 
     if existing:

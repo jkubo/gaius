@@ -25,7 +25,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pyyaml pytest
-          pip install -e .   # provides the `gaius` entrypoint the benchmark shells out to
+          pip install -e ".[mcp,http]"   # gaius entrypoint + mcp/fastapi for the attribution tests
 
       - name: Install semantic extras (optional — skip if unavailable)
         run: pip install "sentence-transformers>=2.7" "sqlite-vec>=0.1" || true

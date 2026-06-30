@@ -30,7 +30,7 @@ semantic = [
     "sqlite-vec>=0.1",
 ]
 mcp = [
-    "mcp[server]>=1.0",
+    "mcp>=1.0",
 ]
 http = [
     "fastapi>=0.100",
@@ -39,6 +39,9 @@ http = [
 all = [
     "gaius-memory[semantic,mcp,http]",
 ]
+dev = [
+    "pytest>=8.0",
+]
 
 [project.scripts]
 gaius = "gaius._core:main"
@@ -46,11 +49,6 @@ gaius = "gaius._core:main"
 [project.urls]
 Homepage = "https://github.com/jkubo/gaius"
 Issues = "https://github.com/jkubo/gaius/issues"
-
-[project.optional-dependencies.dev]
-dev = [
-    "pytest>=8.0",
-]
 
 [tool.setuptools.packages.find]
 where = ["."]

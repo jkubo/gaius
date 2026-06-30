@@ -25,13 +25,20 @@ Engineers running Claude Code all day generate enormous amounts of institutional
 
 ## Benchmark
 
+Reproducible on a fresh clone: `bench_inject.py` builds a throwaway SQLite corpus
+from the bundled `benchmarks/demo_corpus/`, so anyone can verify retrieval quality:
+
 ```
-gaius Injection Benchmark (25 ops queries, live ops corpus)
+$ python3 benchmarks/bench_inject.py
+
+gaius Injection Benchmark (25 queries, bundled demo corpus)
 ════════════════════════════════════════════════════════════
-Recall:    24/25 (96%)   keyword-recall on real inject output
-Precision warnings: 2/25
-Avg latency: 760ms  (BM25 + semantic, embed daemon warm)
-Cold start:  ~7s    (first query, no daemon)
+Recall:    25/25 (100%)  keyword-recall on real inject output
+Prec-warn: 3/25
+Corpus:    27 demo facts  (throwaway SQLite, no daemon, ~0.08s/query)
+
+Semantic mode (embed daemon, real corpus):
+Cold start:  ~7s    (first query, model load)
 Daemon warm: ~8ms   (Unix socket, model kept in memory)
 
 Storage: sqlite-vec (384-dim, all-MiniLM-L6-v2) + BM25 in a single SQLite file
@@ -111,7 +118,7 @@ gaius inject --task "debug flannel networking" --budget 4000
 claude mcp add gaius -- python3 -m gaius.mcp_server
 
 # Or if using the script install:
-claude mcp add gaius -- /path/to/gaius/mcp_server.py
+claude mcp add gaius -- /path/to/gaius/gaius/mcp_server.py
 ```
 
 5 tools available mid-session: `gaius_search`, `gaius_kg_query`, `gaius_kg_timeline`, `gaius_stats`, `gaius_fact_add`.
@@ -123,10 +130,10 @@ claude mcp add gaius -- /path/to/gaius/mcp_server.py
 ```
 gaius/
 ├── gaius/
-│   ├── _core.py          # All logic (extraction, search, KG, inject, MCP)
+│   ├── _core.py          # All logic (extraction, search, KG, inject)
+│   ├── mcp_server.py     # MCP server (5 tools)
 │   ├── __init__.py       # Public API surface
 │   └── __main__.py       # python -m gaius
-├── mcp_server.py         # MCP server (5 tools)
 ├── http_adapter.py       # FastAPI REST adapter (optional, for remote access)
 ├── presets/
 │   ├── k8s.yaml          # Entity patterns for Kubernetes clusters

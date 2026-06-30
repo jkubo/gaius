@@ -9,7 +9,9 @@ Options:
                     (env: MNEMOSYNE_MEMORY_DIR, default: ~/.gaius/memory)
 
 Commands:
-  health           Line counts and threshold status for all memory files (domain/, skills/)
+  health           Line counts, byte budget, and threshold status for all memory files.
+                   Also lints MEMORY.md for index-line gloss accretion (Gap-32) and,
+                   when over byte budget, points at the heaviest lines to compress.
   audit            Scan common.md for entries that belong in domain files
   split <file>     Propose a split plan for an oversized file (never auto-executes)
   prune <file>     Identify redundant or stale entries (never auto-deletes)
@@ -136,6 +138,59 @@ def scan_content_defects(path: Path):
     return defects
 
 
+# ── MEMORY.md index-gloss accretion (Gap-32 structural cure) ──────────────────
+# The byte budget catches the TOTAL but not WHERE, and the 2000-char runaway
+# check never fires on index lines (they top out ~1300-1700 chars). So the
+# `## Project Files` index mega-lines accrete gloss until the 16KB budget blows,
+# and every surgeon then hand-hunts the fat lines. This lint catches the
+# accretion EARLY by measuring *non-link gloss bytes* — it strips `[label](path)`
+# link tokens and counts the remaining prose, so a vertical with many terse links
+# is fine but one whose links carry paragraph glosses is flagged. Detail on an
+# index line belongs in the linked project file; the index is navigation.
+INDEX_GLOSS_WARN = 350         # non-link gloss bytes on one index line over this = accretion
+PROJECT_FILES_HEADER = "## Project Files"
+_LINK_TOKEN = re.compile(r"\[[^\]]*\]\([^)]*\)")
+
+
+def scan_index_gloss(path: Path, threshold: int = INDEX_GLOSS_WARN):
+    """Index lines under '## Project Files' carrying > `threshold` bytes of
+    non-link gloss. Returns [(lineno, gloss_bytes, total_bytes, preview)]
+    heaviest-first. Advisory only — never blocks (the index is navigation; the
+    detail belongs in the linked file)."""
+    fat = []
+    in_section = False
+    try:
+        for i, raw in enumerate(path.open(), 1):
+            line = raw.rstrip("\n")
+            if line.startswith(PROJECT_FILES_HEADER):
+                in_section = True
+                continue
+            if in_section and line.startswith("## "):
+                break  # next H2 ends the index section
+            if in_section and line.lstrip().startswith(("-", "*")):
+                gloss = len(_LINK_TOKEN.sub("", line))
+                if gloss > threshold:
+                    fat.append((i, gloss, len(line), line.lstrip()[:50]))
+    except Exception:
+        pass
+    fat.sort(key=lambda t: -t[1])
+    return fat
+
+
+def heaviest_lines(path: Path, n: int = 5):
+    """The n longest lines in a file (targeting aid when over byte budget):
+    [(lineno, length, preview)] heaviest-first."""
+    rows = []
+    try:
+        for i, raw in enumerate(path.open(), 1):
+            line = raw.rstrip("\n")
+            rows.append((i, len(line), line.lstrip()[:50]))
+    except Exception:
+        return []
+    rows.sort(key=lambda t: -t[1])
+    return rows[:n]
+
+
 # ── Commands ─────────────────────────────────────────────────────────────────
 
 def cmd_health(memory_dir: Path, args: list):
@@ -222,6 +277,7 @@ def cmd_health(memory_dir: Path, args: list):
     # Summary
     reds    = [r for r in files if r[1] >= r[3]]
     yellows = [r for r in files if r[2] <= r[1] < r[3]]
+    mem_gloss = scan_index_gloss(_mem) if _mem.exists() else []
     if reds:
         print(f"{RED}{BOLD}⚠  {len(reds)} file(s) over limit:{RESET} "
               + ", ".join(r[0] for r in reds))
@@ -239,13 +295,23 @@ def cmd_health(memory_dir: Path, args: list):
               f"(accretion — compress to a pointer):{RESET}")
         for rel, lineno, detail in longish:
             print(f"   {rel}:{lineno}  {detail}")
+    if mem_gloss:
+        print(f"{YELLOW}⚡  {len(mem_gloss)} MEMORY.md index line(s) >{INDEX_GLOSS_WARN}B "
+              f"non-link gloss (Gap-32 accretion — move the detail to the linked file, "
+              f"keep the index a terse hook):{RESET}")
+        for lineno, gloss, total, preview in mem_gloss:
+            print(f"   MEMORY.md:{lineno}  {gloss}B gloss / {total}B line  {preview}…")
     if byte_yellow:
         print(f"{YELLOW}⚡  MEMORY.md over the 16KB injection-budget warn — compress.{RESET}")
     if byte_red:
         red = f"{RED}{BOLD}RED{RESET}"
         print(f"{RED}{BOLD}⚠  MEMORY.md over the 20KB error{RESET} [{red}] — compress before commit.")
+    if (byte_yellow or byte_red) and _mem.exists():
+        print(f"{YELLOW}   heaviest lines (target these first):{RESET}")
+        for lineno, length, preview in heaviest_lines(_mem):
+            print(f"     MEMORY.md:{lineno}  {length}B  {preview}…")
     if (not reds and not yellows and not joined and not longish
-            and not byte_red and not byte_yellow):
+            and not byte_red and not byte_yellow and not mem_gloss):
         print(f"{GREEN}✓  All files within threshold.{RESET}")
     print()
 

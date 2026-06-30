@@ -1,4 +1,4 @@
-#!/home/jkubo/Projects/agent-memory/gaius/.venv/bin/python
+#!/usr/bin/env python3
 """gaius CLI entry point.
 
 Install: install -m 755 /path/to/gaius/gaius_cli ~/.local/bin/gaius
@@ -8,7 +8,7 @@ import sys
 import os
 
 # If gaius package isn't installed, find it via:
-#  1. GAIUS_SRC env var (e.g. export GAIUS_SRC=~/Projects/agent-memory/gaius)
+#  1. GAIUS_SRC env var (e.g. export GAIUS_SRC=~/path/to/gaius)
 #  2. gaius_src in ~/.gaius/config.yaml
 #  3. Relative to this script (works when run directly from the repo, not installed)
 try:

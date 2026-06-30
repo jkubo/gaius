@@ -75,6 +75,14 @@ class TestCountLines:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestAudit:
+    @pytest.fixture(autouse=True)
+    def _default_keywords(self, monkeypatch):
+        # Isolate from the operator's ~/.gaius/config.yaml audit_keywords (which
+        # drift over time). _load_domain_keywords() honors GAIUS_CONFIG=/dev/null
+        # → built-in defaults; DOMAIN_KEYWORDS is bound at import, so reload it.
+        monkeypatch.setenv("GAIUS_CONFIG", "/dev/null")
+        monkeypatch.setattr(mn, "DOMAIN_KEYWORDS", mn._load_domain_keywords())
+
     def _run_audit(self, memory_dir):
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -179,3 +187,78 @@ class TestMemoryByteBudget:
         self._write(tmp_path, 5100, line_len=51)     # 100 lines, all GREEN
         mn.cmd_health(tmp_path, [])
         assert "within threshold" in capsys.readouterr().out
+
+
+class TestIndexGlossAccretion:
+    """scan_index_gloss — Gap-32 structural cure. Flags MEMORY.md '## Project
+    Files' index lines carrying accreted prose, measured link-count-agnostically
+    by stripping [label](path) tokens. A vertical with MANY terse links must pass;
+    one whose links carry paragraph glosses must flag. (This is the failure the
+    2000-char runaway check + total-byte budget both miss.)"""
+
+    TERSE = "- **JDT**: " + " | ".join(f"[f{i}](project/p{i}.md)" for i in range(22))
+    ACCRETED = ("- **JDT**: [master](project/p.md) — "
+                + "verbose resolved status detail from a session note " * 12)
+
+    def _doc(self, *index_lines, recent=None):
+        body = "# MEMORY\n\n## Project Files — grouped by vertical\n\n"
+        body += "\n".join(index_lines) + "\n"
+        if recent:
+            body += "\n## Recent State\n\n" + recent + "\n"
+        return body
+
+    def test_terse_link_dense_line_passes(self, tmp_path):
+        # 22 links, ~492 chars total, but tiny gloss — must NOT flag.
+        p = tmp_path / "MEMORY.md"
+        p.write_text(self._doc(self.TERSE))
+        assert mn.scan_index_gloss(p) == []
+
+    def test_accreted_line_flagged(self, tmp_path):
+        p = tmp_path / "MEMORY.md"
+        p.write_text(self._doc(self.ACCRETED))
+        hits = mn.scan_index_gloss(p)
+        assert len(hits) == 1
+        assert hits[0][1] > mn.INDEX_GLOSS_WARN     # gloss bytes over threshold
+
+    def test_only_scans_project_files_section(self, tmp_path):
+        # an accreted-looking line in Recent State must NOT be flagged
+        p = tmp_path / "MEMORY.md"
+        p.write_text(self._doc(self.TERSE, recent=self.ACCRETED))
+        assert mn.scan_index_gloss(p) == []
+
+    def test_heaviest_first(self, tmp_path):
+        p = tmp_path / "MEMORY.md"
+        small = "- **A**: [x](p.md) — " + "gloss " * 70
+        big   = "- **B**: [y](p.md) — " + "gloss " * 140
+        p.write_text(self._doc(small, big))
+        hits = mn.scan_index_gloss(p)
+        assert len(hits) == 2
+        assert hits[0][1] > hits[1][1]              # heaviest-first
+
+    def test_cmd_health_surfaces_accretion(self, tmp_path, capsys):
+        (tmp_path / "MEMORY.md").write_text(self._doc(self.ACCRETED))
+        mn.cmd_health(tmp_path, [])
+        out = capsys.readouterr().out
+        assert "Gap-32" in out
+        assert "within threshold" not in out
+
+    def test_cmd_health_clean_index_no_accretion(self, tmp_path, capsys):
+        (tmp_path / "MEMORY.md").write_text(self._doc(self.TERSE))
+        mn.cmd_health(tmp_path, [])
+        assert "Gap-32" not in capsys.readouterr().out
+
+    def test_accretion_advisory_is_not_a_blocking_red_token(self, tmp_path, capsys):
+        # the YELLOW accretion advisory must never emit the exact ANSI token the
+        # pre-commit hook greps to block commits.
+        (tmp_path / "MEMORY.md").write_text(self._doc(self.ACCRETED))
+        mn.cmd_health(tmp_path, [])
+        assert "\033[31m\033[1mRED\033[0m" not in capsys.readouterr().out
+
+
+class TestHeaviestLines:
+    def test_returns_longest_first(self, tmp_path):
+        p = tmp_path / "x.md"
+        p.write_text("short\n" + "m" * 200 + "\n" + "l" * 500 + "\n")
+        rows = mn.heaviest_lines(p, n=2)
+        assert len(rows) == 2
+        assert rows[0][1] == 500 and rows[1][1] == 200

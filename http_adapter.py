@@ -495,7 +495,7 @@ async def telemetry_summary(
     _check_auth(request)
     try:
         import sys as _sys
-        _sys.path.insert(0, os.path.expanduser("~/Projects/agent-memory/gaius"))
+        _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from gaius.telemetry import get_summary
         return get_summary(hours)
     except Exception as e:
@@ -511,7 +511,7 @@ async def telemetry_violations(
     _check_auth(request)
     try:
         import sys as _sys
-        _sys.path.insert(0, os.path.expanduser("~/Projects/agent-memory/gaius"))
+        _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from gaius.telemetry import get_violations
         return {"violations": get_violations(limit)}
     except Exception as e:

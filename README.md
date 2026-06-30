@@ -25,15 +25,19 @@ Engineers running Claude Code all day generate enormous amounts of institutional
 
 ## Benchmark
 
-Reproducible on a fresh clone: `bench_inject.py` builds a throwaway SQLite corpus
-from the bundled `benchmarks/demo_corpus/`, so anyone can verify retrieval quality:
+The demo below is a **regression / smoke check, NOT a quality score**: it confirms retrieval still
+works on a fresh clone. A perfect score on a hand-built 27-fact corpus (same author wrote the facts
+and the queries) proves the pipeline runs, nothing more. Real quality is the **External evaluation**
+section below, on a benchmark gaius didn't build.
+
+`bench_inject.py` builds a throwaway SQLite corpus from `benchmarks/demo_corpus/`:
 
 ```
 $ python3 benchmarks/bench_inject.py
 
 gaius Injection Benchmark (25 queries, bundled demo corpus)
 ════════════════════════════════════════════════════════════
-Recall:    25/25 (100%)  keyword-recall on real inject output
+Recall:    25/25 (100%)  regression check, NOT a quality score
 Prec-warn: 3/25
 Corpus:    27 demo facts  (throwaway SQLite, no daemon, ~0.08s/query)
 
@@ -44,6 +48,34 @@ Daemon warm: ~8ms   (Unix socket, model kept in memory)
 Storage: sqlite-vec (384-dim, all-MiniLM-L6-v2) + BM25 in a single SQLite file
 No API keys, no cloud, runs entirely offline.
 ```
+
+## External evaluation (LongMemEval-S)
+
+The demo above only proves the pipeline runs. For an *unbiased* measure, gaius's retrieval is scored on
+[LongMemEval-S](https://github.com/xiaowu0162/LongMemEval) (ICLR 2025): a third-party benchmark whose
+500 questions, ~48-session haystacks, and gold labels gaius has no hand in choosing (independent by
+construction, not a self-graded demo). Reproducible: `python3 benchmarks/bench_longmemeval.py --matrix`.
+
+Two metrics, not the same: **R@k** = per-question fractional recall (stricter; 65% of questions are
+multi-gold); **hit@k** = recall_any@k ("at least one gold session in top-k"), the metric published
+baselines report, so compare hit@k to those, not R@k.
+
+gaius retrieval (all-MiniLM-L6-v2), 500 questions:
+
+| config | MRR | R@5 | R@10 | hit@10 |
+|--------|-----|-----|------|--------|
+| session-semantic | 0.827 | 85.7 | 92.7 | 96.8 |
+| turn-semantic | 0.906 | 92.8 | 96.6 | 98.8 |
+| **turn-hybrid** (real inject path) | **0.912** | 92.8 | 95.2 | **98.6** |
+
+On the matched metric (hit@k), gaius at its real regime (short-fact units + the hybrid inject ranking)
+scores **hit@10 98.6%**, at par with published same-model (all-MiniLM-L6-v2) session-level retrieval
+baselines (~96-99% recall_any@10; protocols differ; retrieval-only, not an end-to-end QA metric).
+Larger embedding models beat all-MiniLM outright, a deliberate tradeoff for gaius's 384-dim, no-GPU,
+fully-offline footprint. Weakest category: temporal-reasoning (~94% R@10 at turn-semantic).
+
+This measures the retrieval engine. Whether *proactive injection* improves agent outcomes is a
+separate evaluation (in progress), and is **not** claimed here.
 
 ---
 
@@ -57,7 +89,7 @@ No API keys, no cloud, runs entirely offline.
 | **Hard enforcement gates** | Memory that *prevents actions*. `exit:2` blocks force-push, live trading without confirmation, critical resource deletion. |
 | **Mnemosyne health monitoring** | Automated memory bloat prevention. Line-count thresholds, misclassification audit, split/prune proposals. |
 | **Live state injection** | Domain files with `kubectl`/`curl` commands in frontmatter, TTL-cached. Memory that knows what's happening right now. |
-| **Hybrid sqlite-vec search** | Keyword TF-IDF/BM25 + semantic embeddings in a single SQLite file. 100% Recall@5 on ops benchmarks. |
+| **Hybrid sqlite-vec search** | Keyword TF-IDF/BM25 + semantic embeddings in a single SQLite file. |
 | **Temporal knowledge graph** | Entity-relationship triples with validity windows. `gaius kg timeline node` shows what changed and when. |
 | **MCP server** | 5 tools for mid-session memory access without leaving Claude Code. |
 
@@ -130,7 +162,11 @@ claude mcp add gaius -- /path/to/gaius/gaius/mcp_server.py
 ```
 gaius/
 ├── gaius/
-│   ├── _core.py          # All logic (extraction, search, KG, inject)
+│   ├── _core.py          # core logic (extraction, search, inject, dedup, decay)
+│   ├── kg.py             # temporal knowledge-graph commands
+│   ├── parsers.py        # session / domain-file parsers
+│   ├── record.py         # session recorder (OpenAI-compatible endpoints)
+│   ├── telemetry.py      # prompt / injection event logging
 │   ├── mcp_server.py     # MCP server (5 tools)
 │   ├── __init__.py       # Public API surface
 │   └── __main__.py       # python -m gaius
@@ -139,10 +175,11 @@ gaius/
 │   ├── k8s.yaml          # Entity patterns for Kubernetes clusters
 │   └── default.yaml      # Minimal defaults for any project
 ├── benchmarks/
-│   ├── bench_inject.py   # Canonical injection benchmark (corpus-agnostic)
-│   └── bench_retrieval.py
+│   ├── bench_inject.py        # injection regression check (bundled demo corpus)
+│   ├── bench_longmemeval.py   # LongMemEval-S external retrieval eval (--matrix)
+│   └── bench_retrieval.py     # legacy Recall@k/MRR harness (not for public numbers)
 ├── tests/
-│   └── test_gaius.py
+│   └── *.py              # unit + integration suites (test_core.py, ...)
 ├── pyproject.toml
 └── LICENSE               # Apache 2.0
 ```

@@ -3,7 +3,7 @@
 
 Uses hand-crafted queries with known ground-truth terms from facts.db.
 Measures Recall@5, Recall@10, MRR, and NDCG@k.
-Metrics adapted from MemPalace's LongMemEval harness.
+Metrics adapted from the standard LongMemEval protocol.
 
 Usage:
     python bench_retrieval.py                    # compare all modes (default)
@@ -24,7 +24,7 @@ from pathlib import Path
 
 EMBED_DIM = 384
 
-# ── Metrics (adapted from MemPalace's LongMemEval harness) ──────────────────
+# ── Metrics (adapted from the standard LongMemEval protocol) ──────────────────
 
 def dcg(relevances: list[float], k: int) -> float:
     """Discounted Cumulative Gain."""

@@ -1083,7 +1083,7 @@ def init_db(db_path: Path = None) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_facts_fact_key ON facts(fact_key);
 
         -- Knowledge Graph: temporal entity-relationship triples
-        -- Adapted from MemPalace's knowledge_graph.py schema.
+        -- Temporal entity-relationship schema with validity windows.
         -- Entity types: node, service, storage-pool, namespace, agent, model, incident
         CREATE TABLE IF NOT EXISTS entities (
             id          TEXT PRIMARY KEY,
@@ -1535,7 +1535,7 @@ def tag_domains_from_specs(text: str, domain_specs: dict) -> list[str]:
 # so `from gaius._core import kg_index_fact` (etc.) keeps working. See gaius/kg.py.
 
 
-# ── Query Boosting (adapted from MemPalace hybrid v4) ────────────────────────
+# ── Query Boosting (hybrid BM25 + TF-IDF) ────────────────────────
 
 def extract_quoted_phrases(text: str) -> list[str]:
     """Extract 'quoted' and "double-quoted" phrases from query text."""
@@ -3512,7 +3512,7 @@ def cmd_inject(args):
                     # Blend: 0.4 keyword + 0.6 semantic
                     score = 0.4 * score + 0.6 * max(0, cosine_sim)
 
-        # Quoted phrase boost (from MemPalace hybrid v4) — exact phrases get priority
+        # Quoted phrase boost: exact phrases get priority
         if parsed.task:
             fact_text = (entry.get("sections", {}).get("key_concepts", "") or "")
             phrases = extract_quoted_phrases(parsed.task)

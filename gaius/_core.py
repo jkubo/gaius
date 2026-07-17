@@ -38,8 +38,6 @@ Commands:
   rescan ID   Force re-extraction for a session (ID = uuid prefix, min 4 chars)
   stats       Show extraction and corpus statistics (includes facts.db)
   batch         Show unreviewed summaries by section (bulk scan mode)
-  sync-council  Scan strategy channel of council log, distill decisions into domain files
-  sync-alerts   Scan alerts channel, track recurring alerts in domain/recurring-alerts.md
 """
 
 import argparse
@@ -132,6 +130,20 @@ def _embed_texts(texts: list[str]) -> list[list[float]] | None:
     if model is None:
         return None
     return model.encode(texts, normalize_embeddings=True).tolist()
+
+
+_CHUNK_WORDS = 170  # ~220 wordpieces, safely under all-MiniLM-L6-v2's 256-token cap
+
+
+def _chunk_text(text: str, max_words: int = _CHUNK_WORDS) -> list[str]:
+    """Split text into <=max_words word-windows so each fits the embedder's 256-token
+    cap instead of being silently truncated to its first ~256 tokens. Short text (the
+    common case) returns a single chunk == the original string byte-for-byte, so
+    short-fact embeddings are unchanged."""
+    words = text.split()
+    if len(words) <= max_words:
+        return [text]
+    return [" ".join(words[i:i + max_words]) for i in range(0, len(words), max_words)]
 
 # ── Config file ──────────────────────────────────────────────────────────────
 # Loaded from ~/.gaius/config.yaml (or GAIUS_CONFIG env var).
@@ -551,8 +563,18 @@ def save_staged(entry: dict):
             str(v) for v in (entry.get("sections") or {}).values() if v)
         entry["state_change"] = bool(_STATE_CHANGE_RE.search(section_text))
     ts = entry.get("timestamp", "unknown")[:19].replace(":", "-")
-    fname = f"{ts}_{entry['uuid'][:8]}.json"
-    with open(STAGING_DIR / fname, "w") as f:
+    # Path-traversal hardening: `timestamp`/`uuid` come from session JSONLs that,
+    # via `gaius s3-retire`, may be authored on another agent's host. The only
+    # prior sanitization was colon->dash, so `/` and `..` survived and a crafted
+    # timestamp="../../../../tmp/" escaped STAGING_DIR. Restrict both fields to
+    # safe filename chars and assert containment before writing.
+    ts = re.sub(r"[^0-9A-Za-z_-]", "-", ts)
+    uuid8 = re.sub(r"[^0-9A-Za-z]", "", str(entry.get("uuid", ""))[:8]) or "nouuid"
+    fname = f"{ts}_{uuid8}.json"
+    dest = (STAGING_DIR / fname).resolve()
+    if dest.parent != STAGING_DIR.resolve():
+        raise ValueError(f"staged filename escapes STAGING_DIR: {fname!r}")
+    with open(dest, "w") as f:
         json.dump(entry, f, indent=2)
 
 
@@ -1112,6 +1134,16 @@ def init_db(db_path: Path = None) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_triples_object ON triples(object);
         CREATE INDEX IF NOT EXISTS idx_triples_predicate ON triples(predicate);
         CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type);
+
+        -- Fact ↔ entity membership (which facts mention which entities).
+        -- Powers entity-grounded routing (route_suggest) and entity domain
+        -- majority votes (kg.refresh_entity_domains).
+        CREATE TABLE IF NOT EXISTS fact_entities (
+            fact_id     INTEGER NOT NULL,
+            entity_id   TEXT NOT NULL,
+            PRIMARY KEY (fact_id, entity_id)
+        ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS idx_fact_entities_entity ON fact_entities(entity_id);
     """)
     # Schema migrations — safe to run on existing DBs (ignore duplicate column errors)
     for _migration in [
@@ -1140,6 +1172,11 @@ def init_db(db_path: Path = None) -> sqlite3.Connection:
         "ALTER TABLE facts ADD COLUMN confidence_source TEXT DEFAULT 'inferred'",
         "ALTER TABLE facts ADD COLUMN review_state TEXT DEFAULT 'auto'",
         "ALTER TABLE facts ADD COLUMN conflict_with TEXT",
+
+        # Knowledge graph Gap-13 rebuild (2026-07-03): weight = co-occurrence
+        # aggregation counter; kg_indexed_at = incremental-index watermark
+        "ALTER TABLE triples ADD COLUMN weight INTEGER DEFAULT 1",
+        "ALTER TABLE facts ADD COLUMN kg_indexed_at TEXT",
     ]:
         try:
             conn.execute(_migration)
@@ -1235,6 +1272,11 @@ def _find_semantic_duplicate(conn: sqlite3.Connection, domain: str, fact_text: s
     Uses sqlite-vec for efficient vector search."""
     if not HAS_SQLITE_VEC:
         return None
+    # Multi-vector safety: a long (chunked) incoming fact compared chunk-wise against
+    # the corpus risks a false-merge that silently discards distinct information, so
+    # never auto-dedup when the incoming fact would be chunked.
+    if len(_chunk_text(fact_text)) > 1:
+        return None
     embedding = _embed_text(fact_text)
     if embedding is None:
         return None
@@ -1260,7 +1302,12 @@ def _find_semantic_duplicate(conn: sqlite3.Connection, domain: str, fact_text: s
             l2_dist = row["distance"]
             cosine_sim = 1.0 - (l2_dist ** 2 / 2.0)
             if cosine_sim >= threshold and row["fact_key"] != hashlib.sha256(fact_text.encode()).hexdigest()[:32]:
-                return dict(row)
+                # Only merge into a single-chunk (short) fact -- matching one chunk of a
+                # long multi-chunk fact is not a whole-fact duplicate (false-merge guard).
+                n_chunks = conn.execute(
+                    "SELECT COUNT(*) FROM fact_embeddings WHERE fact_id = ?", (row["id"],)).fetchone()[0]
+                if n_chunks == 1:
+                    return dict(row)
     except Exception as e:
         # A broken vec0 extension or dimension mismatch silently disabling
         # dedup was invisible for weeks — make it loud once per process.
@@ -1272,18 +1319,23 @@ def _find_semantic_duplicate(conn: sqlite3.Connection, domain: str, fact_text: s
 
 
 def _store_embedding(conn: sqlite3.Connection, fact_id: int, fact_text: str):
-    """Compute and store embedding for a fact. No-op if dependencies unavailable."""
+    """Compute and store embedding(s) for a fact. No-op if dependencies unavailable.
+
+    Long facts are split into <=256-token chunks, each embedded and stored as its own
+    row (same fact_id), so retrieval can MAX over chunks instead of seeing only the
+    first ~256 tokens. Short facts produce exactly one chunk == prior behavior."""
     if not HAS_SQLITE_VEC:
         return
-    embedding = _embed_text(fact_text)
-    if embedding is None:
-        return
     import struct
-    vec_blob = struct.pack(f'{_EMBED_DIM}f', *embedding)
     try:
-        # Upsert: delete old embedding if exists, insert new
+        # Upsert: delete all old chunk rows for this fact, then insert one per chunk.
         conn.execute("DELETE FROM fact_embeddings WHERE fact_id = ?", (fact_id,))
-        conn.execute("INSERT INTO fact_embeddings (embedding, fact_id) VALUES (?, ?)", (vec_blob, fact_id))
+        for chunk in _chunk_text(fact_text):
+            embedding = _embed_text(chunk)
+            if embedding is None:
+                continue
+            vec_blob = struct.pack(f'{_EMBED_DIM}f', *embedding)
+            conn.execute("INSERT INTO fact_embeddings (embedding, fact_id) VALUES (?, ?)", (vec_blob, fact_id))
     except Exception:
         pass
 
@@ -1492,6 +1544,23 @@ def upsert_fact(conn: sqlite3.Connection, domain: str, fact_key: str, fact_text:
             # Store embedding for new fact
             new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             _store_embedding(conn, new_id, fact_text)
+            # Keep the KG current (Gap 13): index entities/relations at insert
+            # time — previously only manual `kg index` runs populated the graph.
+            # Guarded: KG failure must never block fact ingestion. SAVEPOINT so
+            # a partial failure rolls back ALL its KG writes — otherwise the
+            # fact commits un-stamped (kg_indexed_at is the last statement) and
+            # the nightly re-index double-counts its co-occurrence weights.
+            try:
+                conn.execute("SAVEPOINT kg_index")
+                kg_index_fact(conn, new_id, fact_text, domain,
+                              session_uuid=session_uuid, agent=agent, timestamp=now)
+                conn.execute("RELEASE SAVEPOINT kg_index")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK TO SAVEPOINT kg_index")
+                    conn.execute("RELEASE SAVEPOINT kg_index")
+                except Exception:
+                    pass
             # Flag the conflicting existing fact now that we have our new_id
             if conflict_id is not None:
                 conn.execute(
@@ -2882,890 +2951,7 @@ def compute_skill_score(skill: dict, context_terms: set) -> float:
     return score / skill["tokens"] if skill["tokens"] > 0 else 0.0
 
 
-# ── Landscape Protocol ─────────────────────────────────────────────────────────
-
-LANDSCAPE_CACHE_DIR = Path.home() / ".gaius" / "landscape_cache"
-LANDSCAPE_CMD_TIMEOUT = 10  # seconds per command
-
-
-def _run_landscape(domain: str) -> str | None:
-    """Run landscape commands for a domain, return formatted markdown block.
-
-    Loads domain/<domain>.md, parses landscape: frontmatter block, runs each cmd
-    with timeout. Caches result to ~/.gaius/landscape_cache/<domain>.json with
-    landscape_ttl seconds TTL. Returns None if no landscape block or all cmds fail.
-    """
-    import subprocess
-    import json as _json
-
-    domain_file = DOMAIN_DIR / f"{domain}.md"
-    if not domain_file.exists():
-        print(f"[landscape] domain file not found: {domain_file}", file=sys.stderr)
-        return None
-
-    text = domain_file.read_text()
-    fm, _ = _parse_frontmatter(text)
-
-    landscape_cmds = fm.get("landscape")
-    if not landscape_cmds:
-        return None
-
-    ttl = int(fm.get("landscape_ttl", 120))
-    fallback = fm.get("landscape_fallback")
-
-    # Check cache
-    LANDSCAPE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_file = LANDSCAPE_CACHE_DIR / f"{domain}.json"
-    now = datetime.now(timezone.utc)
-    if cache_file.exists():
-        try:
-            cached = _json.loads(cache_file.read_text())
-            cached_at = datetime.fromisoformat(cached["timestamp"])
-            age = (now - cached_at).total_seconds()
-            if age < ttl:
-                return cached["output"]
-        except Exception:
-            pass  # stale or corrupt cache — re-run
-
-    # Run commands
-    lines = [f"## Current State: {domain} (as of {now.strftime('%H:%M UTC')})"]
-    any_success = False
-    for entry in landscape_cmds:
-        if isinstance(entry, dict):
-            label = entry.get("label", "")
-            cmd = entry.get("cmd", "")
-        else:
-            continue
-        try:
-            result = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, timeout=LANDSCAPE_CMD_TIMEOUT
-            )
-            output = result.stdout.strip() or result.stderr.strip() or "no output"
-            any_success = True
-        except subprocess.TimeoutExpired:
-            output = "timeout"
-        except Exception as e:
-            output = f"error: {e}"
-        lines.append(f"**{label}**: {output}" if label else output)
-
-    if not any_success and fallback:
-        fallback_path = DOMAIN_DIR / fallback
-        if fallback_path.exists():
-            return fallback_path.read_text().strip()
-        return None
-
-    output_md = "\n".join(lines)
-
-    # Cache result
-    try:
-        cache_file.write_text(_json.dumps({"timestamp": now.isoformat(), "output": output_md}))
-    except Exception:
-        pass
-
-    return output_md
-
-
-def cmd_landscape(args):
-    """Hydrate live state for a domain and print the landscape block."""
-    parser = argparse.ArgumentParser(prog="gaius landscape")
-    parser.add_argument("domain", nargs="?", default=None, help="Domain name (e.g. finint, networking)")
-    parser.add_argument("--invalidate", action="store_true", help="Force re-run even if cache is fresh")
-    parsed = parser.parse_args(args)
-
-    if parsed.invalidate and parsed.domain:
-        cache_file = LANDSCAPE_CACHE_DIR / f"{parsed.domain}.json"
-        if cache_file.exists():
-            cache_file.unlink()
-
-    if not parsed.domain:
-        # Base layer only — list domains with landscape blocks
-        domains_with_landscape = []
-        if DOMAIN_DIR.is_dir():
-            for p in sorted(DOMAIN_DIR.glob("*.md")):
-                try:
-                    fm, _ = _parse_frontmatter(p.read_text())
-                    if fm.get("landscape"):
-                        domains_with_landscape.append(p.stem)
-                except Exception:
-                    pass
-        if domains_with_landscape:
-            print("Domains with landscape blocks: " + ", ".join(domains_with_landscape))
-        else:
-            print("No landscape blocks found in domain files.")
-        return
-
-    result = _run_landscape(parsed.domain)
-    if result:
-        print(result)
-    else:
-        print(f"[landscape] No landscape block found for domain: {parsed.domain}", file=sys.stderr)
-
-
-def cmd_inject(args):
-    """Inject ranked corpus entries into context, up to token budget."""
-    parser = argparse.ArgumentParser(prog="gaius inject")
-    parser.add_argument("--budget", type=int, required=True, help="Max tokens to inject")
-    parser.add_argument("--skills-budget", type=int, default=0, help="Additional tokens reserved for skills injection (0 = no skills)")
-    parser.add_argument("--skills-context", type=str, default=None, help="Keywords/file paths to score skills against (e.g. 'manifests/vllm storage rocm')")
-    parser.add_argument("--domain", type=str, default=None, help="Restrict to domain")
-    parser.add_argument("--source", type=str, default="corpus", help="Source type: corpus, sop (default: corpus)")
-    parser.add_argument("--sop", type=str, default=None, help="Explicit SOP name to inject")
-    parser.add_argument("--scopes", type=str, default=None, help="Comma-separated scope labels for SOP matching")
-    parser.add_argument("--landscape", type=str, default=None, help="Domain name to hydrate live state for (runs landscape: commands from domain file)")
-    parser.add_argument("--task", type=str, default=None, help="Task description for BM25 relevance ranking (e.g. 'fix DRBD split-brain on toa-fwd')")
-    parser.add_argument("--no-semantic", action="store_true", help="Disable semantic (embedding) scoring even if available")
-    parser.add_argument("--no-always-skills", action="store_true", help="Skip gate:always skills (use when session-start already injected them)")
-    parser.add_argument("--format", type=str, default="claude", choices=["claude", "gemini", "plain"],
-                        help="Output format: claude (hook JSON wrapper), gemini (plain markdown), plain (raw text)")
-    parsed = parser.parse_args(args)
-
-    budget_remaining = parsed.budget
-    injected_text = []
-    injected_skills = []
-
-    # -1. Always-inject skills (gate: always) — unconditional, outside budget
-    # Suppressed by --no-always-skills (e.g. per-prompt hooks where session-start already ran)
-    if not parsed.no_always_skills:
-        for skill in load_skills():
-            if skill["gate"] == "always":
-                injected_skills.append(skill)
-
-    # -0. Landscape injection (--landscape <domain>) — prepend live state block
-    if parsed.landscape:
-        landscape_md = _run_landscape(parsed.landscape)
-        if landscape_md:
-            injected_text.insert(0, landscape_md)
-
-    # 0. Handle skills injection (--skills-budget N)
-    if parsed.skills_budget > 0:
-        # Build context terms from --domain + --skills-context
-        context_terms: set = set()
-        if parsed.domain:
-            context_terms.update(re.sub(r'[^\w\s]', ' ', parsed.domain.lower()).split())
-        if parsed.skills_context:
-            context_terms.update(
-                re.sub(r'[^\w\s]', ' ', parsed.skills_context.lower()).split()
-            )
-
-        # Score all skills, sort by density descending, inject within budget
-        # Exclude gate:always (already injected unconditionally above)
-        already_injected = {s["name"] for s in injected_skills}
-        scored_skills = sorted(
-            [s for s in load_skills() if s["gate"] != "always"],
-            key=lambda s: compute_skill_score(s, context_terms),
-            reverse=True,
-        )
-        skills_remaining = parsed.skills_budget
-        for skill in scored_skills:
-            if skill["name"] in already_injected:
-                continue
-            score = compute_skill_score(skill, context_terms)
-            if score <= 0:
-                break  # sorted descending — everything after is also 0
-            if skill["tokens"] > skills_remaining:
-                continue
-            injected_skills.append(skill)
-            already_injected.add(skill["name"])
-            skills_remaining -= skill["tokens"]
-            if skills_remaining <= 0:
-                break
-
-        # Expand with also_load dependencies (declared by injected skills)
-        skill_by_name = {s["name"]: s for s in load_skills()}
-        seen_names = {s["name"] for s in injected_skills}
-        for skill in list(injected_skills):  # iterate copy — may extend injected_skills
-            for dep_name in skill.get("also_load", []):
-                if dep_name in seen_names or dep_name not in skill_by_name:
-                    continue
-                dep = skill_by_name[dep_name]
-                if dep["tokens"] <= skills_remaining:
-                    injected_skills.append(dep)
-                    skills_remaining -= dep["tokens"]
-                    seen_names.add(dep_name)
-
-    # 1. Handle SOP injection if requested or inferred
-    sops_to_inject = []
-    if parsed.sop:
-        sops_to_inject.append(parsed.sop)
-    elif parsed.source == "sop" or parsed.scopes:
-        # Match scopes to SOP filenames
-        scopes = parsed.scopes.split(",") if parsed.scopes else []
-        for scope in scopes:
-            if scope.startswith("scope:"):
-                name = scope[len("scope:"):]
-                if (SOP_DIR / f"{name}.md").exists():
-                    sops_to_inject.append(name)
-
-    for sop_name in sops_to_inject:
-        sop_path = SOP_DIR / f"{sop_name}.md"
-        if sop_path.exists():
-            content = sop_path.read_text().strip()
-            tokens = estimate_tokens(content)
-            if tokens <= budget_remaining or parsed.source == "sop":
-                injected_text.append(f"# SOP: {sop_name.upper()}\n\n{content}")
-                budget_remaining -= tokens
-                if parsed.source == "sop" and budget_remaining <= 0:
-                    break
-
-    if parsed.source == "sop":
-        if not injected_text:
-            print("No matching SOPs found.")
-            return
-        print("\n\n".join(injected_text))
-        return
-
-    # 1.4. Session handoff injection — check for recent handoffs matching current skill
-    # Handoffs are structured notes left by previous sessions for skill continuity.
-    # Injected BEFORE memory files (1.5) because handoffs are direct session context.
-    # Only inject the most recent handoff per skill, and only if <48h old.
-    _HANDOFF_DIR = Path.home() / "Projects" / "agent-memory" / "handoffs"
-    # Alias map: common task names → canonical skill names they should match
-    _SKILL_ALIASES = {
-        "jdt": "jetint",
-        "japan deluxe": "jetint",
-        "japandeluxe": "jetint",
-        "malware": "malint",
-        "detonation": "malint",
-        "trading": "finint",
-        "autotrade": "finint",
-        "polymarket": "finint",
-        "memory": "mnemos",
-        "surgeon": "mnemos",
-        "frontend": "vantage",
-        "console": "vantage",
-        "kub0.ai": "vantage",
-        "storage": "linstor-drbd",
-        "drbd": "linstor-drbd",
-        "linstor": "linstor-drbd",
-    }
-    injected_handoffs = []
-    if parsed.task and _HANDOFF_DIR.is_dir():
-        _ho_task_lower = parsed.task.lower()
-        # Expand task string with canonical skill names from aliases
-        _ho_match_skills = set()
-        for alias, canonical in _SKILL_ALIASES.items():
-            if alias in _ho_task_lower:
-                _ho_match_skills.add(canonical)
-        _ho_now_ts = datetime.now().timestamp()
-        for hp in sorted(_HANDOFF_DIR.glob("*.md"), reverse=True):
-            # Check age — skip if >48h old
-            try:
-                age_h = (_ho_now_ts - hp.stat().st_mtime) / 3600
-                if age_h > 48:
-                    continue
-            except Exception:
-                continue
-            # Parse frontmatter for skill name
-            raw = hp.read_text()
-            ho_skill = ""
-            ho_severity = "normal"
-            if raw.startswith("---"):
-                parts = raw.split("---", 2)
-                if len(parts) >= 3:
-                    for line in parts[1].strip().splitlines():
-                        if line.startswith("skill:"):
-                            ho_skill = line[6:].strip()
-                        elif line.startswith("severity:"):
-                            ho_severity = line[9:].strip()
-            # Match: skill name appears in task, task words overlap with skill, or alias resolved
-            _ho_direct = ho_skill in _ho_task_lower
-            _ho_split = any(w in _ho_task_lower for w in ho_skill.split("-"))
-            _ho_alias = ho_skill in _ho_match_skills
-            if ho_skill and (_ho_direct or _ho_split or _ho_alias):
-                ho_text = f"### Handoff: {ho_skill} ({hp.stem})"
-                if ho_severity != "normal":
-                    ho_text = f"### ⚠ Handoff ({ho_severity}): {ho_skill}"
-                ho_text += f"\n{raw.split('---', 2)[-1].strip() if raw.startswith('---') else raw}"
-                ho_tokens = estimate_tokens(ho_text)
-                # Handoffs are exempt from corpus budget — they are the highest-priority
-                # context item (direct session continuity). Cap at 3000 tokens to prevent
-                # runaway handoffs from starving everything else.
-                if ho_tokens <= 3000:
-                    injected_handoffs.append({"text": ho_text, "tokens": ho_tokens, "skill": ho_skill})
-                    budget_remaining = max(0, budget_remaining - ho_tokens)
-                    break  # only inject the most recent matching handoff
-
-    # 1.5. Memory file injection — scan all memory directories, score against --task
-    # Memory files (feedback, domain, project, user, reference) contain human-curated
-    # knowledge that MUST surface when relevant. They live outside facts.db.
-    # Priority: feedback > domain > project > user > reference
-    _MEMORY_BASE = MEMORY_DIR
-    _MEMORY_DIRS = [
-        # (subdir, type_label, max_per_type, cosine_threshold)
-        ("feedback", "Feedback", 3, 0.30),   # hard rules — highest priority
-        ("domain",   "Domain",   2, 0.40),   # subsystem gotchas (raised from 0.35)
-        ("project",  "Project",  1, 0.50),   # active work context (raised; max 1 to avoid budget waste)
-        ("user",     "Context",  1, 0.30),   # user preferences/role
-        ("reference","Reference",1, 0.40),   # external system pointers (raised from 0.35)
-    ]
-    injected_feedback = []  # name kept for backward compat with output section
-    # Budget allocation for memory files:
-    #   - feedback/project/user/ref: capped at 40% of budget (these are 200-700 tokens each)
-    #   - domain files: capped at 65% of budget (these are 600-2000 tokens, most valuable)
-    #   - corpus facts get whatever remains
-    # Domain files process after feedback (feedback first for hard gates)
-    _mem_feedback_cap = int(parsed.budget * 0.40)
-    _mem_domain_cap = int(parsed.budget * 0.65)
-    _mem_feedback_used = 0
-    _mem_domain_used = 0
-    if parsed.task:
-        task_lower = parsed.task.lower()
-        # Filter stop words from BM25 scoring — generic words match every file
-        _MEM_STOP_WORDS = frozenset([
-            'a','an','the','is','it','in','on','at','to','for','of','and','or','but','not','with',
-            'from','by','as','be','was','were','been','are','this','that','these','those','i','we',
-            'you','they','do','does','did','will','would','could','should','can','may','might',
-            'have','has','had','new','all','any','each','every','some','no','up','out','about',
-            'just','into','over','after','before','between','through','during','such','than','then',
-            'what','when','where','which','who','how','more','most','very','also','only','like',
-            'make','use','get','set','need','want','try','fix','run','check','look','see',
-        ])
-        task_words = set(re.sub(r'[^\w\s]', ' ', task_lower).split()) - _MEM_STOP_WORDS
-        _mem_task_emb = _embed_text(parsed.task) if not parsed.no_semantic else None
-
-        # Pre-compute document frequency across ALL memory files for proper IDF
-        _mem_doc_freq: Counter = Counter()
-        _mem_total_docs = 0
-        for _mf_subdir, _, _, _ in _MEMORY_DIRS:
-            _mf_dir = _MEMORY_BASE / _mf_subdir
-            if not _mf_dir.is_dir():
-                continue
-            for _mf_fp in _mf_dir.glob("*.md"):
-                try:
-                    _mf_words = set(_mf_fp.read_text().lower().split())
-                    for tw in task_words:
-                        if tw in _mf_words:
-                            _mem_doc_freq[tw] += 1
-                    _mem_total_docs += 1
-                except Exception:
-                    pass
-
-        for subdir, type_label, max_items, cos_thresh in _MEMORY_DIRS:
-            mem_dir = _MEMORY_BASE / subdir
-            if not mem_dir.is_dir():
-                continue
-            candidates = []
-            for fp in sorted(mem_dir.glob("*.md")):
-                try:
-                    raw = fp.read_text()
-                except Exception:
-                    continue
-                # Parse frontmatter
-                fm_name = fp.stem
-                fm_desc = ""
-                body = raw
-                if raw.startswith("---"):
-                    parts = raw.split("---", 2)
-                    if len(parts) >= 3:
-                        for line in parts[1].strip().splitlines():
-                            if line.startswith("name:"):
-                                fm_name = line[5:].strip()
-                            elif line.startswith("description:"):
-                                fm_desc = line[12:].strip()
-                        body = parts[2].strip()
-                # BM25-ish keyword score with real document frequency
-                search_text = f"{fm_name} {fm_desc} {body}".lower()
-                search_words = search_text.split()
-                word_counts = Counter(search_words)
-                doc_len = len(search_words)
-                kw_score = 0.0
-                for tw in task_words:
-                    tf = word_counts.get(tw, 0)
-                    if tf > 0:
-                        # Use actual document frequency across memory files for IDF
-                        # Words appearing in >40% of files get negligible IDF
-                        df = _mem_doc_freq.get(tw, 1)
-                        idf = math.log((_mem_total_docs + 1) / (df + 1) + 0.5)
-                        kw_score += idf * tf * 2.5 / (tf + 1.5 * (0.25 + 0.75 * doc_len / 200))
-                # Body-literal detection only for curated dirs (feedback, domain) —
-                # auto-generated files (reference/corpus-highlights) can contain
-                # "HARD GATE" inside quoted facts and must not inherit hard-gate
-                # privileges (cap bypass, relaxed cosine).
-                is_hard_gate = "hard gate" in fm_desc.lower() or (subdir in ("feedback", "domain") and "HARD GATE" in body)
-                if is_hard_gate:
-                    kw_score *= 1.5
-                if kw_score > 0:
-                    candidates.append((kw_score, fm_name, fm_desc, body, fp, is_hard_gate))
-
-            # Semantic gate — primary filter using embed daemon
-            if _mem_task_emb and candidates:
-                gated = []
-                for kw_score, fm_name, fm_desc, body, fp, is_hg in candidates:
-                    emb = _embed_text(f"{fm_name}: {fm_desc}. {body[:500]}")
-                    if emb:
-                        cosine = sum(a * b for a, b in zip(_mem_task_emb, emb))
-                        if cosine < 0.20:
-                            continue  # truly irrelevant
-                        elif cosine < cos_thresh and not is_hg:
-                            continue  # borderline + not hard gate
-                        elif cosine < cos_thresh and is_hg:
-                            kw_score = 0.2 * kw_score + 0.8 * (cosine ** 2) * 40
-                        else:
-                            kw_score = 0.3 * kw_score + 0.7 * (cosine ** 2) * 60
-                    else:
-                        kw_score *= 0.5
-                    gated.append((kw_score, fm_name, fm_desc, body, fp, is_hg))
-                candidates = gated
-            elif not _mem_task_emb and candidates:
-                candidates = [c for c in candidates if c[0] > 3.0]
-
-            # Sort, take top N per type. Feedback HARD gates are exempt from the
-            # count cap — a deploy-safety rule must not lose its slot to a
-            # higher-BM25 generic rule. They still respect the score floor and
-            # the feedback token cap below.
-            candidates.sort(key=lambda x: x[0], reverse=True)
-            if subdir == "feedback":
-                selected = [c for c in candidates if c[5]]
-                selected += [c for c in candidates if not c[5]][:max_items]
-                selected.sort(key=lambda x: x[0], reverse=True)
-            else:
-                selected = candidates[:max_items]
-            for kw_score, fm_name, fm_desc, body, fp, is_hg in selected:
-                if kw_score <= 1.0:  # lowered from 2.0 — real IDF produces lower scores
-                    break
-                # Memory file excerpting: reduce injected size to save budget
-                inject_body = body
-                # Domain files: truncate to first 800 chars (the inventory table is enough)
-                if type_label == "Domain" and len(body) > 800:
-                    inject_body = body[:800].rstrip() + "\n\n_(truncated — full file available on demand)_"
-                # Feedback: inject only the rule + "How to apply", skip narrative
-                if type_label == "Feedback" and "**How to apply:**" in body:
-                    # Extract: everything before "**Why:**" + "**How to apply:**" section
-                    parts = body.split("**Why:**", 1)
-                    rule_text = parts[0].strip()
-                    how_section = ""
-                    if "**How to apply:**" in body:
-                        how_section = body.split("**How to apply:**", 1)[1]
-                        # Truncate at next heading or end
-                        for marker in ("\n##", "\n**When", "\n---"):
-                            if marker in how_section:
-                                how_section = how_section[:how_section.index(marker)]
-                        how_section = "**How to apply:**" + how_section.strip()
-                    inject_body = f"{rule_text}\n\n{how_section}".strip()
-                mem_text = f"### {type_label}: {fm_name}\n_{fm_desc}_\n\n{inject_body}"
-                mem_tokens = estimate_tokens(mem_text)
-                # Enforce memory budget caps — separate pools for feedback vs domain
-                is_domain_type = (type_label == "Domain")
-                if is_domain_type:
-                    if _mem_domain_used + mem_tokens > _mem_domain_cap:
-                        continue  # domain budget exhausted
-                else:
-                    # Hard gates no longer bypass the token cap: they are exempt from
-                    # the COUNT cap instead (all matching hard gates compete on rank
-                    # within the 40% pool). An unbounded bypass let a single 5K-token
-                    # auto-generated file eat 69% of the budget.
-                    if _mem_feedback_used + mem_tokens > _mem_feedback_cap:
-                        continue  # feedback budget exhausted
-                if mem_tokens <= budget_remaining:
-                    injected_feedback.append({
-                        "text": mem_text, "tokens": mem_tokens,
-                        "score": kw_score, "name": fm_name, "type": type_label,
-                    })
-                    budget_remaining -= mem_tokens
-                    if is_domain_type:
-                        _mem_domain_used += mem_tokens
-                    else:
-                        _mem_feedback_used += mem_tokens
-
-    # 2. Handle Corpus injection
-    # facts.db is the authoritative corpus. Staged entries are legacy (pre-facts.db)
-    # and have been promoted to facts.db via staged-promotion provenance.
-    entries = []
-
-    # Load persistent facts (facts.db)
-    conn = init_db()
-    facts_query = "SELECT * FROM facts WHERE tombstoned_at IS NULL AND (outcome IS NULL OR outcome != 'rejected')"
-    if parsed.domain:
-        # Use simple escaping to avoid SQL injection
-        safe_domain = parsed.domain.replace("'", "''")
-        facts_query += f" AND domain = '{safe_domain}'"
-
-    try:
-        rows = conn.execute(facts_query).fetchall()
-        for r in rows:
-            # Convert DB row to a format compatible with staged entries
-            fact = dict(r)
-            # Map fact to a format that can be ranked.
-            # We put the text in 'key_concepts' section by default for facts.
-            entries.append({
-                "type": "fact",
-                "domain": fact["domain"],
-                "uuid": fact["fact_key"],
-                "timestamp": fact["last_seen"] or fact["first_seen"] or "",
-                "last_confirmed": fact["last_seen"],
-                "sections": {"key_concepts": fact["fact_text"]},
-                "score_override": fact["score"],
-                "provenance": fact["provenance"],
-                "is_fact": True,
-                "fact_type": fact.get("fact_type", "observation"),
-                "review_state": fact.get("review_state", "auto"),
-            })
-    except Exception as e:
-        print(f"Warning: could not load facts from DB: {e}", file=sys.stderr)
-
-    if not entries:
-        print("No corpus entries available.")
-        return
-
-    # Filter by domain if specified
-    if parsed.domain:
-        entries = [
-            e for e in entries
-            if parsed.domain in tag_domains(" ".join(
-                (e.get("sections", {}).get(k, "") or "")
-                for k, _ in SECTION_HEADERS
-            ))
-        ]
-        if not entries:
-            print(f"No entries matching domain '{parsed.domain}'.")
-            return
-
-    # Load domain stats for bootstrap check
-    domain_stats = load_domain_stats()
-
-    # Check cold domain bootstrap
-    in_bootstrap = False
-    if parsed.domain:
-        dom_info = domain_stats.get(parsed.domain, {})
-        session_count = dom_info.get("session_count", 0)
-        if session_count < BOOTSTRAP_THRESHOLD:
-            in_bootstrap = True
-
-    # Compute TF-IDF scores (and optionally BM25 if --task is given)
-    doc_freq = build_doc_freq(entries)
-    total_docs = len(entries)
-    now = datetime.now(timezone.utc)
-
-    # BM25 setup — only when --task is provided
-    task_terms: list[str] = []
-    bm25_df: dict = {}
-    bm25_avg_len: float = 1.0
-    # Skill-aware domain boost: detect active skill/domain from task text
-    _active_skill_domains: set = set()
-    if parsed.task:
-        task_terms = re.sub(r'[^\w\s]', ' ', parsed.task.lower()).split()
-        bm25_df, bm25_avg_len = _build_bm25_doc_freq(entries, set(task_terms))
-        # Map skill keywords to domains for boosting
-        _SKILL_DOMAIN_MAP = {
-            "ops": {"operational", "general"},
-            "quant": {"finint", "operational"},
-            "finint": {"finint"},
-            "malware": {"security"},
-            "malint": {"malint", "security"},
-            "audit": {"security"},
-            "gaius": {"general", "operational"},
-            "maint": {"general", "operational"},
-            "storage": {"storage"},
-            "linstor": {"storage"},
-            "tetragon": {"security"},
-            "cctv": {"cctv", "operational"},
-            "adsb": {"adsb", "operational"},
-            "console": {"services", "frontend"},
-            "jdt": {"services"},
-        }
-        _task_lower = parsed.task.lower()
-        for skill_kw, domains in _SKILL_DOMAIN_MAP.items():
-            if skill_kw in _task_lower:
-                _active_skill_domains.update(domains)
-
-    # Semantic scoring setup — embed the task query once, batch-load all embeddings upfront
-    task_embedding = None
-    fact_embedding_map: dict = {}  # fact_key -> cosine_sim (pre-computed)
-    use_semantic = HAS_SQLITE_VEC and not parsed.no_semantic and parsed.task
-    if use_semantic:
-        task_embedding = _embed_text(parsed.task)
-        if task_embedding:
-            try:
-                import struct as _struct
-                # Batch load: join facts → fact_embeddings in a single query (not per-fact)
-                embed_rows = conn.execute(
-                    "SELECT f.fact_key, fe.embedding FROM facts f "
-                    "JOIN fact_embeddings fe ON fe.fact_id = f.id "
-                    "WHERE f.tombstoned_at IS NULL"
-                ).fetchall()
-                for fact_key, emb_blob in embed_rows:
-                    fact_vec = _struct.unpack(f'{_EMBED_DIM}f', emb_blob)
-                    cosine_sim = sum(a * b for a, b in zip(task_embedding, fact_vec))
-                    fact_embedding_map[fact_key] = cosine_sim
-            except Exception:
-                pass  # fall back to keyword-only score
-
-    scored_entries = []
-    for entry in entries:
-        score = compute_entry_tfidf_score(entry, doc_freq, total_docs)
-
-        # BM25 boost — when --task given, add relevance score (normalized to same scale)
-        if task_terms:
-            bm25 = bm25_score(task_terms, entry, bm25_df, total_docs, bm25_avg_len)
-            # Blend: BM25 replaces TF-IDF as the primary signal when --task is given.
-            # Weight: 0.3 TF-IDF (to retain general importance) + 0.7 BM25 (task relevance).
-            score = 0.3 * score + 0.7 * bm25
-
-        # Semantic similarity boost — use pre-computed cosine sim from batch load
-        # Floor: require min cosine_sim > 0.3 to avoid surfacing irrelevant boilerplate
-        if fact_embedding_map and entry.get("is_fact"):
-            cosine_sim = fact_embedding_map.get(entry.get("uuid", ""))
-            if cosine_sim is not None:
-                if cosine_sim < 0.3:
-                    score *= 0.1  # heavily penalize semantically irrelevant facts
-                else:
-                    # Blend: 0.4 keyword + 0.6 semantic
-                    score = 0.4 * score + 0.6 * max(0, cosine_sim)
-
-        # Quoted phrase boost: exact phrases get priority
-        if parsed.task:
-            fact_text = (entry.get("sections", {}).get("key_concepts", "") or "")
-            phrases = extract_quoted_phrases(parsed.task)
-            q_boost = quoted_phrase_boost(phrases, fact_text)
-            if q_boost > 0:
-                score *= (1.0 + 0.3 * q_boost)  # up to 30% boost for exact phrases
-
-            # Infrastructure entity boost — k8s node names, service names
-            e_boost = infra_entity_boost(parsed.task, fact_text)
-            if e_boost > 0:
-                score *= (1.0 + 0.2 * e_boost)  # up to 20% boost for entity match
-
-        # Apply decay factor
-        ts = entry.get("last_confirmed") or entry.get("timestamp", "")
-        created_ts = entry.get("timestamp", "")
-        if ts and created_ts:
-            try:
-                created = datetime.fromisoformat(created_ts.replace("Z", "+00:00"))
-                confirmed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                age_days = (now - created).total_seconds() / 86400
-                last_confirmed_days = (now - confirmed).total_seconds() / 86400
-                score *= decay_factor(age_days, last_confirmed_days)
-            except (ValueError, TypeError):
-                pass
-
-        # Fact-type weighting — boost high-value types, penalize raw observations
-        if entry.get("is_fact"):
-            ft = entry.get("fact_type", "observation")
-            if ft in ("incident", "finding"):
-                score *= 1.3
-            elif ft in ("procedure", "security"):
-                score *= 1.2
-            elif ft == "observation":
-                score *= 0.5  # raw observations are low-value for injection
-
-            # Stored quality score — use as a quality multiplier when non-default.
-            # After rescore (2026-05-03), scores are properly distributed:
-            #   findings 0.5+, procedures 0.4+, security 0.4, operational 0.3
-            stored_q = entry.get("score_override", 0)
-            if stored_q and stored_q > 0.35:
-                score *= (0.8 + 0.4 * stored_q)  # 0.4→0.96x, 0.7→1.08x, 1.0→1.2x
-
-            # Pending review = low-confidence or contradiction-flagged at ingest.
-            # They stay injectable (most will never be human-reviewed) but must
-            # not outrank clean facts.
-            if entry.get("review_state") == "pending":
-                score *= 0.6
-
-            # Skill-aware domain boost — when active skill/domain detected from task,
-            # boost facts in matching domains (2x) to surface relevant context
-            if _active_skill_domains and entry.get("domain") in _active_skill_domains:
-                score *= 1.8
-
-        # Cross-agent confirmation bonus
-        agent_source = entry.get("agent_source", "claude")
-        sources_for_hash = set()
-        chash = entry.get("content_hash", "")
-        if chash:
-            for other in entries:
-                if other.get("content_hash") == chash and other is not entry:
-                    sources_for_hash.add(other.get("agent_source", "claude"))
-            sources_for_hash.add(agent_source)
-            if len(sources_for_hash) >= 2:
-                score *= CROSS_AGENT_MULTIPLIER
-
-        # Build text for injection
-        text_parts = []
-        for key, header in SECTION_HEADERS:
-            section_text = (entry.get("sections", {}).get(key, "") or "").strip()
-            if section_text:
-                text_parts.append(f"### {header}\n{section_text}")
-        text = "\n\n".join(text_parts)
-        tokens = estimate_tokens(text)
-
-        # Score-per-token for budget-aware ranking
-        priority = score / tokens if tokens > 0 else 0
-
-        scored_entries.append({
-            "entry": entry,
-            "score": score,
-            "tokens": tokens,
-            "priority": priority,
-            "text": text,
-            "in_bootstrap": in_bootstrap,
-        })
-
-    # Sort by priority descending
-    scored_entries.sort(key=lambda x: x["priority"], reverse=True)
-
-    # Inject up to budget; dedup by content to suppress cross-domain duplicates
-    # Account for feedback AND handoff tokens already consumed in steps 1.4/1.5
-    feedback_tokens_used = sum(fb["tokens"] for fb in injected_feedback)
-    handoff_tokens_used = sum(h["tokens"] for h in injected_handoffs)
-    budget_remaining = max(0, parsed.budget - feedback_tokens_used - handoff_tokens_used)
-    injected = []
-    seen_content_hashes: set = set()
-    _MAX_CORPUS_ENTRIES = 15  # cap to avoid overwhelming context with low-signal tail
-    for se in scored_entries:
-        if se["tokens"] > budget_remaining and not se["in_bootstrap"]:
-            continue
-        if not se["in_bootstrap"] and se["score"] <= 0:
-            continue
-        if not se["in_bootstrap"] and INJECT_MIN_PRIORITY > 0 and se["priority"] < INJECT_MIN_PRIORITY:
-            continue
-        # Content dedup: skip if same text already queued (same fact in different domain)
-        content_hash = hashlib.sha256(se["text"].encode()).hexdigest()[:16]
-        if content_hash in seen_content_hashes:
-            continue
-        seen_content_hashes.add(content_hash)
-        injected.append(se)
-        budget_remaining -= se["tokens"]
-        if budget_remaining <= 0 and not se["in_bootstrap"]:
-            break
-        if len(injected) >= _MAX_CORPUS_ENTRIES:
-            break
-
-    if not injected and not injected_skills and not injected_text and not injected_feedback and not injected_handoffs:
-        print("No entries meet scoring threshold for injection.")
-        # Log telemetry: no-match event
-        try:
-            from gaius.telemetry import log_prompt_event
-            _prompt_hash = hashlib.sha256((parsed.task or "").encode()).hexdigest()[:12]
-            _terms_raw = len(re.sub(r'[^\w\s]', ' ', (parsed.task or "").lower()).split()) if parsed.task else 0
-            log_prompt_event(
-                session_id=os.environ.get("CLAUDE_SESSION_ID", ""),
-                prompt_hash=_prompt_hash, prompt_len=len(parsed.task or ""),
-                terms_raw=_terms_raw, terms_filtered=len(task_terms) if task_terms else 0,
-                skip_reason="no_match", budget=parsed.budget,
-            )
-        except Exception:
-            pass
-        return
-    elif not injected:
-        injected = []  # skills/SOPs/feedback/handoffs present — continue to output block
-
-    # Output injected entries
-    bootstrap_tag = " [BOOTSTRAP]" if in_bootstrap else ""
-    task_tag = f" [task: {parsed.task[:60]}{'…' if len(parsed.task or '') > 60 else ''}]" if parsed.task else ""
-    skills_tokens = sum(s["tokens"] for s in injected_skills)
-    # Approximate total of what gets printed — each component counted once
-    # (the old budget-delta formula double-counted feedback tokens). Corpus
-    # entries gain ~25 tokens each in print framing (separator + meta comment
-    # + section header), not reflected in se["tokens"].
-    corpus_tokens = sum(se["tokens"] for se in injected) + len(injected) * 25
-    text_tokens = sum(estimate_tokens(t) for t in injected_text)
-    total_tokens = corpus_tokens + text_tokens + feedback_tokens_used + handoff_tokens_used + skills_tokens
-    fb_tag = f" | Memory: {len(injected_feedback)}" if injected_feedback else ""
-    ho_tag = f" | Handoff: {len(injected_handoffs)}" if injected_handoffs else ""
-    print(f"# Gaius Corpus Injection{bootstrap_tag}{task_tag}")
-    print(f"# Entries: {len(injected) + len(injected_text)} | Tokens: ~{total_tokens}"
-          + fb_tag + ho_tag
-          + (f" | Skills: {len(injected_skills)} ({skills_tokens} tokens)" if injected_skills else ""))
-    print()
-
-    # Skills context block (before corpus)
-    if injected_skills:
-        print("## Skills Context")
-        print()
-        for skill in injected_skills:
-            desc  = skill["fm"].get("description", "")
-            stale = skill.get("is_stale", False)
-            also  = skill.get("also_load", [])
-            header = f"### Skill: {skill['name']}"
-            if stale:
-                header += f"  ⚠ STALE (last updated {skill.get('git_date','?')} — verify against current cluster state)"
-            print(header)
-            if desc:
-                print(f"_{desc}_")
-            if also:
-                print(f"_Also loads: {', '.join(also)}_")
-            print()
-            print(skill["body"])
-            print()
-
-    # Memory block (between skills and corpus — higher priority than raw facts)
-    if injected_feedback:
-        print("## Memory Context")
-        print("_Curated knowledge from memory files. Feedback entries are hard rules — violating them is a red flag._")
-        print()
-        for fb in injected_feedback:
-            print(fb["text"])
-            print()
-
-    # Handoff block (between memory and SOPs — previous session continuity)
-    if injected_handoffs:
-        print("## Session Handoff")
-        print("_Structured notes from the previous session of this skill. Review before starting new work._")
-        print()
-        for ho in injected_handoffs:
-            print(ho["text"])
-            print()
-
-    for sop_md in injected_text:
-        print(sop_md)
-        print()
-
-    for se in injected:
-        uuid = se["entry"].get("uuid", "?")[:8]
-        ts = se["entry"].get("timestamp", "")[:10]
-        print(f"---\n<!-- {uuid} | {ts} | score={se['score']:.3f} | priority={se['priority']:.4f} -->")
-        # Compact format: truncate fact text to reduce token waste
-        text = se["text"]
-        if se["entry"].get("is_fact") and len(text) > 300:
-            # Single-line compact: first 280 chars + ellipsis
-            text = text[:280].rstrip() + "…"
-        print(text)
-        print()
-
-    # ── Telemetry logging ─────────────────────────────────────────────────────
-    try:
-        from gaius.telemetry import log_prompt_event, log_injection_fact
-        _session_id = os.environ.get("CLAUDE_SESSION_ID", "")
-        _prompt_hash = hashlib.sha256((parsed.task or "").encode()).hexdigest()[:12]
-        _terms_raw = len(re.sub(r'[^\w\s]', ' ', (parsed.task or "").lower()).split()) if parsed.task else 0
-        _mem_types = {}
-        for fb in injected_feedback:
-            t = fb.get("type", "unknown")
-            _mem_types[t] = _mem_types.get(t, 0) + 1
-        _top_cos = max((se.get("entry", {}).get("cosine_sim", 0) or 0 for se in injected), default=0)
-        # Also check fact_embedding_map for top cosine among injected
-        if fact_embedding_map and injected:
-            _inj_cosines = [fact_embedding_map.get(se["entry"].get("uuid", ""), 0) for se in injected]
-            _top_cos = max(_top_cos, max(_inj_cosines)) if _inj_cosines else _top_cos
-
-        log_prompt_event(
-            session_id=_session_id, prompt_hash=_prompt_hash,
-            prompt_len=len(parsed.task or ""), terms_raw=_terms_raw,
-            terms_filtered=len(task_terms) if task_terms else 0,
-            entries_injected=len(injected), memory_files_injected=len(injected_feedback),
-            memory_types=_mem_types if _mem_types else None,
-            tokens_used=total_tokens, budget=parsed.budget,
-            top_cosine=_top_cos if _top_cos > 0 else None,
-            active_skill=os.environ.get("GAIUS_ACTIVE_SKILL", ""),
-        )
-        # Log individual fact injections for popularity tracking
-        for se in injected:
-            _fk = se["entry"].get("uuid", "")
-            _cos = fact_embedding_map.get(_fk, None) if fact_embedding_map else None
-            log_injection_fact(
-                session_id=_session_id, prompt_hash=_prompt_hash,
-                fact_key=_fk, score=se["score"], priority=se["priority"],
-                cosine=_cos, source="corpus",
-            )
-        for fb in injected_feedback:
-            log_injection_fact(
-                session_id=_session_id, prompt_hash=_prompt_hash,
-                fact_key=fb.get("name", ""), score=fb.get("score", 0), priority=0,
-                source=f"memory_{fb.get('type', 'unknown').lower()}",
-            )
-    except Exception:
-        pass  # telemetry must never break injection
-
-
+# ── Landscape Protocol → extracted to gaius/landscape.py (facade re-import below) ──
 def cmd_index(args):
     """Parse JSONL, build domain index, write deltas and corpus."""
     parser = argparse.ArgumentParser(prog="gaius index")
@@ -5058,29 +4244,17 @@ def cmd_embed(args):
 
     print(f"Embedding {len(to_embed)} facts ({len(existing_ids)} already done)...")
 
-    # Batch embed for efficiency
-    import struct
-    texts = [t[1] for t in to_embed]
-    ids = [t[0] for t in to_embed]
-    BATCH_SIZE = 256
+    # Embed each fact via _store_embedding so long facts are chunked consistently
+    # with the live write path (one row per <=256-token chunk), instead of one
+    # truncated vector per fact.
     embedded = 0
-    for i in range(0, len(texts), BATCH_SIZE):
-        batch_texts = texts[i:i + BATCH_SIZE]
-        batch_ids = ids[i:i + BATCH_SIZE]
-        vectors = _embed_texts(batch_texts)
-        if vectors is None:
-            break
-        for fact_id, vec in zip(batch_ids, vectors):
-            vec_blob = struct.pack(f'{_EMBED_DIM}f', *vec)
-            try:
-                conn.execute("INSERT INTO fact_embeddings (embedding, fact_id) VALUES (?, ?)", (vec_blob, fact_id))
-            except Exception:
-                pass
-        embedded += len(batch_texts)
+    for fact_id, fact_text in to_embed:
+        _store_embedding(conn, fact_id, fact_text)
+        embedded += 1
         if embedded % 1000 == 0 or embedded == len(to_embed):
             print(f"  {embedded}/{len(to_embed)} embedded")
     conn.commit()
-    print(f"Done. {embedded} new embeddings stored.")
+    print(f"Done. {embedded} facts embedded (chunked as needed).")
 
 
 def cmd_stats(args):
@@ -5145,8 +4319,13 @@ def cmd_stats(args):
         # Embedding stats
         if HAS_SQLITE_VEC:
             try:
-                embedded_count = conn.execute("SELECT COUNT(*) FROM fact_embeddings").fetchone()[0]
-                print(f"  Embeddings: {embedded_count}/{total_facts} ({100*embedded_count//max(total_facts,1)}%)")
+                # Live facts only: tombstoned facts lose embeddings by design (dedup) —
+                # counting them made 100%-embedded corpora read as a backlog.
+                live_facts = conn.execute("SELECT COUNT(*) FROM facts WHERE tombstoned_at IS NULL").fetchone()[0]
+                embedded_count = conn.execute(
+                    "SELECT COUNT(*) FROM facts WHERE tombstoned_at IS NULL "
+                    "AND id IN (SELECT fact_id FROM fact_embeddings)").fetchone()[0]
+                print(f"  Embeddings: {embedded_count}/{live_facts} ({100*embedded_count//max(live_facts,1)}%)")
                 print(f"  Embedding model: all-MiniLM-L6-v2 ({_EMBED_DIM}-dim)")
             except Exception:
                 print("  Embeddings: not initialized (run: gaius embed)")
@@ -5374,1017 +4553,8 @@ def cmd_batch(args):
         print()
 
 
-# ── Step 6: maturity scoring ───────────────────────────────────────────────────
-
-PROVENANCE_WEIGHT = {
-    "automated":           0.7,
-    "auto-mined":          0.6,   # machine-mined from session JSONLs, unreviewed (78% of corpus)
-    "structured_reasoning": 0.8,
-    "compaction":          0.9,
-    "distillation":        0.85,  # relay agent output — structured, validated intent
-    "finding":             1.0,
-    "procedure":           0.9,
-    "mcp-session":         0.8,   # agent deliberately recorded mid-session
-    "human_reviewed":      1.0,
-}
-
-# Provenances exempt from time decay (permanent records)
-NO_DECAY_PROVENANCES = frozenset(["finding", "procedure"])
-
-OUTCOME_MODIFIER = {
-    "confirmed":      1.2,
-    "open_question":  0.7,
-    "refuted":        0.3,
-    None:             1.0,
-}
-
-MATURITY_BOOTSTRAP_MIN = 20   # need at least this many facts to compute score
-
-# Cross-model confirmation multiplier — applied when the same signal unit has been
-# independently confirmed by agents on architecturally distinct model families.
-# Three-tier hierarchy:
-#   single-session baseline  <  cold-start same-model convergence  <  cross-model (this)
-# Configurable: adjust here without touching scoring logic.
-CROSS_MODEL_MULTIPLIER = 1.5
-
-# Source reliability — discounts autonomous (machine-generated) facts to prevent
-# hallucination reinforcement loops (G1). Domain files are curated ground truth.
-SOURCE_RELIABILITY = {
-    "autonomous": 0.7,   # machine-generated (briefing CronJob, Tier 2 triage)
-    "human":      1.0,   # interactive sessions (default, backward compat)
-    "domain":     1.2,   # curated domain/*.md files
-}
-
-
-def _maturity_score(facts: list[dict], decay_rate: float = 0.005) -> float:
-    """Compute a [0,1] maturity score for a list of fact rows.
-
-    Formula: sum(confirmation_count × decay × provenance_weight × outcome_modifier × cross_model)
-             ──────────────────────────────────────────────────────────────────────────────────────
-             total_facts
-
-    decay = exp(-rate × age_days), where age_days is days since first_seen.
-    cross_model = CROSS_MODEL_MULTIPLIER when model_families has 2+ distinct families,
-                  1.0 otherwise.
-    """
-    import math
-    now = datetime.now(timezone.utc)
-    total = len(facts)
-    if total < MATURITY_BOOTSTRAP_MIN:
-        return 0.0
-
-    weighted_sum = 0.0
-    for row in facts:
-        conf  = max(1, row["confirmation_count"])
-        prov_key = row["provenance"] if row["provenance"] else "automated"
-        prov  = PROVENANCE_WEIGHT.get(prov_key, 0.5)
-        out   = OUTCOME_MODIFIER.get(row["outcome"], 1.0)
-        try:
-            first_seen = datetime.fromisoformat(row["first_seen"])
-            if first_seen.tzinfo is None:
-                first_seen = first_seen.replace(tzinfo=timezone.utc)
-            age_days = (now - first_seen).total_seconds() / 86400
-        except (TypeError, ValueError):
-            age_days = 0.0
-        # Exempt certain provenances from time decay (permanent records)
-        if prov_key in NO_DECAY_PROVENANCES:
-            decay = 1.0
-        else:
-            decay = math.exp(-decay_rate * age_days)
-        # Cross-model confirmation multiplier
-        try:
-            families = json.loads(row["model_families"] or '["claude"]')
-            cross_mult = CROSS_MODEL_MULTIPLIER if len(set(families)) >= 2 else 1.0
-        except (TypeError, ValueError, KeyError):
-            cross_mult = 1.0
-        # Source reliability (G1: discount autonomous, boost curated)
-        source_mult = SOURCE_RELIABILITY.get(row["source"] or "human", 1.0)
-        weighted_sum += conf * decay * prov * out * cross_mult * source_mult
-
-    raw = weighted_sum / total
-    # Normalise to [0,1]: clamp rather than divide (avoids requiring a max baseline)
-    return min(1.0, raw)
-
-
-def cmd_maturity(args):
-    """Print per-domain maturity scores derived from facts.db."""
-    import argparse as _ap
-    parser = _ap.ArgumentParser(prog="gaius maturity")
-    parser.add_argument("--domain", type=str, default=None,
-                        help="Show detail for a single domain")
-    parsed = parser.parse_args(args)
-
-    conn = init_db()
-    domain_specs = load_domain_specs()
-
-    # Fetch all facts grouped by domain (exclude training_excluded facts)
-    rows = conn.execute(
-        "SELECT domain, confirmation_count, provenance, outcome, first_seen, model_families, source FROM facts WHERE COALESCE(training_excluded, 0) = 0 ORDER BY domain"
-    ).fetchall()
-
-    by_domain: dict[str, list] = {}
-    for row in rows:
-        by_domain.setdefault(row["domain"], []).append(row)
-
-    # Load full YAML specs (for maturity_decay_rate) separately from keyword index
-    full_specs: dict[str, dict] = {}
-    if HAS_YAML and SPECS_DIR.exists():
-        for spec_file in SPECS_DIR.glob("*.yaml"):
-            try:
-                with open(spec_file) as f:
-                    spec = yaml.safe_load(f)
-                if isinstance(spec, dict):
-                    full_specs[spec.get("domain", spec_file.stem)] = spec
-            except Exception:
-                pass
-
-    if parsed.domain:
-        domains = [parsed.domain] if parsed.domain in by_domain else []
-    else:
-        domains = sorted(by_domain.keys())
-
-    if not domains:
-        print("No facts found." if not by_domain else f"Domain '{parsed.domain}' not found.")
-        return
-
-    header = f"{'Domain':<22} {'Facts':>6}  {'Score':>6}  {'Maturity':>10}"
-    print(header)
-    print("─" * len(header))
-
-    for domain in domains:
-        facts = by_domain[domain]
-        spec  = full_specs.get(domain, {})
-        rate  = spec.get("maturity_decay_rate", 0.005)
-        score = _maturity_score(facts, decay_rate=rate)
-        n     = len(facts)
-        bar_len = int(score * 20)
-        bar   = "█" * bar_len + "░" * (20 - bar_len)
-        status = "▲ LIVE" if score >= 0.45 else ("~ warm" if score >= 0.25 else "· cold")
-        if n < MATURITY_BOOTSTRAP_MIN:
-            status = f"  ({n} facts, need {MATURITY_BOOTSTRAP_MIN})"
-            bar    = "░" * 20
-            score  = 0.0
-        print(f"{domain:<22} {n:>6}  {score:>6.3f}  {bar}  {status}")
-
-    print()
-    print(f"Total facts: {sum(len(v) for v in by_domain.values())}")
-    if not parsed.domain:
-        alive = sum(1 for d in domains
-                    if len(by_domain[d]) >= MATURITY_BOOTSTRAP_MIN
-                    and _maturity_score(by_domain[d],
-                                        full_specs.get(d, {}).get("maturity_decay_rate", 0.005)) >= 0.45)
-        print(f"Live domains (score ≥ 0.45): {alive}/{len(domains)}")
-
-
-def cmd_readiness(args):
-    """Show domain training readiness against thresholds."""
-    conn = init_db()
-    
-    # Query domain scores
-    rows = conn.execute("SELECT domain, confirmation_count, provenance, outcome, first_seen, model_families FROM facts ORDER BY domain").fetchall()
-    by_domain = {}
-    for row in rows:
-        by_domain.setdefault(row["domain"], []).append(row)
-
-    # Load specs for decay rates
-    full_specs = {}
-    if HAS_YAML and SPECS_DIR.exists():
-        for spec_file in SPECS_DIR.glob("*.yaml"):
-            try:
-                with open(spec_file) as f:
-                    spec = yaml.safe_load(f)
-                if isinstance(spec, dict):
-                    full_specs[spec.get("domain", spec_file.stem)] = spec
-            except Exception:
-                pass
-
-    header = f"{'Domain':<22} {'Facts':>6} {'Score':>6} {'Status':<10} {'Threshold'}"
-    print(header)
-    print("─" * len(header))
-
-    domains = sorted(DOMAIN_KEYWORDS.keys())
-    for domain in domains:
-        facts = by_domain.get(domain, [])
-        n = len(facts)
-        
-        spec = full_specs.get(domain, {})
-        rate = spec.get("maturity_decay_rate", 0.005)
-        score = _maturity_score(facts, decay_rate=rate) if n >= MATURITY_BOOTSTRAP_MIN else 0.0
-        
-        thresh = READINESS_THRESHOLDS.get(domain, DEFAULT_READINESS)
-        t_score = thresh["score"]
-        t_facts = thresh["min_facts"]
-        
-        status = "NOT READY"
-        if score >= t_score and n >= t_facts:
-            status = "▲ READY"
-        elif score >= t_score * 0.8 and n >= t_facts * 0.8:
-            status = "~ MARGINAL"
-            
-        print(f"{domain:<22} {n:>6} {score:>6.3f} {status:<10} (score ≥ {t_score}, facts ≥ {t_facts})")
-
-def cmd_snapshot(args):
-    """Output a maturity + readiness snapshot as JSON for observatory telemetry.
-
-    Writes to stdout (or --output FILE). Designed to be run from a CronJob:
-      python gaius snapshot --json | curl -X POST .../observatory/maturity/ingest
-    """
-    import argparse as _ap
-    parser = _ap.ArgumentParser(prog="gaius snapshot")
-    parser.add_argument("--output", "-o", type=str, default=None,
-                        help="Output file path (default: stdout)")
-    parsed = parser.parse_args(args)
-
-    conn = init_db()
-    rows = conn.execute(
-        "SELECT domain, confirmation_count, provenance, outcome, first_seen, model_families, source FROM facts ORDER BY domain"
-    ).fetchall()
-    by_domain = {}
-    for row in rows:
-        by_domain.setdefault(row["domain"], []).append(row)
-
-    full_specs = {}
-    if HAS_YAML and SPECS_DIR.exists():
-        for spec_file in SPECS_DIR.glob("*.yaml"):
-            try:
-                with open(spec_file) as f:
-                    spec = yaml.safe_load(f)
-                if isinstance(spec, dict):
-                    full_specs[spec.get("domain", spec_file.stem)] = spec
-            except Exception:
-                pass
-
-    all_domains = sorted(set(list(by_domain.keys()) + list(DOMAIN_KEYWORDS.keys())))
-    total_facts = sum(len(v) for v in by_domain.values())
-    live_count = 0
-    domains_out = []
-
-    for domain in all_domains:
-        facts = by_domain.get(domain, [])
-        n = len(facts)
-        spec = full_specs.get(domain, {})
-        rate = spec.get("maturity_decay_rate", 0.005)
-        score = _maturity_score(facts, decay_rate=rate) if n >= MATURITY_BOOTSTRAP_MIN else 0.0
-
-        thresh = READINESS_THRESHOLDS.get(domain, DEFAULT_READINESS)
-        t_score = thresh["score"]
-        t_facts = thresh["min_facts"]
-        ready = score >= t_score and n >= t_facts
-
-        if score >= 0.45 and n >= MATURITY_BOOTSTRAP_MIN:
-            status = "live"
-            live_count += 1
-        elif score >= 0.25 and n >= MATURITY_BOOTSTRAP_MIN:
-            status = "warm"
-        elif n >= MATURITY_BOOTSTRAP_MIN:
-            status = "cold"
-        else:
-            status = "bootstrap"
-
-        # Compute per-domain raw stats for client-side recomputation
-        provenance_counts = {}
-        total_conf = 0
-        total_age = 0.0
-        cross_model_count = 0
-        now_snap = datetime.now(timezone.utc)
-        for row in facts:
-            prov_key = row["provenance"] if row["provenance"] else "automated"
-            provenance_counts[prov_key] = provenance_counts.get(prov_key, 0) + 1
-            total_conf += max(1, row["confirmation_count"])
-            try:
-                fs = datetime.fromisoformat(row["first_seen"])
-                if fs.tzinfo is None:
-                    fs = fs.replace(tzinfo=timezone.utc)
-                total_age += (now_snap - fs).total_seconds() / 86400
-            except (TypeError, ValueError):
-                pass
-            try:
-                families = json.loads(row["model_families"] or '["claude"]')
-                if len(set(families)) >= 2:
-                    cross_model_count += 1
-            except (TypeError, ValueError, KeyError):
-                pass
-
-        domains_out.append({
-            "domain": domain,
-            "facts": n,
-            "score": round(score, 4),
-            "status": status,
-            "ready": ready,
-            "threshold_score": t_score,
-            "threshold_facts": t_facts,
-            "provenance_counts": provenance_counts,
-            "mean_age_days": round(total_age / n, 2) if n > 0 else 0,
-            "avg_confirmation": round(total_conf / n, 3) if n > 0 else 0,
-            "cross_model_frac": round(cross_model_count / n, 4) if n > 0 else 0,
-        })
-
-    snapshot = {
-        "snapshot_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        "snapshot_ts": datetime.now(timezone.utc).isoformat(),
-        "gaius_version": "2",
-        "total_facts": total_facts,
-        "live_domains": live_count,
-        "domains": domains_out,
-    }
-
-    output = json.dumps(snapshot, indent=2)
-    if parsed.output:
-        with open(parsed.output, "w") as f:
-            f.write(output)
-        print(f"Snapshot written to {parsed.output} ({total_facts} facts, {live_count} live domains)",
-              file=sys.stderr)
-    else:
-        print(output)
-
-
-def cmd_governor(args):
-    """Show knowledge gap analysis: which principals have confirmed which facts.
-
-    Four states per fact:
-      both-confirm   — both principals confirmed (high confidence)
-      primary-only   — only principal-a confirmed (gap: principal-b hasn't seen this)
-      secondary-only — only principal-b confirmed (gap: principal-a hasn't seen this)
-      both-disagree  — reserved; requires content comparison (TBD)
-    """
-    import argparse as _ap
-    parser = _ap.ArgumentParser(prog="gaius governor")
-    parser.add_argument("--domain", type=str, default=None,
-                        help="Filter to a single domain")
-    parser.add_argument("--state", type=str, default=None,
-                        choices=["both-confirm", "primary-only", "secondary-only"],
-                        help="Filter to a specific state")
-    parser.add_argument("--principal-a", type=str, default="operator",
-                        help="Primary principal name (default: operator)")
-    parser.add_argument("--principal-b", type=str, default="gemini",
-                        help="Secondary principal name (default: gemini)")
-    parser.add_argument("--limit", type=int, default=20,
-                        help="Max facts to show per state (default: 20)")
-    parsed = parser.parse_args(args)
-
-    pa = parsed.principal_a
-    pb = parsed.principal_b
-
-    conn = init_db()
-
-    domain_clause = "AND domain = ?" if parsed.domain else ""
-    domain_params = (parsed.domain,) if parsed.domain else ()
-
-    def fetch_state(label, where_clause, params):
-        sql = f"""
-            SELECT domain, fact_key, fact_text, principals, confirmation_count, score
-            FROM facts
-            WHERE (outcome IS NULL OR outcome != 'rejected')
-            {domain_clause}
-            AND {where_clause}
-            ORDER BY domain, score DESC
-            LIMIT ?
-        """
-        return conn.execute(sql, domain_params + params + (parsed.limit,)).fetchall()
-
-    states = {
-        "both-confirm": (
-            f"principals LIKE '%\"{pa}\"%' AND principals LIKE '%\"{pb}\"%'",
-            ()
-        ),
-        "primary-only": (
-            f"principals LIKE '%\"{pa}\"%' AND principals NOT LIKE '%\"{pb}\"%'",
-            ()
-        ),
-        "secondary-only": (
-            f"principals NOT LIKE '%\"{pa}\"%' AND principals LIKE '%\"{pb}\"%'",
-            ()
-        ),
-    }
-
-    if parsed.state:
-        states_to_show = {parsed.state: states[parsed.state]}
-    else:
-        states_to_show = states
-
-    for state_label, (where, params) in states_to_show.items():
-        rows = fetch_state(state_label, where, params)
-        count_sql = f"""
-            SELECT COUNT(*) FROM facts
-            WHERE (outcome IS NULL OR outcome != 'rejected')
-            {domain_clause}
-            AND {where}
-        """
-        total = conn.execute(count_sql, domain_params + params).fetchone()[0]
-
-        print(f"\n── {state_label} ({total} facts) {'─' * max(0, 50 - len(state_label) - len(str(total)) - 12)}")
-        if not rows:
-            print("  (none)")
-            continue
-        for row in rows:
-            principals_list = json.loads(row["principals"] or "[]")
-            p_str = ",".join(principals_list) if principals_list else "?"
-            print(f"  [{row['domain']}] {row['fact_key'][:60]}  ({p_str})  score={row['score']:.2f}")
-            if parsed.state:
-                # Show fact text when filtered to one state
-                print(f"    {row['fact_text'][:120]}")
-
-    print()
-    print("Note: both-disagree state requires content comparison — not yet implemented.")
-    print("Open question per council: route automatically to council log or surface to governors first?")
-
-
-def cmd_route(args):
-    """Route a query to relevant domain files for RAG injection."""
-    import argparse
-    parser = argparse.ArgumentParser(prog="gaius route",
-                                     description="Route a query to domain context files")
-    parser.add_argument("query", nargs="+", help="Query text to route")
-    parser.add_argument("--hint", type=str, default=None,
-                        help="Primary domain hint (e.g. from question metadata)")
-    parser.add_argument("--max-files", type=int, default=3)
-    parser.add_argument("--max-chars", type=int, default=10000)
-    parser.add_argument("--json", action="store_true", help="Output as JSON")
-    parsed = parser.parse_args(args)
-
-    query = " ".join(parsed.query)
-    results = route_domains(query, primary_hint=parsed.hint,
-                            max_files=parsed.max_files, max_chars=parsed.max_chars)
-
-    if parsed.json:
-        print(json.dumps(results, indent=2))
-        return
-
-    if not results:
-        print("No domain matches found.")
-        return
-
-    print(f"Query: {query[:100]}{'...' if len(query) > 100 else ''}")
-    if parsed.hint:
-        print(f"Hint:  {parsed.hint}")
-    print()
-    for i, r in enumerate(results):
-        tag = " (primary)" if i == 0 else ""
-        print(f"  {r['domain']:<16} score={r['score']:.3f}  budget={r['budget']}c{tag}")
-
-
-# ── RAFT Sidecar Extraction ───────────────────────────────────────────────────
-
-# Incident indicators in blog categories/tags/content
-_INCIDENT_KEYWORDS = frozenset([
-    "incident", "debugging", "postmortem", "outage", "failure", "broke",
-    "crash", "cascade", "recovery", "fix", "broken",
-])
-
-# Architecture indicators
-_ARCHITECTURE_KEYWORDS = frozenset([
-    "architecture", "design", "deployment", "platform", "stack", "pipeline",
-    "build", "deploy", "setup", "integration",
-])
-
-# Failure class detection — generic K8s/ops defaults; extend via config failure_class_keywords.
-# RULE: _FAILURE_CLASS_MAP_DEFAULT must contain only generic infrastructure terms.
-#       Stack-specific names (CNIs, storage backends, service meshes) belong in
-#       ~/.gaius/config.yaml [failure_class_keywords]. CI enforces clean defaults.
-_FAILURE_CLASS_MAP_DEFAULT = {
-    "networking":    ["dns", "mtu", "route", "tunnel", "overlay", "proxy", "cni",
-                      "ingress", "loadbalancer", "endpoint"],
-    "storage":       ["pvc", "s3", "volume", "disk", "mount", "persistent", "csi"],
-    "compute":       ["oom", "cpu", "memory", "gpu", "containerd", "sandbox", "cgroup"],
-    "control_plane": ["etcd", "apiserver", "kubelet", "scheduler", "quorum", "kube-proxy"],
-    "observability": ["prometheus", "grafana", "loki", "otel", "alert", "metric", "scrape"],
-    "security":      ["oauth", "cert", "tls", "rbac", "token"],
-}
-_FAILURE_CLASS_MAP: dict = {}
-for _cls, _kws in _FAILURE_CLASS_MAP_DEFAULT.items():
-    _FAILURE_CLASS_MAP[_cls] = list(_kws) + list(
-        _gaius_cfg.get("failure_class_keywords", {}).get(_cls, [])
-    )
-
-# Domain detection from categories/tags — generic defaults; extend via config domain_tags.
-# Same rule: keep defaults generic; project-specific tag→domain mappings go in config.
-_DOMAIN_MAP_DEFAULT = {
-    "networking":    ["networking", "dns", "cni"],
-    "storage":       ["storage"],
-    "observability": ["observability", "monitoring", "prometheus", "grafana"],
-    "security":      ["security", "authentication", "oauth"],
-    "agent":         ["ai", "agent", "llm", "claude", "gemini"],
-}
-_DOMAIN_MAP: dict = {}
-for _dom, _tags in _DOMAIN_MAP_DEFAULT.items():
-    _DOMAIN_MAP[_dom] = list(_tags) + list(
-        _gaius_cfg.get("domain_tags", {}).get(_dom, [])
-    )
-
-
-def _parse_frontmatter(text: str) -> tuple[dict, str]:
-    """Parse YAML frontmatter from markdown. Returns (frontmatter_dict, body)."""
-    import yaml
-    if not text.startswith("---"):
-        return {}, text
-    end = text.find("---", 3)
-    if end == -1:
-        return {}, text
-    fm_text = text[3:end].strip()
-    body = text[end+3:].strip()
-    try:
-        fm = yaml.safe_load(fm_text)
-    except Exception:
-        fm = {}
-    return fm or {}, body
-
-
-def _detect_type(fm: dict, body: str) -> str:
-    """Detect if post is incident or architecture from frontmatter + content."""
-    tags = set()
-    for key in ("tags", "categories"):
-        val = fm.get(key, [])
-        if isinstance(val, list):
-            tags.update(t.lower() for t in val)
-        elif isinstance(val, str):
-            tags.add(val.lower())
-
-    title = fm.get("title", "").lower()
-    body_lower = body[:2000].lower()  # check first 2K chars
-
-    incident_score = sum(1 for kw in _INCIDENT_KEYWORDS if kw in tags or kw in title or kw in body_lower)
-    arch_score = sum(1 for kw in _ARCHITECTURE_KEYWORDS if kw in tags or kw in title or kw in body_lower)
-
-    return "incident" if incident_score >= arch_score else "architecture"
-
-
-def _detect_failure_class(body: str) -> str:
-    """Detect failure class from body content."""
-    body_lower = body.lower()
-    scores = {}
-    for cls, keywords in _FAILURE_CLASS_MAP.items():
-        scores[cls] = sum(1 for kw in keywords if kw in body_lower)
-    if not scores or max(scores.values()) == 0:
-        return "unknown"
-    return max(scores, key=scores.get)
-
-
-def _detect_domain(fm: dict) -> str:
-    """Detect domain from categories/tags."""
-    tags = set()
-    for key in ("tags", "categories"):
-        val = fm.get(key, [])
-        if isinstance(val, list):
-            tags.update(t.lower() for t in val)
-    for domain, keywords in _DOMAIN_MAP.items():
-        if any(kw in tags for kw in keywords):
-            return domain
-    return "infrastructure"
-
-
-def _detect_complexity(body: str) -> str:
-    """Detect complexity from content structure."""
-    # Count distinct failure mechanisms / components mentioned
-    acts = len(re.findall(r'^#{1,3}\s+Act\s+\d', body, re.MULTILINE))
-    sections = len(re.findall(r'^#{1,3}\s+', body, re.MULTILINE))
-    if acts >= 4 or sections >= 8:
-        return "cascade"
-    elif acts >= 2 or sections >= 4:
-        return "multi-step"
-    return "simple"
-
-
-def _yaml_quote(s: str) -> str:
-    """Always double-quote YAML list items to prevent special-char breakage."""
-    escaped = s.replace('\\', '\\\\').replace('"', '\\"')
-    return f'"{escaped}"'
-
-
-def _raft_item(s: str) -> str:
-    """Format a RAFT list item — quote content, pass through TODO stubs."""
-    return s if s.startswith("# TODO") else _yaml_quote(s)
-
-
-def _split_sections(body: str) -> list[tuple[str, str]]:
-    """Split markdown into (heading, content) pairs.  First section heading is ''."""
-    sections: list[tuple[str, str]] = []
-    heading = ""
-    buf: list[str] = []
-    for line in body.splitlines():
-        m = re.match(r'^#{1,3}\s+(.+)', line)
-        if m:
-            if buf:
-                sections.append((heading, "\n".join(buf)))
-            heading = m.group(1).strip()
-            buf = []
-        else:
-            buf.append(line)
-    if buf:
-        sections.append((heading, "\n".join(buf)))
-    return sections
-
-
-def _clean_md(s: str) -> str:
-    """Strip markdown formatting from a line."""
-    s = re.sub(r'^[*\->]+\s*', '', s)                                    # bullet/quote
-    s = re.sub(r'^\d+\.\s+', '', s)                                     # numbered list
-    s = re.sub(r'\*\*([^*]+)\*\*', r'\1', s)                            # unbold
-    s = re.sub(r'\[([^\]]+)\]\([^)]+\)(?:\{[^}]*\})?', r'\1', s)       # unlink + target
-    s = re.sub(r'`([^`]+)`', r'\1', s)                                   # un-backtick
-    return s.strip()
-
-
-def _extract_items(body: str, patterns: list[str], max_items: int = 6,
-                   section_hints: list[str] | None = None) -> list[str]:
-    """Extract items matching patterns.  Skips code blocks, truncates prose.
-
-    If section_hints provided, searches only sections whose headings contain
-    any of those keywords (case-insensitive).
-    """
-    if section_hints:
-        sections = _split_sections(body)
-        narrowed = []
-        for heading, content in sections:
-            if any(h in heading.lower() for h in section_hints):
-                narrowed.append(content)
-        if narrowed:
-            body = "\n".join(narrowed)
-
-    items: list[str] = []
-    in_code = False
-
-    for line in body.splitlines():
-        stripped = line.strip()
-
-        if stripped.startswith('```'):
-            in_code = not in_code
-            continue
-        if in_code or not stripped or stripped.startswith('|') or stripped.startswith('!['):
-            continue
-        if re.match(r'^#{1,3}\s+', stripped):
-            continue
-
-        line_lower = stripped.lower()
-        if not any(re.search(p, line_lower) for p in patterns):
-            continue
-
-        clean = _clean_md(stripped)
-        if len(clean) < 15:
-            continue
-        # Truncate prose — take first sentence
-        if len(clean) > 180:
-            m = re.match(r'([^.!?]+[.!?])', clean)
-            clean = m.group(1).strip() if m and len(m.group(1)) > 20 else clean[:150]
-
-        if clean not in items:
-            items.append(clean)
-        if len(items) >= max_items:
-            break
-
-    return items
-
-
-def _extract_objective(body: str) -> str:
-    """Try to extract a one-line objective from opening paragraphs."""
-    in_code = False
-    paragraphs: list[str] = []
-    buf: list[str] = []
-
-    for line in body.splitlines()[:40]:
-        if line.strip().startswith('```'):
-            in_code = not in_code
-            continue
-        if in_code or re.match(r'^#{1,3}\s+', line):
-            if buf:
-                paragraphs.append(" ".join(buf))
-                buf = []
-            continue
-        if not line.strip():
-            if buf:
-                paragraphs.append(" ".join(buf))
-                buf = []
-            continue
-        buf.append(line.strip())
-
-    if buf:
-        paragraphs.append(" ".join(buf))
-
-    for p in paragraphs[:4]:
-        p_clean = _clean_md(p)
-        if len(p_clean) < 30:
-            continue
-        m = re.match(r'([^.!?]+[.!?])', p_clean)
-        if m and 30 < len(m.group(1)) < 200:
-            return m.group(1).strip()
-
-    return "# TODO: one-line summary"
-
-
-def _extract_bold_items(body: str, section_kws: list[str],
-                        max_items: int = 6) -> list[str]:
-    """Extract **bold-prefixed** items from sections whose headings match keywords."""
-    items: list[str] = []
-    sections = _split_sections(body)
-
-    for heading, content in sections:
-        if not any(kw in heading.lower() for kw in section_kws):
-            continue
-        for m in re.finditer(r'\*\*([^*]+)\*\*([^*\n]*)', content):
-            bold = m.group(1).strip().rstrip('.')
-            rest = m.group(2).strip().lstrip('. ')
-            if len(bold) < 5:
-                continue
-            item = bold
-            rest = _clean_md(rest)
-            if rest and len(rest) < 130:
-                item += f" ({rest})"
-            if len(item) > 200:
-                item = item[:150]
-            items.append(item)
-            if len(items) >= max_items:
-                return items
-
-    return items
-
-
-def _extract_incident_yaml(fm: dict, body: str, slug: str) -> str:
-    """Generate incident-type RAFT YAML from blog post."""
-    title = fm.get("title", slug.replace("-", " ").title())
-    date = str(fm.get("date", ""))[:10]
-    author = fm.get("author", "unknown")
-    failure_class = _detect_failure_class(body)
-    complexity = _detect_complexity(body)
-
-    mechanisms = _extract_items(body, [
-        r'overwrit|wip|destroy|flush|reset|regenerat|poison|propagat',
-        r'without\s+\w+ing|silently|invisible|stale',
-        r'race\s+condition|boot\s+race|timing',
-    ])
-
-    symptoms = _extract_items(body, [
-        r'timeout|offline|crash|fail|error|dead|unreachable|stuck|pending',
-        r'oom|restart|flap|partition|degraded',
-        r'nothing\s+(?:is\s+)?(?:actually\s+)?work',
-    ])
-
-    root_causes = _extract_items(body, [
-        r'root\s+cause|the\s+(?:real|actual)\s+(?:cause|problem|issue)',
-        r'because|the\s+reason|what\s+(?:actually\s+)?happened',
-        r'overwrote|wiped|destroyed|poisoned|corrupted',
-        r'installer\s+(?:is|overwrit|wip)',
-    ])
-
-    fixes = _extract_items(body, [
-        r'fix|solution|resolve|workaround|restore|recover|repair',
-        r'the\s+correct\s+sequence|we\s+(?:fixed|resolved|restored)',
-        r'fsck\.repair|fsck\.mode|grub',
-        r'layer\s+\d|insurance|prevention',
-    ])
-
-    anti_patterns = _extract_items(body, [
-        r'(?:don.t|never|avoid|do\s+not)\s+\w+',
-        r'trap|gotcha|mistake|lie|mirage|propaganda',
-        r'assuming|trusting.*(?:ready|running|healthy)',
-    ])
-
-    # Prevention — try to extract, fall back to TODO
-    prevention = _extract_items(body, [
-        r'prevent|ensure|gate|alert|monitor|never\s+again',
-        r'added?\s+(?:a\s+)?(?:alert|check|metric|gate|guard)',
-    ], section_hints=["prevention", "after", "fix", "lesson", "going forward"])
-
-    lines = [
-        f'title: "{title}"',
-        f"slug: {slug}",
-        f"date: {date}",
-        f"type: incident",
-        f"author: {author}",
-        f"reviewed_by:",
-        f"source: /posts/{slug}/",
-        f"confidence: observed",
-        f"complexity: {complexity}",
-        f"failure_class: {failure_class}",
-        "",
-        "mechanism:",
-    ]
-    for m in (mechanisms or ["# TODO: extract from post"]):
-        lines.append(f"  - {_raft_item(m)}")
-
-    lines.append("")
-    lines.append("symptom:")
-    for s in (symptoms or ["# TODO: extract from post"]):
-        lines.append(f"  - {_raft_item(s)}")
-
-    lines.append("")
-    lines.append("root_cause:")
-    for r in (root_causes or ["# TODO: extract from post"]):
-        lines.append(f"  - {_raft_item(r)}")
-
-    lines.append("")
-    lines.append("fix:")
-    for f_ in (fixes or ["# TODO: extract from post"]):
-        lines.append(f"  - {_raft_item(f_)}")
-
-    lines.append("")
-    lines.append("prevention:")
-    for pv in (prevention or ["# TODO: extract from post"]):
-        lines.append(f"  - {_raft_item(pv)}")
-
-    lines.append("")
-    lines.append("anti_patterns:")
-    for a in (anti_patterns or ["# TODO: extract from post"]):
-        lines.append(f"  - {_raft_item(a)}")
-
-    lines.append("")
-    return "\n".join(lines)
-
-
-def _extract_architecture_yaml(fm: dict, body: str, slug: str) -> str:
-    """Generate architecture-type RAFT YAML from blog post."""
-    title = fm.get("title", slug.replace("-", " ").title())
-    date = str(fm.get("date", ""))[:10]
-    author = fm.get("author", "unknown")
-    domain = _detect_domain(fm)
-    complexity = _detect_complexity(body)
-
-    objective = _extract_objective(body)
-
-    # Components — prefer table bold entries + targeted section patterns
-    components = _extract_items(body, [
-        r'cronjob|cron\s*job|deployment|daemonset|statefulset',
-        r'redis|kafka|postgres|mysql|etcd|s3|seaweedfs',
-        r'endpoint|pipeline|sandbox|engine|proxy|gateway',
-    ], section_hints=["pipeline", "defense", "built", "architecture", "stack",
-                      "system", "component", "infrastructure"])
-    # Also grab bold names from tables
-    table_bold: list[str] = []
-    in_code = False
-    for line in body.splitlines():
-        if line.strip().startswith('```'):
-            in_code = not in_code
-            continue
-        if in_code:
-            continue
-        if '|' in line and not line.strip().startswith('|--'):
-            for tm in re.finditer(r'\*\*([A-Z][^*]{2,40})\*\*', line):
-                name = tm.group(1).strip()
-                if name not in table_bold:
-                    table_bold.append(name)
-    # Filter technique IDs and too-short items from table bold extraction
-    table_bold = [t for t in table_bold if len(t) > 5 and not re.match(r'^AML\.', t)]
-    all_comp = table_bold + [c for c in components if c not in table_bold]
-    components = all_comp[:8] or ["# TODO: extract from post"]
-
-    # Decisions — fix/design sections
-    decisions = _extract_items(body, [
-        r'decided|chose|exempt|added|implemented|switched|replaced',
-        r'permanent\s+fix|the\s+fix|solution|now\s+\w+s\s+',
-    ], section_hints=["fix", "decision", "design", "after", "solution", "permanent"])
-    if not decisions:
-        decisions = _extract_items(body, [
-            r'decided|chose|design|instead\s+of|the\s+reason|exempt',
-        ])
-    decisions = decisions or ["# TODO: extract from post"]
-
-    # Tradeoffs — tension/irony language
-    tradeoffs = _extract_items(body, [
-        r'tradeoff|trade-off|tension|but\s+(?:the|it|this)',
-        r'(?:too|so)\s+(?:effective|sensitive|aggressive|broad)',
-        r'neither\s+\w+\s+alone|double.edged|at\s+the\s+cost\s+of',
-    ], section_hints=["irony", "tradeoff", "tension", "collision", "cost"])
-    tradeoffs = tradeoffs or ["# TODO: extract from post"]
-
-    # Outcomes — results/metrics/after sections
-    outcomes = _extract_items(body, [
-        r'result|outcome|achieved|operational|live|running|deployed',
-        r'before.*after|\d+\s*->|increased|decreased|improved',
-        r'total|count|rate|metric|percent',
-    ], section_hints=["after", "result", "outcome", "metric", "impact"])
-    outcomes = outcomes or ["# TODO: extract from post"]
-
-    # Anti-patterns — bold items in failure/lesson sections first, then keyword fallback
-    anti_patterns = _extract_bold_items(body, [
-        "failure", "bug", "lesson", "mistake", "problem", "wrong",
-        "pattern", "irony", "under one",
-    ])
-    if not anti_patterns:
-        anti_patterns = _extract_items(body, [
-            r'(?:don.t|never|avoid|do\s+not)\s+\w+',
-            r'anti.pattern|mistake|silent(?:ly)?|invisible|indistinguish',
-        ], section_hints=["failure", "bug", "lesson", "pattern", "irony"])
-    anti_patterns = anti_patterns or ["# TODO: extract from post"]
-
-    lines = [
-        f'title: "{title}"',
-        f"slug: {slug}",
-        f"date: {date}",
-        f"type: architecture",
-        f"author: {author}",
-        f"reviewed_by:",
-        f"source: /posts/{slug}/",
-        f"confidence: observed",
-        f"complexity: {complexity}",
-        f"domain: {domain}",
-        "",
-        f"objective: {_raft_item(objective)}",
-        "",
-        "components:",
-    ]
-    for c in components:
-        lines.append(f"  - {_raft_item(c)}")
-
-    lines.append("")
-    lines.append("decisions:")
-    for d in decisions:
-        lines.append(f"  - {_raft_item(d)}")
-
-    lines.append("")
-    lines.append("tradeoffs:")
-    for t in tradeoffs:
-        lines.append(f"  - {_raft_item(t)}")
-
-    lines.append("")
-    lines.append("outcomes:")
-    for o in outcomes:
-        lines.append(f"  - {_raft_item(o)}")
-
-    lines.append("")
-    lines.append("anti_patterns:")
-    for a in anti_patterns:
-        lines.append(f"  - {_raft_item(a)}")
-
-    lines.append("")
-    return "\n".join(lines)
-
-
-def cmd_raft(args):
-    """Generate a draft RAFT sidecar YAML from a blog post markdown file."""
-    import argparse
-    parser = argparse.ArgumentParser(prog="gaius raft",
-                                     description="Extract RAFT sidecar YAML from blog post")
-    parser.add_argument("post_file", help="Path to blog post markdown file")
-    parser.add_argument("--output", "-o", type=str, default=None,
-                        help="Output file (default: _data/raft/<slug>.yaml)")
-    parser.add_argument("--type", choices=["incident", "architecture"], default=None,
-                        help="Force type (auto-detected if omitted)")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Print YAML to stdout instead of writing file")
-    parser.add_argument("--no-clobber", "-n", action="store_true",
-                        help="Skip if output already exists and has been reviewed")
-    parsed = parser.parse_args(args)
-
-    post_path = Path(parsed.post_file)
-    if not post_path.exists():
-        print(f"ERROR: {post_path} not found", file=sys.stderr)
-        sys.exit(1)
-
-    text = post_path.read_text()
-    fm, body = _parse_frontmatter(text)
-
-    # Derive slug from filename: 2026-03-25-the-great-api-mirage.md → the-great-api-mirage
-    stem = post_path.stem
-    slug = re.sub(r'^\d{4}-\d{2}-\d{2}-', '', stem)
-
-    # Determine output path early for --no-clobber check
-    if parsed.output:
-        out_path = Path(parsed.output)
-    else:
-        raft_dir = post_path.parent.parent / "_data" / "raft"
-        if not raft_dir.exists():
-            raft_dir.mkdir(parents=True, exist_ok=True)
-        out_path = raft_dir / f"{slug}.yaml"
-
-    if parsed.no_clobber and out_path.exists():
-        existing = out_path.read_text()
-        reviewed = re.search(r'reviewed_by:\s*(\S+)', existing)
-        if reviewed:
-            print(f"SKIP: {out_path} already reviewed by {reviewed.group(1)}")
-            return
-        if "# TODO" not in existing:
-            print(f"SKIP: {out_path} already filled (no TODOs)")
-            return
-
-    post_type = parsed.type or _detect_type(fm, body)
-
-    if post_type == "incident":
-        yaml_content = _extract_incident_yaml(fm, body, slug)
-    else:
-        yaml_content = _extract_architecture_yaml(fm, body, slug)
-
-    # Validate generated YAML
-    import yaml as _yaml
-    try:
-        _yaml.safe_load(yaml_content)
-    except _yaml.YAMLError as e:
-        print(f"WARNING: Generated YAML has syntax errors: {e}", file=sys.stderr)
-        print("Likely unquoted special characters — check output.", file=sys.stderr)
-
-    if parsed.dry_run:
-        print(yaml_content)
-        return
-
-    out_path.write_text(yaml_content)
-    todo_count = yaml_content.count("# TODO")
-    print(f"RAFT sidecar written to {out_path}")
-    print(f"  Type:       {post_type}")
-    print(f"  Slug:       {slug}")
-    print(f"  Title:      {fm.get('title', '?')}")
-    print(f"  # TODOs:    {todo_count}")
-    if todo_count == 0:
-        print(f"  All fields auto-filled. Review before committing.")
-    print(f"\nReview and fill in # TODO items before committing.")
-
-
+# ── Step 6: maturity scoring → extracted to gaius/maturity.py (facade re-import below) ──
+# ── RAFT Sidecar Extraction → extracted to gaius/raft.py (facade re-import below) ──
 # ── Event-based session retire (shared by pentagi/ollama) ─────────────────────
 
 def _retire_event_sessions(sessions_dir: Path, parser_fn, staging_subdir: str,
@@ -6825,370 +4995,6 @@ def cmd_commands(args):
     print(" | ".join(parts))
 
 
-# ── Council sync (D3) ─────────────────────────────────────────────────────────
-
-COUNCIL_CURSOR_FILE = Path.home() / ".gaius" / "landscape_cache" / "council-cursor.txt"
-_COUNCIL_CHANNEL_ALERTS = "alerts"
-_COUNCIL_SYNC_LIMIT = 200
-
-
-def _read_council_cursor(cursor_file: Path = COUNCIL_CURSOR_FILE) -> str | None:
-    """Read last-seen council log entry ID from cursor file."""
-    if cursor_file.exists():
-        try:
-            return cursor_file.read_text().strip() or None
-        except Exception:
-            pass
-    return None
-
-
-def _write_council_cursor(entry_id: str, cursor_file: Path = COUNCIL_CURSOR_FILE) -> None:
-    cursor_file.parent.mkdir(parents=True, exist_ok=True)
-    cursor_file.write_text(entry_id)
-
-
-def _fetch_council_log(base_url: str, api_key: str, channel: str, limit: int) -> list[dict]:
-    """Fetch council log entries from the agent-orchestrator API.
-
-    X-Agent identifies the caller for the per-channel ACL — the strategy
-    channel 403'd every fetch for 10 weeks because only X-API-Key was sent
-    (which the orchestrator ignores entirely). ?agent= is NOT an alternative:
-    it also author-filters results to the named agent's own entries."""
-    import urllib.request
-    url = f"{base_url.rstrip('/')}/council/log?channel={channel}&limit={limit}"
-    req = urllib.request.Request(url, headers={"X-API-Key": api_key, "X-Agent": "gaius"})
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read())
-            return data.get("entries", [])
-    except Exception as e:
-        print(f"[sync-council] fetch failed ({channel}): {e}", file=sys.stderr)
-        return []
-
-
-def _domain_dir_for_append() -> Path:
-    """Resolve domain directory for appending distilled notes."""
-    cfg_dir = _gaius_cfg.get("domain_dir")
-    if cfg_dir:
-        return Path(cfg_dir).expanduser()
-    return Path.home() / ".gaius" / "memory" / "domain"
-
-
-def _append_to_domain(domain: str, note: str) -> None:
-    """Append a distilled council note to a domain file."""
-    domain_dir = _domain_dir_for_append()
-    domain_file = domain_dir / f"{domain}.md"
-    if not domain_file.exists():
-        print(f"[sync-council] domain file not found: {domain_file}", file=sys.stderr)
-        return
-    with open(domain_file, "a") as f:
-        f.write(f"\n{note}\n")
-
-
-def _distill_council_entry(entry: dict) -> tuple[str, str] | tuple[None, None]:
-    """Extract domain + distilled note text from a strategy/decision entry.
-
-    Returns (domain_name, note_text) or (None, None) if not distillable.
-    """
-    etype = entry.get("type", "")
-    content = entry.get("content", {})
-
-    # decision/distillation/disagreement from strategy; extract = closed-issue
-    # lessons emitted on the gaius channel by the Forgejo webhook.
-    if etype not in ("decision", "distillation", "disagreement", "extract"):
-        return None, None
-
-    # Extract text for routing
-    if isinstance(content, dict):
-        text_parts = []
-        for key in ("title", "summary", "content", "body", "position", "decision", "question"):
-            val = content.get(key)
-            if val and isinstance(val, str):
-                text_parts.append(val)
-        text = " ".join(text_parts)
-    elif isinstance(content, str):
-        text = content
-    else:
-        return None, None
-
-    if not text.strip():
-        return None, None
-
-    # Route to domain
-    routes = route_domains(text, max_files=1, max_chars=500)
-    if not routes:
-        return None, None
-    domain = routes[0]["domain"]
-
-    # Build distilled note
-    ts = entry.get("timestamp", "")[:10]
-    agents = ", ".join(entry.get("agents", []))
-    issue_ref = entry.get("issue_ref", "")
-    entry_id = entry.get("id", "")[:8]
-
-    # Summarize content
-    summary = text[:200].replace("\n", " ").strip()
-    if len(text) > 200:
-        summary += "…"
-
-    ref_parts = []
-    if issue_ref:
-        ref_parts.append(issue_ref)
-    if entry_id:
-        ref_parts.append(f"id:{entry_id}")
-    ref = " | ".join(ref_parts) if ref_parts else "no-ref"
-
-    note = (
-        f"\n<!-- council:{etype} {ts} agents:{agents} {ref} -->\n"
-        f"- **[{ts}] {etype.title()}** ({agents}): {summary}\n"
-    )
-    return domain, note
-
-
-def cmd_sync_council(args):
-    """Scan strategy channel of council log, distill decisions into domain files."""
-    parser = argparse.ArgumentParser(prog="gaius sync-council")
-    parser.add_argument("--dry-run", action="store_true", help="Print would-append without writing")
-    parser.add_argument("--limit", type=int, default=_COUNCIL_SYNC_LIMIT, help="Max entries to fetch")
-    parser.add_argument("--reset-cursor", action="store_true", help="Ignore cursor, process all fetched entries")
-    parsed = parser.parse_args(args)
-
-    cfg_council = _gaius_cfg.get("council", {})
-    base_url = cfg_council.get("base_url", "").rstrip("/")
-    api_key = cfg_council.get("api_key", "")
-
-    if not base_url or not api_key:
-        print("[sync-council] ERROR: council.base_url and council.api_key must be set in ~/.gaius/config.yaml", file=sys.stderr)
-        sys.exit(1)
-
-    # Two channels, per-channel cursors: strategy (decisions/disagreements)
-    # and gaius (closed-issue extract entries from the Forgejo webhook).
-    channels = (
-        ("strategy", COUNCIL_CURSOR_FILE),
-        ("gaius", COUNCIL_CURSOR_FILE.with_name("council-cursor-gaius.txt")),
-    )
-    grand_new = grand_appended = 0
-    any_fetched = False
-
-    for channel, cursor_file in channels:
-        cursor = None if parsed.reset_cursor else _read_council_cursor(cursor_file)
-        entries = _fetch_council_log(base_url, api_key, channel, parsed.limit)
-        if not entries:
-            print(f"[sync-council] {channel}: no entries returned")
-            continue
-        any_fetched = True
-
-        # Filter to entries after cursor (entries come newest-first, process oldest-first)
-        new_entries = list(reversed(entries))
-        if cursor:
-            past_cursor = False
-            new_entries = []
-            for e in reversed(entries):
-                if e.get("id") == cursor:
-                    past_cursor = True
-                    continue
-                if past_cursor:
-                    new_entries.append(e)
-            if not past_cursor:
-                # Cursor not found in this batch — process all (cursor may be older than limit)
-                new_entries = list(reversed(entries))
-
-        if not new_entries:
-            print(f"[sync-council] {channel}: no new entries since cursor {cursor or 'none'}")
-            continue
-
-        appended = 0
-        last_id = None
-        for entry in new_entries:
-            domain, note = _distill_council_entry(entry)
-            last_id = entry.get("id", last_id)
-            if not domain or not note:
-                continue
-
-            if parsed.dry_run:
-                print(f"[DRY-RUN] would append to domain/{domain}.md:")
-                print(note)
-            else:
-                _append_to_domain(domain, note)
-                appended += 1
-
-        if not parsed.dry_run and last_id:
-            _write_council_cursor(last_id, cursor_file)
-
-        grand_new += len(new_entries)
-        grand_appended += appended
-        if parsed.dry_run:
-            print(f"[sync-council] {channel}: dry-run, {len(new_entries)} new entries evaluated, {appended} would append")
-        else:
-            print(f"[sync-council] {channel}: processed {len(new_entries)} new entries, appended {appended} notes, cursor → {last_id[:8] if last_id else 'none'}")
-
-    if not any_fetched:
-        print("[sync-council] no entries returned")
-        return
-    print(f"[sync-council] total: {grand_new} new entries, {grand_appended} notes appended")
-
-
-# ── Alert sync (D1) ───────────────────────────────────────────────────────────
-
-RECURRING_ALERTS_FILE_NAME = "recurring-alerts.md"
-_ALERT_WINDOW_DAYS = 7
-_ALERT_RECUR_THRESHOLD = 5  # fires > this many times → tracked
-
-
-def _normalize_alert_text(text: str) -> str:
-    """Strip variable parts (timestamps, pod names, IPs) for dedup grouping."""
-    # Remove timestamps like 2026-03-30T12:34:56Z or 10:30:45
-    text = re.sub(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?', '', text)
-    text = re.sub(r'\b\d{2}:\d{2}:\d{2}\b', '', text)
-    # Remove pod suffixes like -abc12-xyz34
-    text = re.sub(r'-[a-z0-9]{5,10}-[a-z0-9]{4,8}\b', '', text)
-    # Remove IPs
-    text = re.sub(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b', '<IP>', text)
-    # Collapse whitespace
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text[:120]
-
-
-def _load_recurring_alerts_md(domain_dir: Path) -> dict[str, dict]:
-    """Parse existing recurring-alerts.md into dict keyed by normalized alert text."""
-    path = domain_dir / RECURRING_ALERTS_FILE_NAME
-    if not path.exists():
-        return {}
-
-    existing: dict[str, dict] = {}
-    # Parse markdown table rows: | alert | count | last_fired | fix |
-    table_row = re.compile(r'^\|\s*(.+?)\s*\|\s*(\d+)\s*\|\s*(.+?)\s*\|\s*(.*?)\s*\|$')
-    for line in path.read_text().splitlines():
-        m = table_row.match(line.strip())
-        if m:
-            alert_text, count, last_fired, fix = m.groups()
-            if alert_text.startswith("Alert") and "Count" in count:
-                continue  # header
-            existing[alert_text] = {"count": int(count), "last_fired": last_fired.strip(), "fix": fix.strip()}
-    return existing
-
-
-_RECURRING_ALERTS_MARKER = "<!-- AUTO-GENERATED BY gaius sync-alerts — do not edit below this line -->"
-_RECURRING_ALERTS_MAX_ROWS = 30
-
-
-def _write_recurring_alerts_md(domain_dir: Path, alerts: dict[str, dict]) -> None:
-    """Rewrite recurring-alerts.md, preserving manual content above the auto marker."""
-    path = domain_dir / RECURRING_ALERTS_FILE_NAME
-
-    # Preserve any manually-written content above the marker
-    manual_section = ""
-    if path.exists():
-        content = path.read_text()
-        marker_pos = content.find(_RECURRING_ALERTS_MARKER)
-        if marker_pos >= 0:
-            manual_section = content[:marker_pos]
-
-    auto_lines = [
-        f"{_RECURRING_ALERTS_MARKER}\n",
-        "\n",
-        f"## Raw Alert Table (top {_RECURRING_ALERTS_MAX_ROWS})\n",
-        "\n",
-        "| Alert | Count(7d) | Last fired | Last known fix |\n",
-        "|-------|-----------|------------|----------------|\n",
-    ]
-    sorted_alerts = sorted(alerts.items(), key=lambda x: -x[1]["count"])
-    for alert_text, meta in sorted_alerts[:_RECURRING_ALERTS_MAX_ROWS]:
-        fix = meta.get("fix", "")
-        auto_lines.append(f"| {alert_text} | {meta['count']} | {meta['last_fired']} | {fix} |\n")
-
-    if not manual_section:
-        manual_section = (
-            "# Recurring Alerts\n"
-            "\n"
-            "Auto-tracked by `gaius sync-alerts`. Distilled patterns above, raw table below.\n"
-            "\n"
-        )
-
-    path.write_text(manual_section + "".join(auto_lines))
-
-
-def cmd_sync_alerts(args):
-    """Scan council log alerts channel, track recurring alerts in domain/recurring-alerts.md."""
-    parser = argparse.ArgumentParser(prog="gaius sync-alerts")
-    parser.add_argument("--dry-run", action="store_true", help="Print would-write without changing files")
-    parser.add_argument("--window-days", type=int, default=_ALERT_WINDOW_DAYS, help="Lookback window in days")
-    parser.add_argument("--threshold", type=int, default=_ALERT_RECUR_THRESHOLD, help="Min fires to track")
-    parsed = parser.parse_args(args)
-
-    cfg_council = _gaius_cfg.get("council", {})
-    base_url = cfg_council.get("base_url", "").rstrip("/")
-    api_key = cfg_council.get("api_key", "")
-
-    if not base_url or not api_key:
-        print("[sync-alerts] ERROR: council.base_url and council.api_key must be set in ~/.gaius/config.yaml", file=sys.stderr)
-        sys.exit(1)
-
-    entries = _fetch_council_log(base_url, api_key, _COUNCIL_CHANNEL_ALERTS, 500)
-    if not entries:
-        print("[sync-alerts] no alerts returned")
-        return
-
-    # Filter to window
-    cutoff = datetime.now(timezone.utc).timestamp() - (parsed.window_days * 86400)
-    window_entries = []
-    for e in entries:
-        ts_str = e.get("timestamp", "")
-        try:
-            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
-            if ts >= cutoff:
-                window_entries.append((ts_str[:10], e))
-        except Exception:
-            pass
-
-    if not window_entries:
-        print(f"[sync-alerts] no alerts in last {parsed.window_days} days")
-        return
-
-    # Count by normalized alert text
-    counts: dict[str, dict] = {}
-    for date_str, entry in window_entries:
-        content = entry.get("content", "")
-        if isinstance(content, dict):
-            text = content.get("message", "") or content.get("content", "") or str(content)
-        else:
-            text = str(content)
-
-        normalized = _normalize_alert_text(text)
-        if normalized not in counts:
-            counts[normalized] = {"count": 0, "last_fired": date_str}
-        counts[normalized]["count"] += 1
-        if date_str > counts[normalized]["last_fired"]:
-            counts[normalized]["last_fired"] = date_str
-
-    # Filter to recurring
-    recurring = {k: v for k, v in counts.items() if v["count"] > parsed.threshold}
-
-    if not recurring:
-        print(f"[sync-alerts] no alerts fired >{parsed.threshold} times in {parsed.window_days}d")
-        return
-
-    domain_dir = _domain_dir_for_append()
-
-    if parsed.dry_run:
-        print(f"[DRY-RUN] would write {len(recurring)} recurring alerts to domain/{RECURRING_ALERTS_FILE_NAME}:")
-        for alert, meta in sorted(recurring.items(), key=lambda x: -x[1]["count"]):
-            print(f"  [{meta['count']}x] {alert}")
-        return
-
-    # Merge with existing (preserve fix column)
-    existing = _load_recurring_alerts_md(domain_dir)
-    for alert_text, meta in recurring.items():
-        if alert_text in existing:
-            existing[alert_text]["count"] = meta["count"]
-            existing[alert_text]["last_fired"] = meta["last_fired"]
-        else:
-            existing[alert_text] = meta
-
-    _write_recurring_alerts_md(domain_dir, existing)
-    print(f"[sync-alerts] wrote {len(existing)} recurring alerts ({len(recurring)} new/updated) to domain/{RECURRING_ALERTS_FILE_NAME}")
-
-
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 
 def cmd_init(args):
@@ -7324,6 +5130,22 @@ def cmd_init(args):
     print(f"Edit {config_path} to customize entity patterns and principal mappings.")
 
 
+def volatility_recency(prov_key: str, fact_type: str, age_days: float, rate: float) -> float:
+    """Recency factor honoring the fact_type volatility axis (2026-07-03).
+
+    Precedence: an explicit `live` rating wins over provenance — a fact a session
+    deliberately marked as volatile state MUST decay fast enough to force
+    re-verification (3x rate ≈ half-life ~12 days at the default 0.02/day).
+    `structural` facts are design-level and do not decay, same as the no-decay
+    provenances. Everything else keeps the standard rate.
+    """
+    if fact_type == "live":
+        return math.exp(-rate * 3.0 * age_days)
+    if prov_key in NO_DECAY_PROVENANCES or fact_type == "structural":
+        return 1.0
+    return math.exp(-rate * age_days)
+
+
 def cmd_decay(args):
     """Apply time-based score decay to all facts.
 
@@ -7361,7 +5183,7 @@ def cmd_decay(args):
 
     facts = conn.execute(
         "SELECT id, domain, fact_key, fact_text, score, confirmation_count, provenance, "
-        "outcome, first_seen, last_seen, model_families, source "
+        "outcome, first_seen, last_seen, model_families, source, fact_type "
         "FROM facts WHERE tombstoned_at IS NULL"
     ).fetchall()
 
@@ -7397,10 +5219,7 @@ def cmd_decay(args):
         except (TypeError, ValueError):
             age_days = 30.0  # unknown → assume moderately old
 
-        if prov_key in NO_DECAY_PROVENANCES:
-            recency = 1.0
-        else:
-            recency = math.exp(-rate * age_days)
+        recency = volatility_recency(prov_key, fact["fact_type"], age_days, rate)
 
         # Confirmation boost (log scale, capped at 3.0)
         conf = max(1, fact["confirmation_count"])
@@ -7485,6 +5304,7 @@ def cmd_rescore(args):
         "operational": "automated",
         "structural":  "automated",
         "observation": "automated",
+        "live":        "automated",   # volatile state — base weight as operational; decay differentiates
     }
 
     conn = init_db()
@@ -7540,10 +5360,7 @@ def cmd_rescore(args):
         except (TypeError, ValueError):
             age_days = 30.0
 
-        if effective_prov in NO_DECAY_PROVENANCES:
-            recency = 1.0
-        else:
-            recency = math.exp(-rate * age_days)
+        recency = volatility_recency(effective_prov, fact["fact_type"], age_days, rate)
 
         # Confirmation boost
         conf = max(1, fact["confirmation_count"])
@@ -7594,9 +5411,11 @@ def cmd_rescore(args):
     # Optional KG rebuild
     if parsed.rebuild_kg:
         print("\n  Rebuilding knowledge graph...")
-        # Clear existing KG
+        # Clear existing KG (incl. fact links + the incremental-index watermark)
         conn.execute("DELETE FROM entities")
         conn.execute("DELETE FROM triples")
+        conn.execute("DELETE FROM fact_entities")
+        conn.execute("UPDATE facts SET kg_indexed_at = NULL")
         conn.commit()
 
         kg_count = 0
@@ -7604,13 +5423,23 @@ def cmd_rescore(args):
             text = fact["fact_text"] or ""
             if len(text) < 20:
                 continue
+            # SAVEPOINT: a partial kg_index_fact failure must roll back all its
+            # writes, or the fact stays un-stamped with triples half-written and
+            # the next incremental index double-counts co-occurrence weights.
             try:
+                conn.execute("SAVEPOINT kg_rebuild")
                 kg_index_fact(conn, fact["id"], text, fact["domain"] or "general",
                               timestamp=fact["first_seen"])
+                conn.execute("RELEASE SAVEPOINT kg_rebuild")
                 kg_count += 1
             except Exception:
-                pass
+                try:
+                    conn.execute("ROLLBACK TO SAVEPOINT kg_rebuild")
+                    conn.execute("RELEASE SAVEPOINT kg_rebuild")
+                except Exception:
+                    pass
 
+        refresh_entity_domains(conn)
         conn.commit()
         ent_count = conn.execute("SELECT count(*) FROM entities").fetchone()[0]
         tri_count = conn.execute("SELECT count(*) FROM triples").fetchone()[0]
@@ -8352,10 +6181,18 @@ def cmd_record(args):
     record_main(args)
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# FACADE RE-EXPORTS (extracted modules) — see gaius/ARCHITECTURE.md § facade convention
+# ═════════════════════════════════════════════════════════════════════════════
+# Each extracted module imports shared helpers from gaius._core at ITS top; these
+# re-imports run at module END (after _core's own definitions) so the extracted
+# modules can import back without a circular-import error, and so every existing
+# `from gaius._core import X` and the COMMANDS dict below keep resolving unchanged.
+# ORDER MATTERS: leaf modules first — raft before landscape (landscape imports the
+# _parse_frontmatter that raft owns and _core re-exports here). This whole block
+# MUST precede the COMMANDS dict, which references the re-exported cmd_* by name.
+#
 # ── Session-format adapters (extracted to gaius/parsers.py) ──────────────────
-# Imported at module end (not top) so parsers.py can import shared scoring/config
-# from this module without a circular-import error. Re-exported here to preserve
-# the public contract: `from gaius._core import parse_grok_events`, etc.
 from gaius.parsers import (  # noqa: E402
     detect_format,
     parse_claude_events,
@@ -8375,563 +6212,47 @@ from gaius.kg import (  # noqa: E402,F401  re-export (kg split 2026-06-28)
     _BUILTIN_ENTITY_PATTERNS, _load_entity_patterns, _ENTITY_PATTERNS,
     _RELATION_PATTERNS, extract_entities, extract_relations, upsert_entity,
     add_triple, invalidate_triple, kg_index_fact, cmd_kg,
+    add_cooccurrence, refresh_entity_domains, cmd_kg_export_links,
+)
+
+from gaius.raft import (  # noqa: E402,F401  re-export (raft split 2026-07-01)
+    _parse_frontmatter, _FAILURE_CLASS_MAP, _DOMAIN_MAP,
+    _FAILURE_CLASS_MAP_DEFAULT, _DOMAIN_MAP_DEFAULT, cmd_raft,
 )
 
 
-# --- Phase 1b: production-outcome ingestion (closed self-improvement loop) ---
-# Pulls completed-task outcomes from the orchestrator GET /outcomes into facts.db's
-# task_outcomes table. ADDITIVE — never touches the facts table; idempotent by task key.
-# Foundation for outcome-grounded corpus scoring (Phase 2) + the gaius router (Phase 3).
-# Scope: ~/ansible/drafts/closed-loop-self-improvement-scope-20260623.md
+# --- Phase 1b: production-outcome ingestion → extracted to gaius/outcomes.py (facade re-import below) ---
+# --- Phase 2/3: corpus integrity + router → extracted to gaius/corpus_audit.py (facade re-import below) ---
+# ── Source-of-truth reconciler → extracted to gaius/reconcile.py (facade re-import below) ──
 
-def _ensure_outcomes_table(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS task_outcomes (
-            key           TEXT PRIMARY KEY,
-            scope         TEXT,
-            model         TEXT,
-            status        TEXT,
-            result_status TEXT,
-            success       INTEGER,
-            summary       TEXT,
-            cost_usd      REAL,
-            verdicts      TEXT,
-            at            TEXT,
-            ingested_at   TEXT
-        )
-        """
-    )
-    conn.commit()
+from gaius.maturity import (  # noqa: E402,F401  re-export (maturity split 2026-07-01)
+    _maturity_score, PROVENANCE_WEIGHT, NO_DECAY_PROVENANCES, OUTCOME_MODIFIER,
+    MATURITY_BOOTSTRAP_MIN, CROSS_MODEL_MULTIPLIER, SOURCE_RELIABILITY,
+    cmd_maturity, cmd_readiness, cmd_snapshot, cmd_governor, cmd_route,
+)
 
 
-def ingest_outcomes(conn: sqlite3.Connection, records: list) -> tuple:
-    """Upsert orchestrator task-outcome records into task_outcomes. Idempotent by key;
-    never touches the facts table. Records lacking a key are skipped. Returns (inserted, updated)."""
-    _ensure_outcomes_table(conn)
-    now = datetime.now(timezone.utc).isoformat()
-    ins = upd = 0
-    for r in records:
-        key = (r.get("key") or "").strip()
-        if not key:
-            continue
-        existed = conn.execute("SELECT 1 FROM task_outcomes WHERE key = ?", (key,)).fetchone()
-        conn.execute(
-            """
-            INSERT INTO task_outcomes
-                (key, scope, model, status, result_status, success, summary, cost_usd, verdicts, at, ingested_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET
-                scope=excluded.scope, model=excluded.model, status=excluded.status,
-                result_status=excluded.result_status, success=excluded.success,
-                summary=excluded.summary, cost_usd=excluded.cost_usd,
-                verdicts=excluded.verdicts, at=excluded.at, ingested_at=excluded.ingested_at
-            """,
-            (
-                key, r.get("scope"), r.get("model"), r.get("status"), r.get("result_status"),
-                1 if r.get("success") else 0, (r.get("summary") or "")[:500],
-                float(r.get("cost_usd") or 0), json.dumps(r.get("verdicts") or []),
-                r.get("at"), now,
-            ),
-        )
-        if existed:
-            upd += 1
-        else:
-            ins += 1
-    conn.commit()
-    return ins, upd
+from gaius.outcomes import (  # noqa: E402,F401  re-export (outcomes split 2026-07-01)
+    _ensure_outcomes_table, ingest_outcomes, outcome_winrates, cmd_ingest_outcomes,
+)
 
+from gaius.corpus_audit import (  # noqa: E402,F401  re-export (corpus_audit split 2026-07-01)
+    REPETITION_THRESHOLD, repetition_candidates, corpus_audit_stats,
+    route_suggest, cmd_corpus_audit, cmd_route_suggest,
+)
 
-def outcome_winrates(conn: sqlite3.Connection) -> list:
-    """Per-scope success rate over task_outcomes — the routing/grounding signal."""
-    _ensure_outcomes_table(conn)
-    rows = conn.execute(
-        "SELECT COALESCE(scope,''), COUNT(*), COALESCE(SUM(success),0) "
-        "FROM task_outcomes GROUP BY scope ORDER BY scope"
-    ).fetchall()
-    return [
-        {"scope": scope, "total": total, "success": success,
-         "rate": (success / total) if total else 0.0}
-        for scope, total, success in rows
-    ]
+from gaius.reconcile import (  # noqa: E402,F401  re-export (reconcile split 2026-07-01)
+    load_source_registry, source_divergence, reconcile_source,
+    _reconcile_excluded, _dir_fingerprint, remote_divergence, cmd_reconcile,
+)
 
+from gaius.landscape import (  # noqa: E402,F401  re-export (landscape split 2026-07-01)
+    cmd_inject, cmd_landscape,
+)
 
-def cmd_ingest_outcomes(args):
-    """Pull completed-task outcomes from the orchestrator into facts.db task_outcomes.
-
-    Additive (never touches facts); idempotent by key. Foundation for outcome-grounded
-    corpus scoring. Usage: gaius ingest-outcomes [--orch URL] [--limit N] [--dry-run]
-    """
-    import urllib.request
-    p = argparse.ArgumentParser(prog="gaius ingest-outcomes")
-    p.add_argument("--orch", default=os.environ.get("AGENT_ORCH_URL", "http://localhost:8080"),
-                   help="orchestrator base URL (or set AGENT_ORCH_URL)")
-    p.add_argument("--limit", type=int, default=500)
-    p.add_argument("--dry-run", action="store_true", help="fetch + print; write nothing")
-    ns = p.parse_args(args)
-
-    url = ns.orch.rstrip("/") + f"/outcomes?limit={ns.limit}"
-    try:
-        with urllib.request.urlopen(url, timeout=20) as resp:
-            data = json.loads(resp.read().decode())
-    except Exception as e:
-        print(f"fetch {url}: {e}", file=sys.stderr)
-        sys.exit(1)
-    records = data.get("recent") or []
-    print(f"fetched {len(records)} outcomes (orchestrator count={data.get('count')}) from {url}")
-    if ns.dry_run:
-        for r in records[:10]:
-            print(f"  {r.get('key')}  {r.get('scope')}  success={r.get('success')}")
-        print("(--dry-run: nothing written)")
-        return
-    conn = init_db()
-    ins, upd = ingest_outcomes(conn, records)
-    print(f"task_outcomes: +{ins} new, {upd} updated")
-    for wr in outcome_winrates(conn):
-        print(f"  {wr['scope'] or '(none)'}: {wr['success']}/{wr['total']} ({wr['rate']*100:.0f}%)")
-
-
-# --- Phase 2 (shadow): corpus integrity / self-poison audit ---
-# READ-ONLY. Surfaces the risk the operator named: facts corroborated by REPETITION but never
-# outcome- or human-verified, plus contradiction clusters (same fact_key, divergent live facts).
-# This is the shadow half of outcome-grounding — it MUTATES NOTHING. Enforcement (demote/
-# tombstone) is a later, operator-gated step once the retrieval->outcome linkage exists.
-
-REPETITION_THRESHOLD = 2  # confirmation_count at/above which a fact is "rewarded by repetition"
-
-
-def repetition_candidates(conn: sqlite3.Connection, limit: int = 20) -> list:
-    """List repetition-only facts (corroborated by repeats, never outcome/human-verified) — the
-    candidates an operator-gated enforcement pass would demote. Read-only; worst (most-repeated) first."""
-    rows = conn.execute(
-        "SELECT id, domain, confirmation_count, COALESCE(score,0), substr(fact_text,1,140) "
-        "FROM facts WHERE tombstoned_at IS NULL AND confirmation_count >= ? "
-        "AND outcome IS NULL AND (confidence_source IS NULL OR confidence_source != 'human') "
-        "ORDER BY confirmation_count DESC, COALESCE(score,0) DESC LIMIT ?",
-        (REPETITION_THRESHOLD, limit)).fetchall()
-    return [{"id": r[0], "domain": r[1], "confirmation_count": r[2], "score": r[3], "text": r[4]}
-            for r in rows]
-
-
-def corpus_audit_stats(conn: sqlite3.Connection) -> dict:
-    """Compute read-only corpus integrity signals over the facts table. Never writes."""
-    def scalar(q, *a):
-        row = conn.execute(q, a).fetchone()
-        return (row[0] if row and row[0] is not None else 0)
-
-    stats = {
-        "live_facts": scalar("SELECT COUNT(*) FROM facts WHERE tombstoned_at IS NULL"),
-        "human_verified": scalar(
-            "SELECT COUNT(*) FROM facts WHERE tombstoned_at IS NULL AND confidence_source='human'"),
-        "outcome_verified": scalar(
-            "SELECT COUNT(*) FROM facts WHERE tombstoned_at IS NULL AND outcome IS NOT NULL AND outcome != 'rejected'"),
-        "rejected": scalar("SELECT COUNT(*) FROM facts WHERE outcome='rejected'"),
-        # corroborated by repeats, never outcome- or human-verified — the self-poison surface
-        "repetition_unverified": scalar(
-            "SELECT COUNT(*) FROM facts WHERE tombstoned_at IS NULL AND confirmation_count >= ? "
-            "AND outcome IS NULL AND (confidence_source IS NULL OR confidence_source != 'human')",
-            REPETITION_THRESHOLD),
-        # same fact_key, more than one live fact → divergent claims under one key
-        "contradiction_keys": scalar(
-            "SELECT COUNT(*) FROM (SELECT fact_key FROM facts WHERE tombstoned_at IS NULL "
-            "GROUP BY fact_key HAVING COUNT(*) > 1)"),
-        "contradiction_facts": scalar(
-            "SELECT COALESCE(SUM(c),0) FROM (SELECT COUNT(*) c FROM facts WHERE tombstoned_at IS NULL "
-            "GROUP BY fact_key HAVING COUNT(*) > 1)"),
-        "conflict_flagged": scalar(
-            "SELECT COUNT(*) FROM facts WHERE tombstoned_at IS NULL AND conflict_with IS NOT NULL"),
-    }
-    # Outcome cross-ref, only if task_outcomes exists (avoids a write on a read-only conn).
-    has_to = scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='task_outcomes'")
-    if has_to:
-        stats["task_outcomes"] = scalar("SELECT COUNT(*) FROM task_outcomes")
-        rows = conn.execute(
-            "SELECT COALESCE(scope,''), COUNT(*), COALESCE(SUM(success),0) "
-            "FROM task_outcomes GROUP BY scope ORDER BY scope").fetchall()
-        stats["outcome_by_scope"] = [
-            {"scope": s, "total": t, "success": su, "rate": (su / t if t else 0.0)}
-            for s, t, su in rows
-        ]
-    return stats
-
-
-def cmd_corpus_audit(args):
-    """Read-only corpus integrity / self-poison shadow audit (Phase 2 — mutates nothing).
-
-    Surfaces facts rewarded by repetition but never outcome/human-verified, contradiction
-    clusters, and (with --candidates N) the prune candidates an operator-gated enforcement pass
-    would demote. Usage: gaius corpus-audit [--json] [--samples N] [--candidates N]
-    """
-    p = argparse.ArgumentParser(prog="gaius corpus-audit")
-    p.add_argument("--json", action="store_true")
-    p.add_argument("--samples", type=int, default=5)
-    p.add_argument("--candidates", type=int, default=0,
-                   help="list the top-N repetition-only prune candidates (read-only)")
-    ns = p.parse_args(args)
-
-    # READ-ONLY connection — Phase 2 shadow MUST NOT mutate the corpus (enforced at the SQLite layer).
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
-    stats = corpus_audit_stats(conn)
-    samples = conn.execute(
-        "SELECT fact_key, COUNT(*) c FROM facts WHERE tombstoned_at IS NULL "
-        "GROUP BY fact_key HAVING c > 1 ORDER BY c DESC LIMIT ?", (ns.samples,)).fetchall()
-    cands = repetition_candidates(conn, ns.candidates) if ns.candidates > 0 else []
-
-    if ns.json:
-        print(json.dumps({**stats,
-                          "contradiction_samples": [{"fact_key": k, "count": c} for k, c in samples],
-                          "repetition_candidates": cands}, indent=2))
-        return
-
-    live = stats["live_facts"] or 1
-    pct = lambda n: f"{n / live * 100:.1f}%"
-    print("\nCORPUS AUDIT (read-only shadow — Phase 2, mutates nothing)")
-    print(f"  live facts:           {stats['live_facts']}")
-    print(f"  human-verified:       {stats['human_verified']} ({pct(stats['human_verified'])})")
-    print(f"  outcome-verified:     {stats['outcome_verified']} ({pct(stats['outcome_verified'])})")
-    print(f"  ⚠ repetition-only:    {stats['repetition_unverified']} ({pct(stats['repetition_unverified'])})  — corroborated by REPEATS, never outcome/human-verified")
-    print(f"  ⚠ contradiction:      {stats['contradiction_keys']} keys / {stats['contradiction_facts']} facts (same fact_key, divergent)")
-    print(f"  conflict-flagged:     {stats['conflict_flagged']}")
-    if "task_outcomes" in stats:
-        print(f"  task_outcomes:        {stats['task_outcomes']}")
-    if samples:
-        print("  top contradiction keys:")
-        for k, c in samples:
-            print(f"    {c}x  {k}")
-    if cands:
-        print(f"  repetition-only prune candidates (top {len(cands)}, operator-gated to enforce):")
-        for c in cands:
-            print(f"    [{c['id']}] cc={c['confirmation_count']} {c['domain']}: {c['text']}")
-    print()
-
-
-# --- Phase 3: gaius-grounded router (retrieval-augmented, read-only) ---
-# Augments the keyword router (route_domains) with the ACTUAL corpus facts behind each domain
-# + task_outcomes win-rates, so a route is grounded in own history and TRANSPARENT (returns the
-# supporting facts) — vs Fugu's trained black box. Crucially flags how many supporting facts are
-# UNVERIFIED (repetition-only), tying routing to the Phase 2 self-poison signal. Read-only;
-# mutates nothing. The orchestrator adopting this for real routing is a later, flag-gated step.
-
-def _corpus_domain_search(conn: sqlite3.Connection, query: str, limit: int = 8):
-    """Cheap corpus-CONTENT retrieval signal: live facts whose text contains query terms,
-    grouped by domain. BM25-lite over the corpus itself (not the hardcoded keyword map), so
-    routing reflects what the corpus actually knows — covering the keyword router's blind spots.
-    Read-only. Returns (domains_ranked, facts)."""
-    terms = re.findall(r"[a-z0-9-]{4,}", query.lower())[:10]
-    if not terms:
-        return [], []
-    where = " OR ".join(["LOWER(fact_text) LIKE ?"] * len(terms))
-    rows = conn.execute(
-        "SELECT id, domain, fact_text, confirmation_count, COALESCE(score,0), outcome, confidence_source "
-        "FROM facts WHERE tombstoned_at IS NULL AND (" + where + ") "
-        "ORDER BY COALESCE(score,0) DESC, confirmation_count DESC LIMIT ?",
-        [f"%{t}%" for t in terms] + [limit]).fetchall()
-    ranked = [d for d, _ in Counter(r[1] for r in rows).most_common()]
-    facts = [{
-        "id": r[0], "domain": r[1], "text": (r[2] or "")[:160],
-        "confirmation_count": r[3], "score": r[4],
-        "verified": bool(r[5] and r[5] != "rejected") or r[6] == "human",
-    } for r in rows]
-    return ranked, facts
-
-
-def route_suggest(conn: sqlite3.Connection, query: str, hint: str = None, max_facts: int = 5) -> dict:
-    """Retrieval-augmented routing recommendation (read-only). Combines the keyword router with a
-    corpus-content search so the route reflects what the corpus actually knows; returns supporting
-    facts (each with a verified flag), how many are UNVERIFIED, and task_outcomes win-rates. Never writes."""
-    kw_domains = route_domains(query, primary_hint=hint, max_files=3, max_chars=8000)
-    corpus_domains, corpus_facts = _corpus_domain_search(conn, query, limit=max_facts)
-
-    # Prefer the keyword router when it hits (cheap, precise); else the corpus-content signal
-    # (covers the keyword router's blind spots); else the explicit hint.
-    primary = (kw_domains[0]["domain"] if kw_domains
-               else corpus_domains[0] if corpus_domains
-               else hint)
-
-    # Supporting facts: the corpus-matched facts (they matched the query content); else the
-    # top facts of the primary domain.
-    facts = corpus_facts[:max_facts]
-    if not facts and primary:
-        rows = conn.execute(
-            "SELECT id, fact_text, confirmation_count, COALESCE(score,0), outcome, confidence_source "
-            "FROM facts WHERE domain = ? AND tombstoned_at IS NULL "
-            "ORDER BY COALESCE(score,0) DESC, confirmation_count DESC LIMIT ?",
-            (primary, max_facts)).fetchall()
-        facts = [{
-            "id": fid, "domain": primary, "text": (text or "")[:160],
-            "confirmation_count": cc, "score": score,
-            "verified": bool(outcome and outcome != "rejected") or csrc == "human",
-        } for fid, text, cc, score, outcome, csrc in rows]
-
-    winrates = []
-    has_to = conn.execute(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='task_outcomes'").fetchone()[0]
-    if has_to:
-        rows = conn.execute(
-            "SELECT COALESCE(scope,''), COUNT(*), COALESCE(SUM(success),0) "
-            "FROM task_outcomes GROUP BY scope ORDER BY 3 DESC").fetchall()
-        winrates = [{"scope": s, "total": t, "success": su, "rate": (su / t if t else 0.0)}
-                    for s, t, su in rows]
-
-    return {
-        "query": query,
-        "domains": kw_domains,
-        "corpus_domains": corpus_domains,
-        "primary_domain": primary,
-        "supporting_facts": facts,
-        "unverified_supporting": sum(1 for f in facts if not f["verified"]),
-        "outcome_winrates": winrates,
-    }
-
-
-def cmd_route_suggest(args):
-    """Retrieval-augmented routing recommendation grounded in corpus facts (read-only).
-
-    Unlike 'route' (keyword domains only), this returns the supporting facts + how many are
-    UNVERIFIED + outcome win-rates. Usage: gaius route-suggest <task...> [--hint D] [--json]
-    """
-    p = argparse.ArgumentParser(prog="gaius route-suggest")
-    p.add_argument("query", nargs="+", help="task / query text to route")
-    p.add_argument("--hint", default=None, help="primary domain hint")
-    p.add_argument("--max-facts", type=int, default=5)
-    p.add_argument("--json", action="store_true")
-    ns = p.parse_args(args)
-    query = " ".join(ns.query)
-
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)  # read-only: routing never mutates
-    res = route_suggest(conn, query, hint=ns.hint, max_facts=ns.max_facts)
-
-    if ns.json:
-        print(json.dumps(res, indent=2))
-        return
-    print(f"\nROUTE: {query[:100]}{'...' if len(query) > 100 else ''}")
-    print(f"  primary domain: {res['primary_domain']}")
-    if res["domains"]:
-        print("  candidates: " + ", ".join(f"{d['domain']}({d['score']:.2f})" for d in res["domains"]))
-    if res["supporting_facts"]:
-        print(f"  supporting facts ({res['unverified_supporting']}/{len(res['supporting_facts'])} UNVERIFIED — repetition-only):")
-        for f in res["supporting_facts"]:
-            mark = "✓" if f["verified"] else "⚠"
-            print(f"    {mark} [{f['id']}] {f['text']}")
-    if res["outcome_winrates"]:
-        print("  scope win-rates (from task_outcomes):")
-        for w in res["outcome_winrates"][:5]:
-            print(f"    {w['scope'] or '(none)'}: {w['success']}/{w['total']} ({w['rate']*100:.0f}%)")
-    print()
-
-
-# ── Source-of-truth reconciler (the promotion-gap fix) ───────────────────────────────────────
-# Closes the "known-but-not-injected-at-depth" gap: load-bearing facts that live only in repo docs
-# (READMEs, PLANs, Makefiles) never reach facts.db, so injection can't surface them — the 2026-06-24
-# gaius-OSS divergence (gaius was open-source for days; no session knew the publish flow existed).
-# CONSERVATIVE by design: a CURATED registry (no LLM guessing) of canonical sources, each carrying
-# human-curated topology facts + an optional dev<->mirror pair. The reconciler (a) PROMOTES the
-# curated facts into facts.db ONCE, flagged-unverified (source='reconcile', outcome=None) so the
-# corpus-audit/outcome QC governs them (never trusted by fiat); insert-once — the nightly does NOT
-# re-corroborate, so it never inflates confirmation_count (the repetition-poison it exists to avoid).
-# And (b) runs a DIVERGENCE SENTINEL diffing dev vs mirror, reporting drift (the check that would
-# have screamed "jkubo/gaius is behind agent-memory"). Mechanical, no LLM, dry-run by default.
-
-DEFAULT_SOURCES = [
-    {
-        "name": "gaius",
-        "dev_path": str(Path.home() / "Projects/agent-memory/gaius"),
-        "mirror_path": str(Path.home() / "Projects/gaius"),
-        "publish_cmd": "make publish  (then push ~/Projects/gaius to github via gh-token HTTPS)",
-        "facts": [
-            "gaius dev repo = kub0-ai/agent-memory (Forgejo, private); the OSS mirror = jkubo/gaius "
-            "(GitHub, PUBLIC, Apache-2.0). The gaius/ subdir is the published package.",
-            "Sync gaius dev -> OSS: from the gaius/ dir run `make publish` (rsync to the ~/Projects/gaius "
-            "mirror clone + leak scan), review the diff, then push the mirror to github via gh-token "
-            "HTTPS (the ~/.ssh/keys/gh_claudeus_ai key is passphrase-locked, so SSH push is blocked).",
-            "After ANY change to gaius source, publish to the OSS mirror in the same session — it drifts "
-            "silently otherwise (the 2026-06-24 divergence: the closed-loop commands sat unpublished for days).",
-        ],
-    },
-]
-
-# Mirrors the Makefile `publish` rsync excludes so the divergence check compares the publishable set.
-_RECONCILE_EXCLUDES = (".git", "__pycache__", ".venv", ".pytest_cache", "benchmarks",
-                       "OPEN-SOURCE-PLAN.md", "drift-facts.yaml", "Makefile")
-_RECONCILE_EXCLUDE_SUFFIXES = (".pyc", ".egg-info", ".archive")
-
-
-def load_source_registry():
-    """DEFAULT_SOURCES merged with ~/.gaius/sources.yaml (optional, user-curated; same shape)."""
-    sources = {s["name"]: dict(s) for s in DEFAULT_SOURCES}
-    cfg = Path.home() / ".gaius" / "sources.yaml"
-    if cfg.exists():
-        try:
-            import yaml
-            extra = yaml.safe_load(cfg.read_text()) or []
-            if isinstance(extra, dict):
-                extra = extra.get("sources", [])
-            for s in extra:
-                sources[s["name"]] = {**sources.get(s["name"], {}), **s}
-        except Exception as e:
-            print(f"  (sources.yaml ignored: {e})", file=sys.stderr)
-    return list(sources.values())
-
-
-def _reconcile_excluded(rel):
-    parts = Path(rel).parts
-    for p in parts:
-        if p in _RECONCILE_EXCLUDES or p.endswith(_RECONCILE_EXCLUDE_SUFFIXES):
-            return True
-    return False
-
-
-def _dir_fingerprint(root):
-    """{relpath: sha256} for non-excluded files under root (empty dict if root is absent)."""
-    import hashlib
-    root = Path(root)
-    fp = {}
-    if not root.exists():
-        return fp
-    for p in root.rglob("*"):
-        if not p.is_file():
-            continue
-        rel = str(p.relative_to(root))
-        if _reconcile_excluded(rel):
-            continue
-        try:
-            fp[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
-        except OSError:
-            pass
-    return fp
-
-
-def source_divergence(dev_path, mirror_path):
-    """Mechanical dev<->mirror drift: files missing-from-mirror / differing / stale-in-mirror."""
-    if not Path(mirror_path).exists():
-        return {"in_sync": False, "mirror_exists": False,
-                "missing_from_mirror": [], "differ": [], "only_in_mirror": [], "dev_files": 0}
-    dev, mir = _dir_fingerprint(dev_path), _dir_fingerprint(mirror_path)
-    missing = sorted(set(dev) - set(mir))
-    differ = sorted(f for f in (set(dev) & set(mir)) if dev[f] != mir[f])
-    stale = sorted(set(mir) - set(dev))
-    return {"in_sync": not (missing or differ or stale), "mirror_exists": True,
-            "missing_from_mirror": missing, "differ": differ, "only_in_mirror": stale,
-            "dev_files": len(dev)}
-
-
-def _remote_head(url, branch="main", timeout=15):
-    """SHA of <branch> at a remote via `git ls-remote` over HTTPS (uses the configured git credential
-    helper, so it avoids a passphrase-locked SSH key). Returns None on failure/timeout."""
-    import subprocess
-    try:
-        out = subprocess.run(["git", "ls-remote", "--heads", url, branch],
-                             capture_output=True, text=True, timeout=timeout)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if out.returncode != 0 or not out.stdout.strip():
-        return None
-    return out.stdout.split()[0]
-
-
-def remote_divergence(remotes, branch="main", head_fn=None):
-    """Compare a source's `main` HEAD across remotes (e.g. a Forgejo dev repo vs its GitHub mirror).
-    remotes = {label: https-url}. Mechanical — `git ls-remote` only, no fetch. Catches the drift the
-    tree-vs-tree check can't see (two remotes on one working tree). An unreachable remote yields
-    in_sync=False (fail-safe — don't silently claim sync when a side is unknown). head_fn defaults to
-    the module-level _remote_head looked up dynamically (so it stays patchable)."""
-    fn = head_fn or _remote_head
-    heads = {label: fn(url, branch) for label, url in remotes.items()}
-    present = [h for h in heads.values() if h]
-    reachable = bool(present) and len(present) == len(heads)
-    in_sync = reachable and len(set(present)) == 1
-    return {"in_sync": in_sync, "reachable": reachable, "branch": branch,
-            "heads": {k: (v[:9] if v else None) for k, v in heads.items()}}
-
-
-def reconcile_source(conn, src, promote, head_fn=None):
-    """Promote a source's curated facts (insert-once, flagged-unverified) + check divergence.
-    head_fn is injectable for tests (defaults to the real git ls-remote probe)."""
-    name = src["name"]
-    results = []
-    for i, text in enumerate(src.get("facts", [])):
-        fk = f"reconcile:{name}:{i}"
-        exists = conn.execute(
-            "SELECT 1 FROM facts WHERE fact_key=? AND tombstoned_at IS NULL", (fk,)).fetchone()
-        if exists:
-            results.append("exists")
-        elif promote:
-            upsert_fact(conn, domain="general", fact_key=fk, fact_text=text, agent="reconcile",
-                        session_uuid="reconcile", provenance=f"source-registry:{name}",
-                        score=0.5, outcome=None, source="reconcile", fact_type="operational")
-            results.append("inserted")
-        else:
-            results.append("would-insert")
-    div = source_divergence(src["dev_path"], src["mirror_path"]) if src.get("mirror_path") else None
-    rdiv = remote_divergence(src["remotes"], head_fn=head_fn) if src.get("remotes") else None
-    return {"name": name, "facts": results, "divergence": div, "remote_divergence": rdiv,
-            "publish_cmd": src.get("publish_cmd")}
-
-
-def cmd_reconcile(args):
-    """Source-of-truth reconciler: promote curated repo facts into the corpus (flagged-unverified,
-    insert-once) + a dev<->mirror divergence sentinel. Closes the promotion gap (a fact known only
-    in a repo doc never reaches injectable memory). Mechanical, no LLM. Default = dry-run.
-
-    Usage: gaius reconcile [--promote] [--json] [--source NAME]
-    """
-    p = argparse.ArgumentParser(prog="gaius reconcile")
-    p.add_argument("--promote", action="store_true",
-                   help="write curated facts to facts.db (additive, flagged-unverified, insert-once)")
-    p.add_argument("--json", action="store_true")
-    p.add_argument("--source", default="", help="reconcile only this source name")
-    ns = p.parse_args(args)
-
-    sources = load_source_registry()
-    if ns.source:
-        sources = [s for s in sources if s["name"] == ns.source]
-        if not sources:
-            print(f"no source named {ns.source!r}", file=sys.stderr)
-            return
-
-    conn = init_db() if ns.promote else sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
-    results = [reconcile_source(conn, s, ns.promote) for s in sources]
-    if ns.promote:
-        conn.commit()
-    conn.close()
-
-    if ns.json:
-        print(json.dumps({"promote": ns.promote, "sources": results}, indent=2))
-        return
-
-    print(f"\nSOURCE RECONCILE ({'PROMOTE' if ns.promote else 'dry-run — no writes'})")
-    for r in results:
-        c = {k: r["facts"].count(k) for k in ("inserted", "would-insert", "exists")}
-        bits = [f"{c['inserted']} promoted"] if c["inserted"] else []
-        if c["would-insert"]:
-            bits.append(f"{c['would-insert']} would-promote")
-        if c["exists"]:
-            bits.append(f"{c['exists']} already-present")
-        print(f"\n  [{r['name']}] facts: {', '.join(bits) or '0'}")
-        d = r["divergence"]
-        if d is None:
-            print("    divergence: (no mirror configured)")
-        elif not d["mirror_exists"]:
-            print("    ⚠ divergence: mirror path does not exist")
-        elif d["in_sync"]:
-            print(f"    ✓ divergence: IN SYNC ({d['dev_files']} files match)")
-        else:
-            print(f"    ⚠ DRIFT: {len(d['missing_from_mirror'])} missing-from-mirror, "
-                  f"{len(d['differ'])} differ, {len(d['only_in_mirror'])} stale-in-mirror")
-            for f in (d["missing_from_mirror"] + d["differ"])[:8]:
-                print(f"        - {f}")
-            if r.get("publish_cmd"):
-                print(f"      → sync: {r['publish_cmd']}")
-        rd = r.get("remote_divergence")
-        if rd is not None:
-            if not rd["reachable"]:
-                print(f"    ⚠ remote: UNREACHABLE (can't verify): {rd['heads']}")
-            elif rd["in_sync"]:
-                print(f"    ✓ remote: IN SYNC (main {next(iter(rd['heads'].values()))})")
-            else:
-                print(f"    ⚠ remote DRIFT — main differs across remotes: {rd['heads']}")
-    print()
-
+from gaius.concord import (  # noqa: E402,F401  re-export (cross-session coordination, 2026-07-17 — OSS-included)
+    cmd_concord, init_concord,
+)
 
 COMMANDS = {
     "init":       cmd_init,
@@ -8966,8 +6287,6 @@ COMMANDS = {
     "skills":          cmd_skills,
     "commands":        cmd_commands,
     "landscape":       cmd_landscape,
-    "sync-council":    cmd_sync_council,
-    "sync-alerts":     cmd_sync_alerts,
     "embed":           cmd_embed,
     "kg":              cmd_kg,
     "decay":           cmd_decay,
@@ -8980,6 +6299,7 @@ COMMANDS = {
     "corpus-audit":    cmd_corpus_audit,
     "route-suggest":   cmd_route_suggest,
     "reconcile":       cmd_reconcile,
+    "concord":         cmd_concord,
 }
 
 SUPPORTED_FORMATS = {"claude", "gemini", "ollama", "vllm", "pentagi", "grok", "codex"}

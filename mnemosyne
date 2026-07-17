@@ -193,6 +193,34 @@ def heaviest_lines(path: Path, n: int = 5):
 
 # ── Commands ─────────────────────────────────────────────────────────────────
 
+def scan_index_completeness(memory_dir: Path):
+    """Every active feedback rule must be catalogued in feedback/INDEX.md, and no
+    retired (.archive/) rule should still be listed. Catches the catalog-drift class
+    that let 64 rules — incl HARD gates — go invisible in the always-injected
+    awareness layer (cured 2026-07-03). Feedback-scoped: keys are deterministic
+    (filename stem minus 'feedback_'), so this is zero-false-positive.
+    Returns [(key, kind)] where kind is 'missing' | 'ghost'. WARN-mode (advisory).
+    """
+    fb = memory_dir / "feedback"
+    idxp = fb / "INDEX.md"
+    if not fb.is_dir() or not idxp.exists():
+        return []
+    idx = idxp.read_text(errors="ignore")
+    findings, active_keys = [], set()
+    for p in fb.glob("feedback_*.md"):
+        key = p.stem[len("feedback_"):]
+        active_keys.add(key)
+        if not re.search(r"\b" + re.escape(key) + r"\b", idx):
+            findings.append((key, "missing"))
+    arch = fb / ".archive"
+    if arch.is_dir():
+        for p in arch.glob("feedback_*.md"):
+            key = p.stem[len("feedback_"):]
+            if key not in active_keys and re.search(r"\b" + re.escape(key) + r"\b", idx):
+                findings.append((key, "ghost"))
+    return findings
+
+
 def cmd_health(memory_dir: Path, args: list):
     """Print line counts and health status for all memory files."""
     files = []
@@ -278,6 +306,7 @@ def cmd_health(memory_dir: Path, args: list):
     reds    = [r for r in files if r[1] >= r[3]]
     yellows = [r for r in files if r[2] <= r[1] < r[3]]
     mem_gloss = scan_index_gloss(_mem) if _mem.exists() else []
+    idx_incomplete = scan_index_completeness(memory_dir)
     if reds:
         print(f"{RED}{BOLD}⚠  {len(reds)} file(s) over limit:{RESET} "
               + ", ".join(r[0] for r in reds))
@@ -301,6 +330,15 @@ def cmd_health(memory_dir: Path, args: list):
               f"keep the index a terse hook):{RESET}")
         for lineno, gloss, total, preview in mem_gloss:
             print(f"   MEMORY.md:{lineno}  {gloss}B gloss / {total}B line  {preview}…")
+    if idx_incomplete:
+        miss = [k for k, knd in idx_incomplete if knd == "missing"]
+        ghost = [k for k, knd in idx_incomplete if knd == "ghost"]
+        print(f"{YELLOW}⚡  feedback/INDEX drift: {len(miss)} rule(s) unlisted, "
+              f"{len(ghost)} retired-but-still-listed (awareness gap — reconcile INDEX):{RESET}")
+        if miss:
+            print(f"   missing: {', '.join(miss[:15])}{' …' if len(miss) > 15 else ''}")
+        if ghost:
+            print(f"   ghost:   {', '.join(ghost)}")
     if byte_yellow:
         print(f"{YELLOW}⚡  MEMORY.md over the 16KB injection-budget warn — compress.{RESET}")
     if byte_red:
@@ -311,7 +349,8 @@ def cmd_health(memory_dir: Path, args: list):
         for lineno, length, preview in heaviest_lines(_mem):
             print(f"     MEMORY.md:{lineno}  {length}B  {preview}…")
     if (not reds and not yellows and not joined and not longish
-            and not byte_red and not byte_yellow and not mem_gloss):
+            and not byte_red and not byte_yellow and not mem_gloss
+            and not idx_incomplete):
         print(f"{GREEN}✓  All files within threshold.{RESET}")
     print()
 

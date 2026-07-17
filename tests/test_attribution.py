@@ -17,9 +17,23 @@ os.environ["GAIUS_CONFIG"] = "/dev/null"
 
 import asyncio
 import hashlib
+import importlib.util
 import json
 
+import pytest
+
 from gaius import _core
+
+# These tests exercise optional-extra surfaces (mcp_server needs [mcp]; http_adapter
+# needs [http]). The dev extra deliberately ships only pytest — skip, don't fail,
+# when the extras aren't installed so the base suite stays green.
+requires_mcp = pytest.mark.skipif(
+    importlib.util.find_spec("mcp") is None,
+    reason="optional [mcp] extra not installed")
+requires_http = pytest.mark.skipif(
+    importlib.util.find_spec("httpx") is None or importlib.util.find_spec("fastapi") is None
+    or importlib.util.find_spec("http_adapter") is None,
+    reason="optional [http] extra not installed / http_adapter not in this build")
 
 
 def _fact_row(db_path, fact_text):
@@ -32,6 +46,7 @@ def _fact_row(db_path, fact_text):
     ).fetchone()
 
 
+@requires_mcp
 class TestMCPAttribution:
     def test_distinct_sessions_corroborate_distinctly(self, tmp_path, monkeypatch):
         db = tmp_path / "facts.db"
@@ -63,6 +78,7 @@ class TestMCPAttribution:
         assert json.loads(row["sessions"]) == ["session"], "default session changed"
 
 
+@requires_http
 class TestAdapterAttribution:
     def test_threads_body_identity(self, tmp_path, monkeypatch):
         db = tmp_path / "facts.db"

@@ -47,6 +47,11 @@ principals:
 # ── Entity Extraction ─────────────────────────────────────────────────────────
 # Regex patterns for KG entity extraction. Merged with built-in baseline.
 # Set preset: none to disable built-ins entirely and use only custom patterns.
+# NOTE: a key matching a builtin type name (node, service, namespace, incident,
+# cve, model) REPLACES that builtin pattern. For deployment-specific service
+# names use the "app" type — it merges alongside the builtins and carries the
+# same co-occurrence semantics as "service". Patterns may use one capture
+# group; group(1) becomes the entity name (else the whole match).
 entities:
   preset: k8s   # use built-in K8s baseline patterns
 
@@ -55,8 +60,8 @@ entities:
     # Example: match your node naming scheme
     # node: '\bprod-[\w]+-node-\d+\b'
 
-    # Example: match your cluster services
-    # service: '\b(?:my-api|my-worker|my-scheduler)\b'
+    # Example: your in-house deployments (merges with the builtin service list)
+    # app: '\b(?:my-api|my-worker|my-scheduler)\b'
 
     # Example: match your namespaces
     # namespace: '\b(?:prod|staging|dev|data-pipeline)\b'

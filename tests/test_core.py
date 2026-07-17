@@ -293,11 +293,11 @@ class TestFailureClassMap:
         old_env = os.environ.get("GAIUS_CONFIG")
         os.environ["GAIUS_CONFIG"] = str(cfg_file)
         try:
-            # Reimport to pick up new config env
-            if "gaius._core" in _sys.modules:
-                del _sys.modules["gaius._core"]
-            if "gaius" in _sys.modules:
-                del _sys.modules["gaius"]
+            # Reimport to pick up new config env. _FAILURE_CLASS_MAP is built at
+            # import time in gaius.raft (split 2026-07-01) from _gaius_cfg, so the
+            # raft submodule must also be cleared or its cached (old-config) map is reused.
+            for _m in ("gaius._core", "gaius.raft", "gaius"):
+                _sys.modules.pop(_m, None)
             from gaius._core import _FAILURE_CLASS_MAP as fcm
             assert "mytunnel" in fcm["networking"]
             # Defaults should still be present
@@ -307,10 +307,8 @@ class TestFailureClassMap:
                 os.environ.pop("GAIUS_CONFIG", None)
             else:
                 os.environ["GAIUS_CONFIG"] = old_env
-            if "gaius._core" in _sys.modules:
-                del _sys.modules["gaius._core"]
-            if "gaius" in _sys.modules:
-                del _sys.modules["gaius"]
+            for _m in ("gaius._core", "gaius.raft", "gaius"):
+                _sys.modules.pop(_m, None)
 
 
 class TestDomainMap:
@@ -705,3 +703,41 @@ class TestDriftLive:
              "pattern": r"Traefik on \*\*(aus-fwd-gpu-\d+)\*\*",
              "probe": "echo k8s-aus-fwd-gpu-02", "compare": "contains"})
         assert code == 0 and "OK" in capsys.readouterr().out
+
+
+class TestSaveStagedPathTraversal:
+    """save_staged() builds a filename from session `timestamp`/`uuid`, which via
+    `gaius s3-retire` can originate on another agent's host. A crafted value must
+    not let the staged write escape STAGING_DIR (path-traversal, audit 2026-07-16)."""
+
+    def _write(self, tmp_path, monkeypatch, entry):
+        from gaius import _core
+        staging = tmp_path / "staged"
+        monkeypatch.setattr(_core, "STAGING_DIR", staging)
+        _core.save_staged(entry)
+        return staging
+
+    def test_traversal_timestamp_stays_inside_staging(self, tmp_path, monkeypatch):
+        staging = self._write(tmp_path, monkeypatch, {
+            "timestamp": "../../../../tmp/", "uuid": "deadbeef1234",
+            "sections": {"key_concepts": "x"}, "reviewed": True})
+        written = list(staging.glob("*.json"))
+        assert written, "nothing written"
+        # every write resolves to a direct child of STAGING_DIR — no escape
+        for p in written:
+            assert p.resolve().parent == staging.resolve()
+        assert not (tmp_path.parent / "tmp" / "_deadbeef.json").exists()
+
+    def test_traversal_in_uuid_is_sanitized(self, tmp_path, monkeypatch):
+        staging = self._write(tmp_path, monkeypatch, {
+            "timestamp": "2026-07-16T03:00:00", "uuid": "../../etc/passwd",
+            "sections": {"key_concepts": "x"}, "reviewed": True})
+        for p in staging.glob("*.json"):
+            assert p.resolve().parent == staging.resolve()
+            assert "/" not in p.name and ".." not in p.name
+
+    def test_normal_timestamp_still_writes(self, tmp_path, monkeypatch):
+        staging = self._write(tmp_path, monkeypatch, {
+            "timestamp": "2026-07-16T03:00:00Z", "uuid": "abcd1234ef",
+            "sections": {"key_concepts": "y"}, "reviewed": True})
+        assert (staging / "2026-07-16T03-00-00_abcd1234.json").exists()

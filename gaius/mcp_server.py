@@ -115,7 +115,8 @@ def gaius_search(query: str, domain: str = "", limit: int = 10) -> str:
             for row in rows:
                 l2_dist = row[1]
                 cosine_sim = max(0, 1.0 - (l2_dist ** 2 / 2.0))
-                sem_by_id[row[2]] = cosine_sim
+                # MAX over a fact's chunks (multi-vector); short facts have one row.
+                sem_by_id[row[2]] = max(sem_by_id.get(row[2], 0.0), cosine_sim)
 
             for item in scored:
                 fid = item["fact"]["id"]
@@ -253,7 +254,7 @@ def gaius_stats() -> str:
 
     # Embeddings
     try:
-        embedded = conn.execute("SELECT COUNT(*) FROM fact_embeddings").fetchone()[0]
+        embedded = conn.execute("SELECT COUNT(DISTINCT fact_id) FROM fact_embeddings").fetchone()[0]
         parts.append(f"\nEmbeddings: {embedded}/{total} ({100*embedded//max(total,1)}%)")
     except Exception:
         parts.append("\nEmbeddings: not available")
@@ -270,16 +271,28 @@ def gaius_stats() -> str:
 
 
 @mcp.tool()
-def gaius_fact_add(fact_text: str, domain: str, source: str = "session") -> str:
+def gaius_fact_add(fact_text: str, domain: str, source: str = "session",
+                   fact_type: str = "operational") -> str:
     """Record a new fact directly to facts.db. Use for important discoveries during a session.
 
     Args:
         fact_text: The fact to record (be concise — one sentence or short paragraph)
         domain: Domain category (storage, networking, security, services, general, etc.)
         source: Source label (default: "session")
+        fact_type: Volatility/kind rating — "structural" for design/architecture facts
+            (no decay; trust without re-check), "operational" (default) for normal
+            operational knowledge, "live" for volatile state snapshots (replica counts,
+            flag values, pod states — fast decay, always re-verify before acting).
+            Also accepts: finding, procedure, security, observation.
     """
     import hashlib
     from gaius._core import init_db, upsert_fact, _is_noise
+
+    _VALID_FACT_TYPES = {"operational", "structural", "live",
+                         "finding", "procedure", "security", "observation"}
+    if fact_type not in _VALID_FACT_TYPES:
+        return (f"Rejected: unknown fact_type '{fact_type}'. "
+                f"Use one of: {', '.join(sorted(_VALID_FACT_TYPES))}.")
 
     # Single ingest pipeline: noise filter, semantic dedup, confidence scoring,
     # race-safe insert all live in upsert_fact — this tool used to be a second
@@ -300,7 +313,8 @@ def gaius_fact_add(fact_text: str, domain: str, source: str = "session") -> str:
     upsert_fact(conn, domain, fact_key, fact_text,
                 agent=os.getenv("GAIUS_AGENT", "operator"),
                 session_uuid=source or os.getenv("GAIUS_SESSION_UUID", "mcp"),
-                provenance="mcp-session", score=0.6, source=source)
+                provenance="mcp-session", score=0.6, source=source,
+                fact_type=fact_type)
 
     if existing:
         return (f"Fact already exists (id: {existing['id']}) — corroborated "
@@ -409,124 +423,6 @@ def gaius_skill_recommend(task: str, files: list[str] | None = None) -> str:
     return "\n".join(lines)
 
 
-# ── Threat Tiering MCP Tools ─────────────────────────────────────────────────
-# Thin HTTP wrappers around detonate-api /api/threat/* endpoints.
-
-_DETONATE_API = os.environ.get(
-    "DETONATE_API_URL", "http://detonate-api.security.svc.cluster.local:8080"
-)
-
-
-def _threat_fetch(path: str, params: dict | None = None) -> str:
-    """Fetch from detonate-api threat endpoint. Returns JSON string."""
-    import urllib.request
-    import urllib.parse
-
-    url = f"{_DETONATE_API}{path}"
-    if params:
-        url += "?" + urllib.parse.urlencode({k: v for k, v in params.items() if v})
-    try:
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return resp.read().decode()
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-
-@mcp.tool()
-def threat_landscape(technique: str = "", family: str = "") -> str:
-    """Active threat campaigns and per-technique scores from CVE intel + attribution.
-
-    Args:
-        technique: Optional MITRE technique ID to filter (e.g., T1496)
-        family: Optional malware family to search for in groups
-    """
-    data = json.loads(_threat_fetch("/api/threat/landscape", {"technique": technique}))
-    if family and "techniques" in data:
-        family_lower = family.lower()
-        data["techniques"] = [
-            t for t in data["techniques"]
-            if any(family_lower in g.lower() for g in (t.get("top_groups") or []))
-        ]
-        data["count"] = len(data["techniques"])
-        data["filter_family"] = family
-    return json.dumps(data, indent=2)
-
-
-@mcp.tool()
-def threat_tp_status(node: str = "", tp: str = "") -> str:
-    """TP priority assignments per node — which TPs are assigned and why.
-
-    Args:
-        node: Optional node name to filter (e.g., web-prod-01)
-        tp: Optional TP name to filter from results
-    """
-    data = json.loads(_threat_fetch("/api/threat/tp-status", {"node": node}))
-    if tp and "assignments" in data:
-        tp_lower = tp.lower()
-        data["assignments"] = [
-            a for a in data["assignments"]
-            if tp_lower in a.get("tp_name", "").lower()
-        ]
-        data["count"] = len(data["assignments"])
-        data["filter_tp"] = tp
-    return json.dumps(data, indent=2)
-
-
-@mcp.tool()
-def threat_cve_exposure(cve: str = "", state: str = "") -> str:
-    """CVE alert states — EXPOSED (red), DETECTED (yellow), MITIGATED (green).
-
-    Args:
-        cve: Optional CVE ID to filter (e.g., CVE-2026-31431)
-        state: Optional state filter (EXPOSED, DETECTED, MITIGATED)
-    """
-    data = json.loads(_threat_fetch("/api/threat/cve-alerts", {"state": state}))
-    if cve and "alerts" in data:
-        cve_upper = cve.upper()
-        data["alerts"] = [a for a in data["alerts"] if cve_upper in a.get("cve_id", "")]
-        data["count"] = len(data["alerts"])
-        data["filter_cve"] = cve
-    return json.dumps(data, indent=2)
-
-
-@mcp.tool()
-def threat_yara_priority(status: str = "") -> str:
-    """YARA rule tier distribution — hot (active campaigns), standard, cold.
-
-    Args:
-        status: Optional tier filter (hot, standard, cold)
-    """
-    # Forward the tier filter to the endpoint; _threat_fetch drops it when empty.
-    return _threat_fetch("/api/threat/yara-priority", {"tier": status})
-
-
-@mcp.tool()
-def threat_recommend(scenario: str = "") -> str:
-    """Get threat landscape summary for a described scenario.
-
-    Args:
-        scenario: Description of the threat scenario to analyze (e.g., "Kinsing cryptominer campaign")
-    """
-    data = json.loads(_threat_fetch("/api/threat/landscape"))
-    if not scenario:
-        return json.dumps(data, indent=2)
-
-    # Filter techniques whose groups/CVEs match the scenario keywords
-    keywords = set(scenario.lower().split())
-    relevant = []
-    for t in data.get("techniques", []):
-        text = " ".join(t.get("top_groups", []) + t.get("top_cves", []) + [t.get("technique_id", "")]).lower()
-        if any(kw in text for kw in keywords):
-            relevant.append(t)
-
-    return json.dumps({
-        "scenario": scenario,
-        "matching_techniques": relevant,
-        "count": len(relevant),
-        "total_techniques": data.get("count", 0),
-        "last_computed": data.get("last_computed"),
-    }, indent=2)
 
 
 if __name__ == "__main__":

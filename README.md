@@ -20,6 +20,7 @@ Engineers running Claude Code all day generate enormous amounts of institutional
 2. **Review** — queues summaries for human review before promoting facts. Bad facts don't silently enter the corpus.
 3. **Index** — promotes reviewed facts into a hybrid keyword + semantic SQLite database (`facts.db`)
 4. **Inject** — at task start, retrieves relevant facts and loads skills context into the session
+5. **Coordinate** — cross-session claims, shared findings, and a claimable task pool (`gaius concord`) so parallel sessions on one machine divide work instead of colliding
 
 ---
 
@@ -77,6 +78,10 @@ fully-offline footprint. Weakest category: temporal-reasoning (~94% R@10 at turn
 This measures the retrieval engine. Whether *proactive injection* improves agent outcomes is a
 separate evaluation (in progress), and is **not** claimed here.
 
+**Chunked-embedding validation:** feeding gaius a whole long session and letting it chunk internally
+recovers the recall naive whole-session embedding loses to the 256-token cap: chunk-granularity hit@10
+**98.4%** vs naive whole-session **95.2%** on a matched 250-question subset, at the turn-level ceiling.
+
 ---
 
 ## What's Genuinely Novel
@@ -90,8 +95,11 @@ separate evaluation (in progress), and is **not** claimed here.
 | **Mnemosyne health monitoring** | Automated memory bloat prevention. Line-count thresholds, misclassification audit, split/prune proposals. |
 | **Live state injection** | Domain files with `kubectl`/`curl` commands in frontmatter, TTL-cached. Memory that knows what's happening right now. |
 | **Hybrid sqlite-vec search** | Keyword TF-IDF/BM25 + semantic embeddings in a single SQLite file. |
+| **Chunked embedding** | Long facts are split into <=256-token chunks, each embedded; retrieval max-pools over a fact's chunks, so long content isn't silently truncated to its first ~256 tokens. |
 | **Temporal knowledge graph** | Entity-relationship triples with validity windows. `gaius kg timeline node` shows what changed and when. |
-| **MCP server** | 5 tools for mid-session memory access without leaving Claude Code. |
+| **Obsidian-vault viewer** | The knowledge graph exports `[[wikilink]]` "Related" blocks into your memory files (`kg export-links`), so the corpus opens directly as an Obsidian vault — browse entities and their links visually, no extra tooling. |
+| **Cross-session coordination** | `gaius concord` — advisory claims with TTL + pid-liveness, shared findings with an adversarial review loop, a claimable task pool, and a live roster. Parallel sessions get *ownership*: each can go deep on its lane instead of defensively re-checking the whole world. |
+| **MCP server** | 7 tools for mid-session memory access without leaving Claude Code. |
 
 ---
 
@@ -153,7 +161,42 @@ claude mcp add gaius -- python3 -m gaius.mcp_server
 claude mcp add gaius -- /path/to/gaius/gaius/mcp_server.py
 ```
 
-5 tools available mid-session: `gaius_search`, `gaius_kg_query`, `gaius_kg_timeline`, `gaius_stats`, `gaius_fact_add`.
+7 tools available mid-session: `gaius_search`, `gaius_kg_query`, `gaius_kg_timeline`, `gaius_stats`, `gaius_fact_add`, `gaius_prime_session`, `gaius_skill_recommend`.
+
+---
+
+## Cross-Session Coordination (concord)
+
+Run five Claude Code sessions against one repo and they will re-derive the same diagnosis
+and overwrite each other's fixes. `gaius concord` is a local, offline-first coordination
+sidecar (`~/.gaius/concord.db` — one SQLite file, no services) that gives parallel sessions:
+
+- **Advisory claims** — atomic single-winner leases on shared resources
+  (`subsystem:storage`, `node:web-01`, `incident:IC`) with TTL + holder-pid liveness, so a
+  dead session can't squat a lease. Winning a claim retitles the terminal tab
+  (`⚑ storage · session-name`) — ownership visible at a glance. Near-miss naming
+  (`subsystem:db` vs `subsystem:db-migration`) surfaces as an overlap warning.
+- **Findings** — discoveries published to sibling sessions, with an adversarial review
+  loop (`open → reviewing → confirmed/refuted`).
+- **Task pool** — an incident commander seeds divided work once; each new session takes
+  the next task atomically.
+- **Roster** — live sessions read from Claude Code's own session registry, joined with
+  the claims they hold.
+
+```bash
+gaius concord status                                   # one-screen sitrep
+gaius concord claim subsystem:db --note "schema migration"
+gaius concord finding add --summary "replica lag is the root cause" --severity major
+gaius concord task add "verify backups" --resource svc:backup
+gaius concord task take                                # atomic — one winner per task
+```
+
+Claims are **advisory by design**: awareness is automated, action is never taken on a
+peer's behalf — a sibling's message is an observation, not authorization. Hook wiring
+(session-start briefs, per-prompt deltas, warn-on-conflicting-mutation, the kill-switch
+pattern) is documented in [`docs/concord.md`](docs/concord.md). Zero configuration
+required; an optional remote bridge (`gaius concord sync`) federates multiple machines
+against any server implementing the same heartbeat/finding contract.
 
 ---
 
@@ -163,11 +206,12 @@ claude mcp add gaius -- /path/to/gaius/gaius/mcp_server.py
 gaius/
 ├── gaius/
 │   ├── _core.py          # core logic (extraction, search, inject, dedup, decay)
+│   ├── concord.py        # cross-session coordination (claims / findings / task pool)
 │   ├── kg.py             # temporal knowledge-graph commands
 │   ├── parsers.py        # session / domain-file parsers
 │   ├── record.py         # session recorder (OpenAI-compatible endpoints)
 │   ├── telemetry.py      # prompt / injection event logging
-│   ├── mcp_server.py     # MCP server (5 tools)
+│   ├── mcp_server.py     # MCP server (7 tools)
 │   ├── __init__.py       # Public API surface
 │   └── __main__.py       # python -m gaius
 ├── http_adapter.py       # FastAPI REST adapter (optional, for remote access)

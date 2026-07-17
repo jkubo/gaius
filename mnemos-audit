@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# mnemos-audit — weekly deterministic memory-drift backstop.
+# Runs mnemosyne health (size, joined-line, index-gloss, feedback/INDEX completeness).
+# On drift, writes a dated report the next /mnemos session picks up. The SEMANTIC
+# audit (stale-but-well-formed claims) needs an LLM session — run `/mnemos` weekly
+# for that; this cron only catches STRUCTURAL debt automatically.
+set -euo pipefail
+MEM="$HOME/Projects/agent-memory"
+MN="$HOME/.local/bin/mnemosyne"
+[[ -x "$MN" ]] || exit 0
+OUT="$("$MN" health 2>&1 || true)"
+if echo "$OUT" | grep -qE 'over limit|over the [0-9]+KB|joined-line defect|approaching limit|runaway line|INDEX drift|index line\(s\) >'; then
+  TS="$(date +%Y-%m-%d)"
+  REP="$MEM/drafts/mnemos-drift-$TS.md"
+  mkdir -p "$MEM/drafts"
+  { echo "# mnemos deterministic drift — $TS (auto)"; echo; echo '```'; echo "$OUT" | grep -E 'over limit|over the [0-9]+KB|joined-line defect|approaching limit|runaway line|INDEX drift|index line\(s\) >|missing:|ghost:'; echo '```'; echo; echo "Run \`/mnemos\` to reconcile + do the semantic audit."; } > "$REP"
+  echo "mnemos-audit: drift found → $REP"
+else
+  echo "mnemos-audit: clean ($(date +%F))"
+fi

@@ -4,9 +4,14 @@
 
 Not another RAG chatbot memory — a production-grade system that extracts facts from Claude Code, Gemini CLI, Grok, and Codex sessions, ranks them into an inject-ready corpus, enforces behavioral gates, and prevents you from breaking prod at 3am.
 
+> **Why gaius** — three things most agent-memory tools skip:
+> - **Runs unattended** — extract → promote → inject with no human in the hot path; correction is optional.
+> - **Prevents actions, not just recalls them** — hard gates `exit:2` on force-push, unconfirmed live-trade, prod-delete.
+> - **Fully offline** — BM25 + sqlite-vec in one SQLite file. No API keys, no cloud.
+
 ```
 gaius retire      # scan sessions → stage summaries
-gaius batch       # review staged summaries
+gaius batch       # (optional) review + correct — facts inject by default
 gaius inject      # inject context into active session
 ```
 
@@ -17,7 +22,7 @@ gaius inject      # inject context into active session
 Engineers running Claude Code all day generate enormous amounts of institutional knowledge that vanishes when the context window closes. gaius captures it:
 
 1. **Extract** — scans Claude Code (and Gemini CLI) session JSONLs, extracts compact summaries with typed signals (knowledge, patterns, errors)
-2. **Review (optional)** — extracted facts are promoted and inject-eligible by default; review is a *correction* loop, not a gate before entry. `reject` drops a bad fact, `defer` punts it, `confirm` pins a verified one — while decay, dedup, and mnemosyne health checks keep quality up without a human bottleneck.
+2. **Review (optional)** — extracted facts are promoted and inject-eligible by default; review is a *correction* loop, not a gate before entry. `reject` drops a bad fact, `defer` punts it, `agent-review` clears it from the queue without touching its rank, `confirm` pins a verified one — while decay, dedup, and mnemosyne health checks keep quality up without a human bottleneck.
 3. **Index** — promotes extracted facts into a hybrid keyword + semantic SQLite database (`facts.db`)
 4. **Inject** — at task start, retrieves relevant facts and loads skills context into the session
 5. **Coordinate** — cross-session claims, shared findings, and a claimable task pool (`gaius concord`) so parallel sessions on one machine divide work instead of colliding
@@ -141,6 +146,8 @@ gaius retire
 
 # Review staged summaries (optional — extracted facts already inject by default).
 # Read each and, if you want, promote highlights into your domain/*.md files.
+# Worth the loop for high-stakes domains (trading, prod ops) where a wrong fact is
+# costly; skip it for low-stakes notes and let decay + dedup self-correct.
 gaius batch          # print all unreviewed in sequence
 gaius next           # print one at a time
 gaius done <uuid>    # mark a staged summary reviewed (queue hygiene, not an inject gate)
@@ -167,6 +174,8 @@ claude mcp add gaius -- /path/to/gaius/gaius/mcp_server.py
 ---
 
 ## Cross-Session Coordination (concord)
+
+**When to use:** more than one agent (or human + agent) on the same repo or incident at once — parallel sessions, a multi-responder incident, or a fan-out whose subtasks must not collide. Single-session work doesn't need it.
 
 Run five Claude Code sessions against one repo and they will re-derive the same diagnosis
 and overwrite each other's fixes. `gaius concord` is a local, offline-first coordination
@@ -279,6 +288,7 @@ See `presets/k8s.yaml` for a full annotated example.
 | `gaius batch` | Print all unreviewed summaries in sequence |
 | `gaius done <uuid>` | Mark summary as reviewed |
 | `gaius confirm` / `reject` / `defer <fact-id>` | Review-loop verdict on a pending fact (confirm → human/confidence=1.0; reject → excluded from inject; defer → re-surface in 7 days) |
+| `gaius agent-review <fact-id>` | Mark a pending fact machine-reviewed — queue hygiene only; weighted ≤ auto, never boosts inject rank |
 | `gaius rescan <uuid>` | Force re-extraction of a specific staged session |
 | `gaius show` | List all staged summaries |
 | `gaius stats` | Extraction and corpus statistics |

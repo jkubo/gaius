@@ -170,8 +170,8 @@ with open(session_path, "a") as f:
 
 1. **Retire** (`gaius retire --format vllm`): Scans session files, deduplicates against processed sessions table, extracts signal using scoring pipeline
 2. **Stage**: High-signal turns become staged entries in the review queue
-3. **Review**: `gaius next` / `gaius batch` for human review
-4. **Promote**: `gaius done <id>` marks entries as reviewed → eligible for inject
+3. **Review** (optional): `gaius next` / `gaius batch` surface staged summaries for human review; `reject`/`defer`/`confirm` correct the corpus, but review is not required for a fact to inject
+4. **Promote**: extracted facts are inject-eligible by default. `gaius done <id>` marks the staged summary reviewed (queue hygiene) — it is not a precondition for inject
 
 Cross-model corroboration: if both a Claude session and a vLLM session confirm the same fact (matched by entity + semantic similarity), the fact gets a 1.5x score boost.
 

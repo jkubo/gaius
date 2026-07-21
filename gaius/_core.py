@@ -5156,12 +5156,64 @@ def cmd_init(args):
     print(f"  gaius retire              # scan sessions → stage summaries")
     print(f"  gaius stats               # show corpus statistics")
     print(f"  gaius batch               # review staged summaries")
+    print(f"  gaius scaffold-skill      # have your agent build a memory-maintenance skill for this system")
     print()
     if backend == "claude":
         print("To add the MCP server to Claude Code:")
         print("  claude mcp add gaius -- python3 -m gaius.mcp_server")
         print()
     print(f"Edit {config_path} to customize entity patterns and principal mappings.")
+
+
+def cmd_scaffold_skill(args):
+    """Emit a generation prompt so the user's OWN coding agent authors + installs a
+    memory-maintenance ('surgeon') skill localized to this machine's gaius setup.
+
+    Unlike `gaius init` (which copies a static SKILL.md), this hands the agent a
+    self-localizing scaffold: the agent discovers local paths/thresholds/conventions and
+    writes a concrete skill for THIS system. Nothing machine-specific is shipped — the
+    template is generic; localization happens locally, in the user's own agent.
+    """
+    parser = argparse.ArgumentParser(prog="gaius scaffold-skill")
+    parser.add_argument("name", nargs="?", default="mnemos",
+                        help="Skill to scaffold (default: mnemos)")
+    parser.add_argument("--write", metavar="PATH",
+                        help="Write the prompt to PATH instead of stdout")
+    parsed = parser.parse_args(args)
+
+    # skill/<name>-scaffold.md lives at the repo root (like presets/ and skill/SKILL.md)
+    _script_dir = Path(__file__).parent.parent  # gaius package root
+    tmpl = _script_dir / "skill" / f"{parsed.name}-scaffold.md"
+    if not tmpl.exists():
+        tmpl = Path(__file__).parent.parent.parent / "skill" / f"{parsed.name}-scaffold.md"
+    if not tmpl.exists():
+        print(f"ERROR: no scaffold template for '{parsed.name}' "
+              f"(looked for {parsed.name}-scaffold.md)")
+        skill_dir = _script_dir / "skill"
+        avail = sorted(p.name[:-len("-scaffold.md")]
+                       for p in skill_dir.glob("*-scaffold.md")) if skill_dir.exists() else []
+        if avail:
+            print(f"Available: {', '.join(avail)}")
+        return
+
+    prompt = tmpl.read_text()
+
+    # Warm-start hint: prepend the detected backend + domain dir so the agent starts grounded.
+    backend = _gaius_cfg.get("backend", "claude")
+    domain_dir = _gaius_cfg.get("domain_dir", "~/.gaius/memory/domain")
+    header = (f"<!-- gaius scaffold-skill: {parsed.name} | detected backend={backend} "
+              f"domain_dir={domain_dir} -->\n\n")
+    out = header + prompt
+
+    if parsed.write:
+        dest = Path(parsed.write).expanduser()
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(out)
+        print(f"✓  Scaffold prompt written to {dest}")
+        print(f"   Feed it to your coding agent (backend={backend}) to generate + "
+              f"install the '{parsed.name}' skill for this system.")
+    else:
+        sys.stdout.write(out)
 
 
 def volatility_recency(prov_key: str, fact_type: str, age_days: float, rate: float) -> float:
@@ -6435,6 +6487,7 @@ compdef _gaius gaius
 
 COMMANDS = {
     "init":       cmd_init,
+    "scaffold-skill": cmd_scaffold_skill,
     "retire":     cmd_retire,
     "s3-retire":  cmd_s3_retire,
     "harvest":    cmd_harvest,

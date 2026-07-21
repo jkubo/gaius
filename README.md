@@ -2,7 +2,7 @@
 
 **Ops memory lifecycle manager for AI coding agents.**
 
-Not another RAG chatbot memory — a production-grade system that extracts facts from Claude Code, Gemini CLI, Grok, and Codex sessions, routes them through human review, enforces behavioral gates, and prevents you from breaking prod at 3am.
+Not another RAG chatbot memory — a production-grade system that extracts facts from Claude Code, Gemini CLI, Grok, and Codex sessions, ranks them into an inject-ready corpus, enforces behavioral gates, and prevents you from breaking prod at 3am.
 
 ```
 gaius retire      # scan sessions → stage summaries
@@ -17,8 +17,8 @@ gaius inject      # inject context into active session
 Engineers running Claude Code all day generate enormous amounts of institutional knowledge that vanishes when the context window closes. gaius captures it:
 
 1. **Extract** — scans Claude Code (and Gemini CLI) session JSONLs, extracts compact summaries with typed signals (knowledge, patterns, errors)
-2. **Review** — queues summaries for human review before promoting facts. Bad facts don't silently enter the corpus.
-3. **Index** — promotes reviewed facts into a hybrid keyword + semantic SQLite database (`facts.db`)
+2. **Review (optional)** — extracted facts are promoted and inject-eligible by default; review is a *correction* loop, not a gate before entry. `reject` drops a bad fact, `defer` punts it, `confirm` pins a verified one — while decay, dedup, and mnemosyne health checks keep quality up without a human bottleneck.
+3. **Index** — promotes extracted facts into a hybrid keyword + semantic SQLite database (`facts.db`)
 4. **Inject** — at task start, retrieves relevant facts and loads skills context into the session
 5. **Coordinate** — cross-session claims, shared findings, and a claimable task pool (`gaius concord`) so parallel sessions on one machine divide work instead of colliding
 
@@ -88,7 +88,7 @@ recovers the recall naive whole-session embedding loses to the 256-token cap: ch
 
 | Feature | Description |
 |---------|-------------|
-| **Human review gate** | `retire → stage → review → promote`. Bad facts can't silently enter the corpus. |
+| **Review & correction loop** | `retire → stage → promote` runs unattended and facts inject by default; `reject`/`defer`/`confirm` plus decay, dedup, and mnemosyne health let you *correct* the corpus without a human in the hot path. |
 | **Multi-agent corroboration** | Facts confirmed by multiple AI agents (Claude + Gemini) get a 1.5× score boost. Cross-model verification for higher confidence. |
 | **Session-type behavioral priming** | Load different skill sets based on what you're doing: ops, trading, security, code review. |
 | **Hard enforcement gates** | Memory that *prevents actions*. `exit:2` blocks force-push, live trading without confirmation, critical resource deletion. |
@@ -139,10 +139,11 @@ $EDITOR ~/.gaius/config.yaml
 # (~/.codex/sessions) when those CLI dirs exist; `--format <name>` scopes to one.
 gaius retire
 
-# Review staged summaries (read each, promote facts manually to domain/*.md)
+# Review staged summaries (optional — extracted facts already inject by default).
+# Read each and, if you want, promote highlights into your domain/*.md files.
 gaius batch          # print all unreviewed in sequence
 gaius next           # print one at a time
-gaius done <uuid>    # mark reviewed after reading
+gaius done <uuid>    # mark a staged summary reviewed (queue hygiene, not an inject gate)
 
 # Check corpus stats
 gaius stats

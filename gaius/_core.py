@@ -6250,9 +6250,109 @@ from gaius.landscape import (  # noqa: E402,F401  re-export (landscape split 202
     cmd_inject, cmd_landscape,
 )
 
+from gaius.recentstate import (  # noqa: E402,F401  re-export (Recent State auto-roll 2026-07-21)
+    cmd_recent_roll, roll_recent_state, should_evict,
+)
+
 from gaius.concord import (  # noqa: E402,F401  re-export (cross-session coordination, 2026-07-17 — OSS-included)
     cmd_concord, init_concord,
 )
+
+
+def cmd_completion(args):
+    """Emit a shell completion script for gaius to stdout.
+
+    Completes the top-level command names (generated from the live COMMANDS
+    registry, so OSS/publish-stripped builds get the right subset automatically)
+    and the global flags. Pure and offline: no DB access, no session scanning.
+
+    Install:
+      gaius completion bash >> ~/.bashrc
+      gaius completion zsh  >> ~/.zshrc
+      gaius completion fish >  ~/.config/fish/completions/gaius.fish
+    """
+    parser = argparse.ArgumentParser(
+        prog="gaius completion",
+        description="Print a shell completion script to stdout.",
+        epilog=(
+            "Install:\n"
+            "  gaius completion bash >> ~/.bashrc\n"
+            "  gaius completion zsh  >> ~/.zshrc\n"
+            "  gaius completion fish >  ~/.config/fish/completions/gaius.fish"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "shell", choices=["bash", "zsh", "fish"],
+        help="Shell to emit completion for (bash, zsh, or fish)",
+    )
+    parsed = parser.parse_args(args)
+
+    # Command list tracks the live registry (auto-reflects OSS-stripped subsets).
+    cmd_words = " ".join(sorted(COMMANDS.keys()))
+    fmt_words = " ".join(sorted(SUPPORTED_FORMATS))
+    global_flags_meta = [
+        ("--sessions-dir", "Override session JSONL directory"),
+        ("--staging-dir", "Override staging output directory"),
+        ("--extra-sessions-dir", "Additional session JSONL directory to scan"),
+        ("--format", "Session format"),
+    ]
+    global_flags = " ".join(flag for flag, _ in global_flags_meta)
+
+    if parsed.shell == "bash":
+        script = f'''# gaius bash completion
+# Install: gaius completion bash >> ~/.bashrc
+_gaius_complete() {{
+    local cur cmds globals
+    cur="${{COMP_WORDS[COMP_CWORD]}}"
+    cmds="{cmd_words}"
+    globals="{global_flags}"
+    COMPREPLY=( $(compgen -W "${{cmds}} ${{globals}}" -- "${{cur}}") )
+}}
+complete -F _gaius_complete gaius
+'''
+        sys.stdout.write(script)
+        return
+
+    if parsed.shell == "zsh":
+        script = r'''#compdef gaius
+# gaius zsh completion
+# Install: gaius completion zsh >> ~/.zshrc  (or drop on a dir in $fpath)
+_gaius() {
+    local -a _gaius_commands _gaius_globals
+    _gaius_commands=(__CMDS__)
+    _gaius_globals=(
+        '--sessions-dir[Override session JSONL directory]:dir:_files -/'
+        '--staging-dir[Override staging output directory]:dir:_files -/'
+        '--extra-sessions-dir[Additional session JSONL directory to scan]:dir:_files -/'
+        '--format[Session format]:format:(__FMTS__)'
+    )
+    _arguments -C \
+        "${_gaius_globals[@]}" \
+        '1:command:->command' \
+        '*::args:->args'
+    case "$state" in
+        command) _describe -t commands 'gaius command' _gaius_commands ;;
+    esac
+}
+compdef _gaius gaius
+'''
+        script = script.replace("__CMDS__", cmd_words).replace("__FMTS__", fmt_words)
+        sys.stdout.write(script)
+        return
+
+    if parsed.shell == "fish":
+        lines = [
+            "# gaius fish completion",
+            "# Install: gaius completion fish > ~/.config/fish/completions/gaius.fish",
+            "complete -c gaius -f",
+            f"complete -c gaius -n '__fish_use_subcommand' -a '{cmd_words}' -d 'gaius command'",
+        ]
+        for flag, desc in global_flags_meta:
+            lines.append(f"complete -c gaius -l {flag.lstrip('-')} -d '{desc}'")
+        sys.stdout.write("\n".join(lines) + "\n")
+        return
+
 
 COMMANDS = {
     "init":       cmd_init,
@@ -6287,6 +6387,7 @@ COMMANDS = {
     "skills":          cmd_skills,
     "commands":        cmd_commands,
     "landscape":       cmd_landscape,
+    "recent-roll":     cmd_recent_roll,
     "embed":           cmd_embed,
     "kg":              cmd_kg,
     "decay":           cmd_decay,
@@ -6300,6 +6401,7 @@ COMMANDS = {
     "route-suggest":   cmd_route_suggest,
     "reconcile":       cmd_reconcile,
     "concord":         cmd_concord,
+    "completion":      cmd_completion,
 }
 
 SUPPORTED_FORMATS = {"claude", "gemini", "ollama", "vllm", "pentagi", "grok", "codex"}
@@ -6370,6 +6472,12 @@ def main():
     elif os.environ.get("GAIUS_EXTRA_SESSIONS_DIR"):
         EXTRA_SESSIONS_DIR = Path(os.environ["GAIUS_EXTRA_SESSIONS_DIR"])
     # else: keep EXTRA_SESSIONS_DIR as None (not set)
+
+    # `completion` emits a static script from the in-memory COMMANDS registry —
+    # no DB or session scan needed. Skip init_db() to keep it fast/side-effect-free.
+    if command == "completion":
+        COMMANDS[command](cmd_argv)
+        return
 
     # Ensure facts.db is initialized on every run
     init_db()

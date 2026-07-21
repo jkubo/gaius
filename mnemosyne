@@ -177,6 +177,39 @@ def scan_index_gloss(path: Path, threshold: int = INDEX_GLOSS_WARN):
     return fat
 
 
+# A fat bullet under '## Recent State' is a fact that outgrew the changelog: it
+# should be homed in a project/domain file with a pointer left behind (or rolled
+# to archive/ by `gaius recent-roll`). Separate from scan_index_gloss on purpose —
+# that one is scoped to '## Project Files' and must NOT widen to Recent State.
+RECENT_STATE_HEADER = "## Recent State"
+RECENT_STATE_BULLET_WARN = 600   # non-link gloss bytes on one Recent-State bullet over this = accretion
+
+
+def scan_recent_state_bullets(path: Path, threshold: int = RECENT_STATE_BULLET_WARN):
+    """Bullets under the '## Recent State' H2 carrying > `threshold` bytes of
+    non-link gloss (link tokens stripped, mirroring scan_index_gloss). Returns
+    [(lineno, gloss_bytes, total_bytes, preview)] heaviest-first. Advisory only —
+    never blocks (Recent State is a changelog; the fix is to home the fact)."""
+    fat = []
+    in_section = False
+    try:
+        for i, raw in enumerate(path.open(), 1):
+            line = raw.rstrip("\n")
+            if line.startswith(RECENT_STATE_HEADER):
+                in_section = True
+                continue
+            if in_section and line.startswith("## "):
+                break  # next H2 ends the Recent State section
+            if in_section and line.lstrip().startswith(("-", "*")):
+                gloss = len(_LINK_TOKEN.sub("", line))
+                if gloss > threshold:
+                    fat.append((i, gloss, len(line), line.lstrip()[:50]))
+    except Exception:
+        pass
+    fat.sort(key=lambda t: -t[1])
+    return fat
+
+
 def heaviest_lines(path: Path, n: int = 5):
     """The n longest lines in a file (targeting aid when over byte budget):
     [(lineno, length, preview)] heaviest-first."""
@@ -306,6 +339,7 @@ def cmd_health(memory_dir: Path, args: list):
     reds    = [r for r in files if r[1] >= r[3]]
     yellows = [r for r in files if r[2] <= r[1] < r[3]]
     mem_gloss = scan_index_gloss(_mem) if _mem.exists() else []
+    rs_gloss = scan_recent_state_bullets(_mem) if _mem.exists() else []
     idx_incomplete = scan_index_completeness(memory_dir)
     if reds:
         print(f"{RED}{BOLD}⚠  {len(reds)} file(s) over limit:{RESET} "
@@ -330,6 +364,12 @@ def cmd_health(memory_dir: Path, args: list):
               f"keep the index a terse hook):{RESET}")
         for lineno, gloss, total, preview in mem_gloss:
             print(f"   MEMORY.md:{lineno}  {gloss}B gloss / {total}B line  {preview}…")
+    if rs_gloss:
+        print(f"{YELLOW}⚡  {len(rs_gloss)} Recent State bullet(s) >{RECENT_STATE_BULLET_WARN}B "
+              f"non-link gloss (a fact outgrew the changelog — home it in a project/domain "
+              f"file + leave a pointer, or `gaius recent-roll` evicts it once done):{RESET}")
+        for lineno, gloss, total, preview in rs_gloss:
+            print(f"   MEMORY.md:{lineno}  {gloss}B gloss / {total}B line  {preview}…")
     if idx_incomplete:
         miss = [k for k, knd in idx_incomplete if knd == "missing"]
         ghost = [k for k, knd in idx_incomplete if knd == "ghost"]
@@ -350,7 +390,7 @@ def cmd_health(memory_dir: Path, args: list):
             print(f"     MEMORY.md:{lineno}  {length}B  {preview}…")
     if (not reds and not yellows and not joined and not longish
             and not byte_red and not byte_yellow and not mem_gloss
-            and not idx_incomplete):
+            and not rs_gloss and not idx_incomplete):
         print(f"{GREEN}✓  All files within threshold.{RESET}")
     print()
 

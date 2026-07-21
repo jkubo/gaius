@@ -277,6 +277,8 @@ See `presets/k8s.yaml` for a full annotated example.
 | `gaius next` | Print oldest unreviewed summary |
 | `gaius batch` | Print all unreviewed summaries in sequence |
 | `gaius done <uuid>` | Mark summary as reviewed |
+| `gaius confirm` / `reject` / `defer <fact-id>` | Review-loop verdict on a pending fact (confirm → human/confidence=1.0; reject → excluded from inject; defer → re-surface in 7 days) |
+| `gaius rescan <uuid>` | Force re-extraction of a specific staged session |
 | `gaius show` | List all staged summaries |
 | `gaius stats` | Extraction and corpus statistics |
 | `gaius inject` | Inject ranked corpus + skills into active session |
@@ -287,6 +289,13 @@ See `presets/k8s.yaml` for a full annotated example.
 | `gaius index` | Rebuild memory index |
 | `gaius landscape` | Show memory system landscape |
 | `gaius skills` | List available skills with scores |
+| `gaius concord <sub>` | Cross-session coordination — claims / findings / task pool (see below) |
+| `gaius recent-roll` | Evict aged, done, pointered `## Recent State` bullets from MEMORY.md into a non-injected archive changelog |
+| `gaius reconcile` | Promote curated repo-doc facts into the corpus (flagged-unverified, insert-once) + dev↔mirror divergence sentinel |
+| `gaius drift` | Check canonical cluster facts for cross-agent drift against a registry |
+| `gaius decay` | Apply time-based score decay to all facts |
+
+> This table is a highlights subset — run `gaius --help` for the full command list.
 
 ---
 

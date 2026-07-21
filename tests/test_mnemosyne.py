@@ -255,6 +255,52 @@ class TestIndexGlossAccretion:
         assert "\033[31m\033[1mRED\033[0m" not in capsys.readouterr().out
 
 
+class TestRecentStateAdvisory:
+    """scan_recent_state_bullets — flags a fact that outgrew the ## Recent State
+    changelog. Separate from scan_index_gloss (which is '## Project Files'-scoped
+    and must stay so). Advisory only: YELLOW, never the blocking RED token."""
+
+    FAT = "- **X**: " + "verbose resolved status detail from a session note " * 16
+    TERSE = "- **Y**: [home](project/p.md) — shipped 07-19."
+
+    def _doc(self, *recent_lines, project=None):
+        body = "# MEMORY\n\n"
+        if project:
+            body += "## Project Files\n\n" + project + "\n\n"
+        body += "## Recent State (2026-07-20)\n\n" + "\n".join(recent_lines) + "\n"
+        return body
+
+    def test_fat_recent_bullet_flagged(self, tmp_path):
+        p = tmp_path / "MEMORY.md"
+        p.write_text(self._doc(self.FAT))
+        hits = mn.scan_recent_state_bullets(p)
+        assert len(hits) == 1
+        assert hits[0][1] > mn.RECENT_STATE_BULLET_WARN
+
+    def test_terse_recent_bullet_passes(self, tmp_path):
+        p = tmp_path / "MEMORY.md"
+        p.write_text(self._doc(self.TERSE))
+        assert mn.scan_recent_state_bullets(p) == []
+
+    def test_index_gloss_does_not_scan_recent_state(self, tmp_path):
+        # the FAT bullet lives ONLY in Recent State — scan_index_gloss must ignore it
+        p = tmp_path / "MEMORY.md"
+        p.write_text(self._doc(self.FAT, project="- **P**: [x](project/p.md) terse"))
+        assert mn.scan_index_gloss(p) == []
+
+    def test_cmd_health_surfaces_recent_state_accretion(self, tmp_path, capsys):
+        (tmp_path / "MEMORY.md").write_text(self._doc(self.FAT))
+        mn.cmd_health(tmp_path, [])
+        out = capsys.readouterr().out
+        assert "Recent State bullet" in out
+        assert "within threshold" not in out
+
+    def test_recent_state_advisory_is_not_a_blocking_red_token(self, tmp_path, capsys):
+        (tmp_path / "MEMORY.md").write_text(self._doc(self.FAT))
+        mn.cmd_health(tmp_path, [])
+        assert "\033[31m\033[1mRED\033[0m" not in capsys.readouterr().out
+
+
 class TestHeaviestLines:
     def test_returns_longest_first(self, tmp_path):
         p = tmp_path / "x.md"

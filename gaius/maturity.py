@@ -68,6 +68,29 @@ SOURCE_RELIABILITY = {
     "domain":     1.2,   # curated domain/*.md files
 }
 
+# Review-state → inject-rank multiplier (registry; the canonical source consumed by
+# the landscape ranker's review-state penalty). The human review verb is empirically
+# DEAD (1 of ~17,637 injectable facts ever human-confirmed, verified 2026-07-21), so
+# review_state is a QUALITY signal, not a human gate:
+#   auto            1.0  — de-facto default injectable tier
+#   confirmed       1.0  — human-confirmed (rare); no extra inject boost (removal verb is 'reject')
+#   pending         0.6  — low-confidence / contradiction-flagged at ingest; still injects, demoted
+#   deferred        0.6  — reviewer punted; MUST keep the penalty (punting must not REWARD a shaky fact)
+#   agent-reviewed  0.6  — machine-drained from the pending queue by the mnemos surgeon.
+#       Weighted ≤ auto and NEVER above pending: an LLM with a completion incentive and no
+#       live-state access would rubber-stamp contradiction-flagged facts upward, so until
+#       outcome-grounding lands, agent-review is queue-hygiene + reject only — never a rank boost.
+# Any state absent here (or NULL) ranks at 1.0 (unpenalized), so this table is additive:
+# no fact carries review_state='agent-reviewed' until the opt-in `gaius agent-review` verb
+# sets it, so the new row is INERT on today's corpus (default-off by construction).
+REVIEW_STATE_WEIGHT = {
+    "auto":           1.0,
+    "confirmed":      1.0,
+    "pending":        0.6,
+    "deferred":       0.6,
+    "agent-reviewed": 0.6,
+}
+
 
 def _maturity_score(facts: list[dict], decay_rate: float = 0.005) -> float:
     """Compute a [0,1] maturity score for a list of fact rows.

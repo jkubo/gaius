@@ -30,6 +30,7 @@ from gaius._core import (
     extract_quoted_phrases, quoted_phrase_boost, infra_entity_boost, decay_factor,
     SECTION_HEADERS, _EMBED_DIM, BOOTSTRAP_THRESHOLD, INJECT_MIN_PRIORITY,
     CROSS_AGENT_MULTIPLIER, HAS_SQLITE_VEC, SOP_DIR, MEMORY_DIR, DOMAIN_DIR,
+    REVIEW_STATE_WEIGHT,
 )
 
 
@@ -148,6 +149,24 @@ def cmd_landscape(args):
         print(result)
     else:
         print(f"[landscape] No landscape block found for domain: {parsed.domain}", file=sys.stderr)
+
+
+def apply_confirmation_boost_cap(score: float, rep_boost: float, cap) -> float:
+    """Item 3: bound the repetition-derived confirmation boost (flag-gated, DEFAULT-OFF).
+
+    ``rep_boost`` is the product of the confirmation-derived multipliers already folded into
+    ``score`` — the stored_q boost (from the confirmation_count-fed ``score`` column) and the
+    cross-agent bonus. When ``cap`` is None the score is returned UNCHANGED (default-off →
+    byte-identical). Otherwise the cap is floored at 1.0 (a *boost* cap must never penalize an
+    unboosted fact) and the score is scaled back so the net repetition boost cannot exceed the
+    cap — stopping a confidently-worded FALSE fact from climbing rank purely by re-extraction.
+    """
+    if cap is None or rep_boost <= 1.0:
+        return score
+    eff_cap = max(1.0, cap)
+    if rep_boost > eff_cap:
+        return score * (eff_cap / rep_boost)
+    return score
 
 
 def cmd_inject(args):
@@ -642,9 +661,28 @@ def cmd_inject(args):
             except Exception:
                 pass  # fall back to keyword-only score
 
+    # Item 3 (flag-gated, DEFAULT-OFF): cap the repetition-derived confirmation boost.
+    # confirmation_count feeds the stored `score` column (surfaced here as score_override →
+    # the stored_q boost) AND the cross-agent bonus stacks another CROSS_AGENT_MULTIPLIER.
+    # A confidently-worded but FALSE fact must not climb inject-rank purely by being
+    # re-extracted N times. Set GAIUS_CONFIRMATION_BOOST_CAP=<float> (e.g. 1.2) to bound the
+    # PRODUCT of those two repetition-derived multipliers. Unset/blank/invalid = no cap =
+    # byte-identical to prior behavior (the rep_boost accumulator below is then dead code).
+    _conf_boost_cap = None
+    _cbc_raw = os.environ.get("GAIUS_CONFIRMATION_BOOST_CAP")
+    if _cbc_raw:
+        try:
+            _conf_boost_cap = float(_cbc_raw)
+        except ValueError:
+            _conf_boost_cap = None  # misconfig → treat as disabled, never crash inject
+
     scored_entries = []
     for entry in entries:
         score = compute_entry_tfidf_score(entry, doc_freq, total_docs)
+        # Repetition-derived boost accumulator (item 3). Multiplied into ONLY by the
+        # stored_q (confirmation-derived score) and cross-agent bonuses below; stays 1.0
+        # otherwise. Never touches `score` unless the cap flag is set (proven default-off).
+        rep_boost = 1.0
 
         # BM25 boost — when --task given, add relevance score (normalized to same scale)
         if task_terms:
@@ -705,13 +743,21 @@ def cmd_inject(args):
             #   findings 0.5+, procedures 0.4+, security 0.4, operational 0.3
             stored_q = entry.get("score_override", 0)
             if stored_q and stored_q > 0.35:
-                score *= (0.8 + 0.4 * stored_q)  # 0.4→0.96x, 0.7→1.08x, 1.0→1.2x
+                _sq_boost = (0.8 + 0.4 * stored_q)  # 0.4→0.96x, 0.7→1.08x, 1.0→1.2x
+                score *= _sq_boost
+                rep_boost *= _sq_boost  # confirmation-derived (item 3 cap tracks it)
 
-            # Pending review = low-confidence or contradiction-flagged at ingest.
-            # They stay injectable (most will never be human-reviewed) but must
-            # not outrank clean facts.
-            if entry.get("review_state") == "pending":
-                score *= 0.6
+            # Review-state weighting — registry: gaius.maturity.REVIEW_STATE_WEIGHT.
+            # pending / deferred / agent-reviewed all demote 0.6x and stay injectable
+            # (most facts are never human-reviewed — that verb is empirically dead, 1 of
+            # 17,637 ever confirmed, verified 07-21). DEFER and AGENT-REVIEW must NOT strip
+            # the penalty (punting/auto-reviewing a shaky pending fact must not REWARD it —
+            # same footgun class); agent-reviewed is weighted ≤ auto and never above pending,
+            # so machine review is queue-hygiene only, never a rank boost. auto/confirmed/
+            # NULL → weight 1.0 (guarded: no `*= 1.0`, so byte-identical for those states).
+            rs_weight = REVIEW_STATE_WEIGHT.get(entry.get("review_state"), 1.0)
+            if rs_weight != 1.0:
+                score *= rs_weight
 
             # Skill-aware domain boost — when active skill/domain detected from task,
             # boost facts in matching domains (2x) to surface relevant context
@@ -729,6 +775,13 @@ def cmd_inject(args):
             sources_for_hash.add(agent_source)
             if len(sources_for_hash) >= 2:
                 score *= CROSS_AGENT_MULTIPLIER
+                rep_boost *= CROSS_AGENT_MULTIPLIER  # confirmation-derived (item 3 cap)
+
+        # Item 3: bound the repetition-derived boost (flag-gated, default-off).
+        # When GAIUS_CONFIRMATION_BOOST_CAP is unset, this is a no-op returning `score`
+        # unchanged (byte-identical); when set, it scales `score` back so the net
+        # confirmation/repetition boost cannot exceed the cap.
+        score = apply_confirmation_boost_cap(score, rep_boost, _conf_boost_cap)
 
         # Build text for injection
         text_parts = []

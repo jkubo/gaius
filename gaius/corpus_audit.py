@@ -9,6 +9,7 @@ at top; _core re-imports this module's public symbols before the COMMANDS dict.
 """
 import argparse
 import json
+import os
 import re
 import sqlite3
 from collections import Counter
@@ -17,12 +18,19 @@ from collections import Counter
 from gaius._core import DB_PATH, route_domains
 
 
-# READ-ONLY. Surfaces the risk the operator named: facts corroborated by REPETITION but never
-# outcome- or human-verified, plus contradiction clusters (same fact_key, divergent live facts).
-# This is the shadow half of outcome-grounding — it MUTATES NOTHING. Enforcement (demote/
-# tombstone) is a later, operator-gated step once the retrieval->outcome linkage exists.
+# READ-ONLY BY DEFAULT. Surfaces the risk the operator named: facts corroborated by REPETITION
+# but never outcome- or human-verified, plus contradiction clusters (same fact_key, divergent
+# live facts). This is the shadow half of outcome-grounding. The default audit MUTATES NOTHING;
+# a DEMOTE-ONLY enforcement pass (reclassify review_state 'auto'→'pending', reversible) is
+# available ONLY behind the CORPUS_AUDIT_ENFORCE gate (see enforce_demote / cmd_corpus_audit).
 
 REPETITION_THRESHOLD = 2  # confirmation_count at/above which a fact is "rewarded by repetition"
+
+# Contradiction-cluster enforcement bar — strictly HIGHER than REPETITION_THRESHOLD (2): a
+# contradiction cluster (same fact_key, >1 live rows) is only enforced when some member is
+# reinforced (confirmation_count >= this). Avoids churning one-off divergences; only demotes
+# losers inside conflicts that have actually been repeated.
+CONTRADICTION_ENFORCE_MIN_CC = 3
 
 
 def repetition_candidates(conn: sqlite3.Connection, limit: int = 20) -> list:
@@ -36,6 +44,69 @@ def repetition_candidates(conn: sqlite3.Connection, limit: int = 20) -> list:
         (REPETITION_THRESHOLD, limit)).fetchall()
     return [{"id": r[0], "domain": r[1], "confirmation_count": r[2], "score": r[3], "text": r[4]}
             for r in rows]
+
+
+def enforce_demote(conn: sqlite3.Connection,
+                   contradiction_min_cc: int = CONTRADICTION_ENFORCE_MIN_CC) -> dict:
+    """DEMOTE-ONLY enforcement — the machine substitute for the dead human review verb.
+
+    Reclassifies FLAGGED facts review_state 'auto' → 'pending' so the ranker's 0.6x pending
+    penalty demotes them at inject time. This is the only lever that actually works: the
+    `score` column feeds the ranker as a BOOST (only when > 0.35) and cannot demote, so a
+    low-score write is inert; reclassifying to 'pending' reuses the real demote path.
+
+    Guarantees (see HARD CONSTRAINTS in the confidence-review spec):
+      • DEMOTE-ONLY — never tombstones, never DELETEs.
+      • Touches ONLY review_state — confidence_source is left untouched, so the
+        'human' trust anchor (corpus_audit's `!= 'human'`) is never machine-forged.
+      • Reversible — an operator flips review_state back to 'auto' to undo.
+      • Idempotent — only 'auto' rows are eligible, so re-runs are no-ops.
+
+    Requires a WRITABLE conn; callers gate this behind CORPUS_AUDIT_ENFORCE (default-off).
+    Returns {"repetition_demoted": N, "contradiction_demoted": M}.
+    """
+    # Tier 1 — repetition-only: corroborated by repeats, never outcome/human-verified.
+    # Same predicate as repetition_candidates(), restricted to still-'auto' rows (idempotent,
+    # demote-only). One set-based UPDATE.
+    rep = conn.execute(
+        "UPDATE facts SET review_state='pending' "
+        "WHERE tombstoned_at IS NULL AND review_state='auto' "
+        "AND confirmation_count >= ? AND outcome IS NULL "
+        "AND (confidence_source IS NULL OR confidence_source != 'human')",
+        (REPETITION_THRESHOLD,))
+    rep_n = rep.rowcount if rep.rowcount and rep.rowcount > 0 else 0
+
+    # Tier 2 — contradiction-cluster losers, behind the strictly HIGHER confirmation bar.
+    # For each fact_key with >1 live rows where some member is reinforced
+    # (confirmation_count >= contradiction_min_cc), keep the single most-trustworthy row and
+    # demote the REST that are still 'auto' and not human/outcome-verified. Uncommitted Tier-1
+    # updates are visible on this same conn, so a loser already demoted above shows as
+    # 'pending' here and is not double-counted.
+    cont_n = 0
+    keys = conn.execute(
+        "SELECT fact_key FROM facts WHERE tombstoned_at IS NULL "
+        "GROUP BY fact_key HAVING COUNT(*) > 1 AND MAX(confirmation_count) >= ?",
+        (contradiction_min_cc,)).fetchall()
+
+    def _verified(outcome, csrc):
+        return csrc == "human" or (outcome is not None and outcome != "rejected")
+
+    for (fact_key,) in keys:
+        rows = conn.execute(
+            "SELECT id, review_state, confirmation_count, COALESCE(score,0), outcome, confidence_source "
+            "FROM facts WHERE fact_key = ? AND tombstoned_at IS NULL",
+            (fact_key,)).fetchall()
+        # Winner = most trustworthy, never demoted: verified first, then highest
+        # confirmation_count, then score, then newest id.
+        winner = max(rows, key=lambda r: (1 if _verified(r[4], r[5]) else 0, r[2], r[3], r[0]))
+        for _id, _rs, _cc, _s, _out, _cs in rows:
+            if _id == winner[0] or _rs != "auto" or _verified(_out, _cs):
+                continue
+            conn.execute("UPDATE facts SET review_state='pending' WHERE id=?", (_id,))
+            cont_n += 1
+
+    conn.commit()
+    return {"repetition_demoted": rep_n, "contradiction_demoted": cont_n}
 
 
 def corpus_audit_stats(conn: sqlite3.Connection) -> dict:
@@ -81,20 +152,35 @@ def corpus_audit_stats(conn: sqlite3.Connection) -> dict:
 
 
 def cmd_corpus_audit(args):
-    """Read-only corpus integrity / self-poison shadow audit (Phase 2 — mutates nothing).
+    """Corpus integrity / self-poison audit — READ-ONLY by default (Phase 2, mutates nothing).
 
     Surfaces facts rewarded by repetition but never outcome/human-verified, contradiction
-    clusters, and (with --candidates N) the prune candidates an operator-gated enforcement pass
-    would demote. Usage: gaius corpus-audit [--json] [--samples N] [--candidates N]
+    clusters, and (with --candidates N) the prune candidates an enforcement pass would demote.
+    With --enforce (or env CORPUS_AUDIT_ENFORCE) it also runs a DEMOTE-ONLY pass that
+    reclassifies flagged 'auto' facts → 'pending' (reversible; confidence_source untouched).
+    Usage: gaius corpus-audit [--json] [--samples N] [--candidates N] [--enforce]
     """
     p = argparse.ArgumentParser(prog="gaius corpus-audit")
     p.add_argument("--json", action="store_true")
     p.add_argument("--samples", type=int, default=5)
     p.add_argument("--candidates", type=int, default=0,
                    help="list the top-N repetition-only prune candidates (read-only)")
+    p.add_argument("--enforce", action="store_true",
+                   help="DEMOTE-ONLY: reclassify flagged 'auto' facts → 'pending' (also via "
+                        "env CORPUS_AUDIT_ENFORCE). Reversible; default-off.")
     ns = p.parse_args(args)
 
-    # READ-ONLY connection — Phase 2 shadow MUST NOT mutate the corpus (enforced at the SQLite layer).
+    # ENFORCE MODE (flag-gated, DEFAULT-OFF): env CORPUS_AUDIT_ENFORCE or --enforce. DEMOTE-ONLY —
+    # reclassify flagged 'auto' facts → 'pending' on a WRITABLE conn, THEN fall through to the
+    # (unchanged) read-only audit so the printed stats reflect the post-enforce state. When
+    # disabled this whole block is skipped and enforce_result stays None → byte-identical output.
+    enforce_result = None
+    if ns.enforce or os.environ.get("CORPUS_AUDIT_ENFORCE"):
+        wconn = sqlite3.connect(str(DB_PATH))
+        enforce_result = enforce_demote(wconn)
+        wconn.close()
+
+    # READ-ONLY connection — the default audit MUST NOT mutate the corpus (enforced at the SQLite layer).
     conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
     stats = corpus_audit_stats(conn)
     samples = conn.execute(
@@ -103,9 +189,12 @@ def cmd_corpus_audit(args):
     cands = repetition_candidates(conn, ns.candidates) if ns.candidates > 0 else []
 
     if ns.json:
-        print(json.dumps({**stats,
-                          "contradiction_samples": [{"fact_key": k, "count": c} for k, c in samples],
-                          "repetition_candidates": cands}, indent=2))
+        payload = {**stats,
+                   "contradiction_samples": [{"fact_key": k, "count": c} for k, c in samples],
+                   "repetition_candidates": cands}
+        if enforce_result is not None:
+            payload["enforce"] = enforce_result
+        print(json.dumps(payload, indent=2))
         return
 
     live = stats["live_facts"] or 1
@@ -127,6 +216,11 @@ def cmd_corpus_audit(args):
         print(f"  repetition-only prune candidates (top {len(cands)}, operator-gated to enforce):")
         for c in cands:
             print(f"    [{c['id']}] cc={c['confirmation_count']} {c['domain']}: {c['text']}")
+    if enforce_result is not None:
+        print(f"  ⚑ ENFORCE (demote-only, review_state auto→pending; reversible):")
+        print(f"      repetition-only demoted:     {enforce_result['repetition_demoted']}")
+        print(f"      contradiction-loser demoted: {enforce_result['contradiction_demoted']}  "
+              f"(cluster max cc ≥ {CONTRADICTION_ENFORCE_MIN_CC})")
     print()
 
 

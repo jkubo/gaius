@@ -4212,6 +4212,40 @@ def cmd_defer(args):
     print(f"   {pending} pending remaining")
 
 
+def cmd_agent_review(args):
+    """Mark a pending fact as reviewed by an AUTOMATED agent (the mnemos surgeon).
+
+    This is the machine substitute for the empirically-dead human `confirm` verb
+    (1 of ~17,637 injectable facts ever human-confirmed, verified 2026-07-21). It
+    sets review_state='agent-reviewed' and leaves confidence + confidence_source
+    UNTOUCHED.
+
+    HARD CONSTRAINT: this never writes confidence_source='human' — that value is the
+    corpus_audit self-poison detector's trust anchor (corpus_audit.py L34/50/57,
+    `!= 'human'` defines "unverified"). Faking it would poison the detector.
+
+    Rank impact: 'agent-reviewed' is weighted ≤ auto (0.6x, same as pending — see
+    gaius.maturity.REVIEW_STATE_WEIGHT). An LLM reviewer with a completion incentive
+    and no live-state access would rubber-stamp contradiction-flagged facts UPWARD,
+    so until outcome-grounding lands this verb is queue-hygiene + `reject` only —
+    it can NEVER boost a fact's inject rank. To remove a bad fact, use `gaius reject`.
+
+    Reversible: flip back to 'auto' (or re-review) with a plain UPDATE. Idempotent.
+    Usage: gaius agent-review <fact-id>
+    """
+    fact_id = _resolve_fact_id(args, 'agent-review')
+    conn = init_db()
+    row = conn.execute("SELECT id, fact_text, review_state FROM facts WHERE id = ?", (fact_id,)).fetchone()
+    if not row:
+        print(f"No fact with id={fact_id}", file=sys.stderr)
+        sys.exit(1)
+    # review_state ONLY — confidence / confidence_source deliberately left as-is.
+    conn.execute("UPDATE facts SET review_state='agent-reviewed' WHERE id=?", (fact_id,))
+    conn.commit()
+    pending = conn.execute("SELECT COUNT(*) FROM facts WHERE review_state='pending'").fetchone()[0]
+    print(f"⤷ Agent-reviewed: [{fact_id}] {row['fact_text'][:80]}  |  {pending} pending remaining")
+
+
 # cmd_kg extracted to gaius/kg.py (2026-06-28); re-imported at bottom of file.
 
 
@@ -5174,12 +5208,28 @@ def cmd_decay(args):
                         help="Decay rate per day (default: 0.02 ≈ half-life ~35 days)")
     parser.add_argument("--floor", type=float, default=0.1,
                         help="Minimum score floor (default: 0.1)")
+    parser.add_argument("--live-ttl-days", type=float, default=0.0,
+                        help="Soft-tombstone fact_type='live' facts whose last_seen is older "
+                             "than N days (0 = disabled; env: GAIUS_LIVE_TTL_DAYS). "
+                             "⚠ NO liveness re-check — retires on age alone, so use a "
+                             "conservative (large) value.")
     parsed = parser.parse_args(args)
 
     conn = init_db()
     now = datetime.now(timezone.utc)
     rate = parsed.rate
     floor = parsed.floor
+    # Item 4 (flag-gated, DEFAULT-OFF): resolve the 'live' TTL. Explicit flag (>0) wins,
+    # else env GAIUS_LIVE_TTL_DAYS, else disabled. Disabled = the tombstone branch below
+    # never fires → decay is byte-identical to prior behavior.
+    live_ttl_days = parsed.live_ttl_days
+    if live_ttl_days <= 0:
+        try:
+            live_ttl_days = float(os.environ.get("GAIUS_LIVE_TTL_DAYS", "0") or "0")
+        except ValueError:
+            live_ttl_days = 0.0
+    live_ttl_enabled = live_ttl_days > 0
+    tombstones: list = []
 
     facts = conn.execute(
         "SELECT id, domain, fact_key, fact_text, score, confirmation_count, provenance, "
@@ -5221,6 +5271,18 @@ def cmd_decay(args):
 
         recency = volatility_recency(prov_key, fact["fact_type"], age_days, rate)
 
+        # Item 4 (flag-gated, DEFAULT-OFF): soft-tombstone stale 'live' facts.
+        # 'live' facts are volatile state snapshots (3x decay) that today only ever
+        # decay to the 0.1 floor and keep injecting FOREVER. When the TTL is enabled a
+        # 'live' fact older than it (by last_seen age) is soft-tombstoned below —
+        # tombstoned_at + tombstone_reason set, RESTORABLE, never DELETEd.
+        # ⚠ RISK: there is NO liveness RE-CHECK — a still-true 'live' guardrail can be
+        # retired mid-window purely on age. That is why this is DEFAULT-OFF, fires only
+        # when the flag is EXPLICITLY set, and should use a conservative (large) TTL.
+        if live_ttl_enabled and (fact["fact_type"] or "") == "live" and age_days > live_ttl_days:
+            tombstones.append(fact["id"])
+            continue  # retiring this fact — skip its score recompute
+
         # Confirmation boost (log scale, capped at 3.0)
         conf = max(1, fact["confirmation_count"])
         conf_boost = min(math.log2(conf + 1), 3.0) / 3.0
@@ -5245,6 +5307,8 @@ def cmd_decay(args):
         print(f"  Would raise:  {buckets['raised']}")
         print(f"  Would decay:  {buckets['decayed']}")
         print(f"  Unchanged:    {buckets['unchanged']}")
+        if live_ttl_enabled:
+            print(f"  Would tombstone (live, last_seen age > {live_ttl_days:g}d): {len(tombstones)}")
         if updates:
             # Show sample changes
             sample = updates[:10]
@@ -5254,15 +5318,29 @@ def cmd_decay(args):
                       f"{(f['fact_key'] or '')[:40]}")
         return
 
-    if not updates:
+    # Soft-tombstone stale 'live' facts (item 4). Empty unless the TTL flag is set.
+    if tombstones:
+        now_iso = now.isoformat()
+        tomb_reason = (f"live-ttl: last_seen age > {live_ttl_days:g}d "
+                       f"(gaius decay; no liveness re-check)")
+        conn.executemany(
+            "UPDATE facts SET tombstoned_at = ?, tombstone_reason = ? WHERE id = ?",
+            [(now_iso, tomb_reason, fid) for fid in tombstones])
+
+    if updates:
+        conn.executemany("UPDATE facts SET score = ? WHERE id = ?", updates)
+
+    if not updates and not tombstones:
         print(f"All {len(facts)} facts unchanged.")
         return
 
-    conn.executemany("UPDATE facts SET score = ? WHERE id = ?", updates)
     conn.commit()
-    print(f"Decayed {len(facts)} facts: "
-          f"↑{buckets['raised']} raised, ↓{buckets['decayed']} decayed, "
-          f"={buckets['unchanged']} unchanged")
+    msg = (f"Decayed {len(facts)} facts: "
+           f"↑{buckets['raised']} raised, ↓{buckets['decayed']} decayed, "
+           f"={buckets['unchanged']} unchanged")
+    if tombstones:
+        msg += f", ⚰{len(tombstones)} live-TTL tombstoned"
+    print(msg)
 
 
 def cmd_rescore(args):
@@ -6228,6 +6306,7 @@ from gaius.raft import (  # noqa: E402,F401  re-export (raft split 2026-07-01)
 from gaius.maturity import (  # noqa: E402,F401  re-export (maturity split 2026-07-01)
     _maturity_score, PROVENANCE_WEIGHT, NO_DECAY_PROVENANCES, OUTCOME_MODIFIER,
     MATURITY_BOOTSTRAP_MIN, CROSS_MODEL_MULTIPLIER, SOURCE_RELIABILITY,
+    REVIEW_STATE_WEIGHT,
     cmd_maturity, cmd_readiness, cmd_snapshot, cmd_governor, cmd_route,
 )
 
@@ -6237,8 +6316,8 @@ from gaius.outcomes import (  # noqa: E402,F401  re-export (outcomes split 2026-
 )
 
 from gaius.corpus_audit import (  # noqa: E402,F401  re-export (corpus_audit split 2026-07-01)
-    REPETITION_THRESHOLD, repetition_candidates, corpus_audit_stats,
-    route_suggest, cmd_corpus_audit, cmd_route_suggest,
+    REPETITION_THRESHOLD, CONTRADICTION_ENFORCE_MIN_CC, repetition_candidates,
+    corpus_audit_stats, enforce_demote, route_suggest, cmd_corpus_audit, cmd_route_suggest,
 )
 
 from gaius.reconcile import (  # noqa: E402,F401  re-export (reconcile split 2026-07-01)
@@ -6368,6 +6447,7 @@ COMMANDS = {
     "confirm":    cmd_confirm,
     "reject":     cmd_reject,
     "defer":      cmd_defer,
+    "agent-review": cmd_agent_review,
     "rescan":     cmd_rescan,
     "stats":      cmd_stats,
     "batch":      cmd_batch,

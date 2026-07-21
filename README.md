@@ -294,6 +294,7 @@ See `presets/k8s.yaml` for a full annotated example.
 | `gaius reconcile` | Promote curated repo-doc facts into the corpus (flagged-unverified, insert-once) + dev↔mirror divergence sentinel |
 | `gaius drift` | Check canonical cluster facts for cross-agent drift against a registry |
 | `gaius decay` | Apply time-based score decay to all facts |
+| `gaius completion <shell>` | Emit a shell completion script (`bash`/`zsh`/`fish`) for command names + global flags |
 
 > This table is a highlights subset — run `gaius --help` for the full command list.
 

@@ -535,7 +535,7 @@ class TestGaiusInit:
         # Patch gaius_dir so it writes to tmp, not ~/.gaius
         with patch("gaius._core.Path.home", return_value=tmp_path):
             # Find preset
-            preset_src = Path(_REPO) / "presets" / "default.yaml"
+            preset_src = _PRESETS / "default.yaml"
             if not preset_src.exists():
                 pytest.skip("presets/default.yaml not found — run from repo root")
 

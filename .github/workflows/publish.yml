@@ -71,7 +71,12 @@ jobs:
           fi
           echo "scanning $n extracted file(s) from ${#sdists[@]} sdist(s) + ${#wheels[@]} wheel(s)"
           hits=$(grep -rIaEn 'kub0\.(net|io)|k8s-(aus|hnd|lax|toa)-|10\.(250|42|43)\.|100\.(64|67)\.|/home/[a-z]+/|(~|\$HOME)/(ansible|\.ssh)|Projects/(agent-memory|Brain)|kub0-ai|sync-council' "$work" || true)  # leak-scan:allow -- this IS the pattern
-          hits=$(printf '%s\n' "$hits" | grep -Fv 'leak-scan:allow' | grep -v '^$' || true)
+          # One narrow exception: the Apache copyright line names the owning entity
+          # and cannot carry an allow marker, because LICENSE ships verbatim as legal
+          # text. Exempt that ONE line only -- matched by position and shape, not by
+          # the name on it, so it keeps working if the holder ever changes. Any other
+          # line of LICENSE, and every other file, still fails the job.
+          hits=$(printf '%s\n' "$hits" | grep -Fv 'leak-scan:allow' | grep -vE '/LICENSE:[0-9]+:[[:space:]]*Copyright [0-9]{4} ' | grep -v '^$' || true)
           if [ -n "$hits" ]; then
             printf '%s\n' "$hits"
             echo "::error::internal reference found in build artifacts; scrub failed, refusing to publish"

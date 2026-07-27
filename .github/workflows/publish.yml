@@ -36,20 +36,48 @@ jobs:
       - name: Guard -- refuse to publish if internal refs leaked into artifacts
         # Mirrors the Makefile's HARD leak scan: domains, cluster hostnames,
         # private IPs, home paths, private repo roots, and the internal-only
-        # sync-council command. Keep the two patterns in sync -- this one is the
+        # council-sync command. Keep the two patterns in sync -- this one is the
         # last gate before a PERMANENT PyPI artifact, so it must not be the weaker.
-        # Soft identifiers (claudeus/council/http_adapter) are accepted public
-        # vocabulary -- the `drift --post-council` command is a real gaius feature.
+        # Soft identifiers are accepted public vocabulary -- the drift webhook
+        # command is a real gaius feature.
         #
-        # NOTE: this guard only sees what the sdist CONTAINS. There is no
-        # MANIFEST.in and packages.find is include=["gaius*"], so tests/ is NOT in
-        # the sdist -- a leak in a fixture is invisible here and must be caught by
-        # the Makefile scan and the test.yml CI scan, both of which now cover tests/.
+        # Scans BOTH artifacts. The sdist is built by setuptools' default file
+        # discovery, which sweeps in tests/ even with no MANIFEST.in and
+        # packages.find include=["gaius*"] -- an earlier version of this comment
+        # asserted the opposite and used it to justify not scanning fixtures.
+        # Verify with `tar tzf dist/*.tar.gz` before trusting any claim about
+        # scope. The wheel carries the package data (presets, skill templates)
+        # and is what most users actually install, so it is scanned too.
+        #
+        # Every step below distinguishes "looked and found nothing" from "never
+        # looked": missing artifacts and a zero-file extraction both fail the job.
+        # Without that, a glob that does not expand makes the pipeline return
+        # grep's own not-found status and the release publishes unscanned.
         run: |
-          if tar xzf dist/*.tar.gz -O | grep -aiE 'kub0\.(net|io)|k8s-(aus|hnd|lax|toa)-|10\.(250|42|43)\.|100\.(64|67)\.|/home/[a-z]+/|(~|\$HOME)/(ansible|\.ssh)|Projects/(agent-memory|Brain)|kub0-ai|sync-council'; then  # leak-scan:allow -- this IS the pattern
-            echo "::error::internal reference found in sdist; scrub failed, refusing to publish"
+          set -euo pipefail
+          shopt -s nullglob
+          sdists=(dist/*.tar.gz); wheels=(dist/*.whl)
+          if [ ${#sdists[@]} -eq 0 ] || [ ${#wheels[@]} -eq 0 ]; then
+            echo "::error::expected an sdist and a wheel in dist/, found: ${sdists[*]:-none} ${wheels[*]:-none}"
             exit 1
           fi
+          work=$(mktemp -d)
+          for f in "${sdists[@]}"; do tar xzf "$f" -C "$work"; done
+          for f in "${wheels[@]}"; do unzip -q -o "$f" -d "$work"; done
+          n=$(find "$work" -type f | wc -l)
+          if [ "$n" -eq 0 ]; then
+            echo "::error::extracted 0 files from the artifacts -- the guard never looked, refusing to publish"
+            exit 1
+          fi
+          echo "scanning $n extracted file(s) from ${#sdists[@]} sdist(s) + ${#wheels[@]} wheel(s)"
+          hits=$(grep -rIaEn 'kub0\.(net|io)|k8s-(aus|hnd|lax|toa)-|10\.(250|42|43)\.|100\.(64|67)\.|/home/[a-z]+/|(~|\$HOME)/(ansible|\.ssh)|Projects/(agent-memory|Brain)|kub0-ai|sync-council' "$work" || true)  # leak-scan:allow -- this IS the pattern
+          hits=$(printf '%s\n' "$hits" | grep -Fv 'leak-scan:allow' | grep -v '^$' || true)
+          if [ -n "$hits" ]; then
+            printf '%s\n' "$hits"
+            echo "::error::internal reference found in build artifacts; scrub failed, refusing to publish"
+            exit 1
+          fi
+          echo "artifact leak scan: clean"
       - uses: actions/upload-artifact@v4
         with:
           name: dist

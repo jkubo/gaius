@@ -154,6 +154,16 @@ def init_concord(path=None):
         CREATE UNIQUE INDEX IF NOT EXISTS idx_claims_active
         ON claims(resource) WHERE released_at IS NULL
     """)
+    # Migration (2026-07-27): first_claimed_at = the ORIGINAL acquisition time, never touched
+    # by a renewal. `created_at` is reset on every same-session re-claim (see _try_claim's
+    # renew branch), which makes it useless as a "is this claim NEW to my peers" delta key —
+    # gaius-concord-autoclaim renews drbd/etcd every 20 min, so a delta on created_at would
+    # re-announce the same lane forever. Backfilled from created_at for pre-existing rows.
+    _claim_cols = {r[1] for r in conn.execute("PRAGMA table_info(claims)")}
+    if "first_claimed_at" not in _claim_cols:
+        conn.execute("ALTER TABLE claims ADD COLUMN first_claimed_at TEXT")
+        conn.execute("UPDATE claims SET first_claimed_at=created_at "
+                     "WHERE first_claimed_at IS NULL")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS findings (
             id         TEXT PRIMARY KEY,
@@ -308,10 +318,11 @@ def _try_claim(conn, resource, sid, pid, name, note, ttl_sec):
     """Atomic claim. Returns (won: bool, holder_row_or_None)."""
     for attempt in (1, 2):
         try:
+            _now = _utcnow()
             conn.execute(
-                "INSERT INTO claims (resource, session_id, pid, holder, note, created_at, ttl_sec) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (resource, sid, pid, name, note, _utcnow(), ttl_sec))
+                "INSERT INTO claims (resource, session_id, pid, holder, note, created_at, "
+                "ttl_sec, first_claimed_at) VALUES (?,?,?,?,?,?,?,?)",
+                (resource, sid, pid, name, note, _now, ttl_sec, _now))
             conn.commit()
             return True, None
         except sqlite3.IntegrityError:

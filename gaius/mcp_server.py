@@ -395,7 +395,7 @@ def gaius_skill_recommend(task: str, files: list[str] | None = None) -> str:
     for skill in skills:
         if skill["gate"] == "always":
             continue  # always-inject skills are unconditional, not recommendations
-        score = compute_skill_score(skill, context_terms)
+        score = compute_skill_score(skill, context_terms, files=files)
         if score > 0:
             scored.append((score, skill))
 
@@ -425,5 +425,15 @@ def gaius_skill_recommend(task: str, files: list[str] | None = None) -> str:
 
 
 
-if __name__ == "__main__":
+def main():
+    """Console-script entry point (`gaius-mcp`).
+
+    Exists so the server can be launched without knowing the interpreter path —
+    `uvx --from gaius-memory[mcp] gaius-mcp`, which is how the Claude Code
+    plugin's .mcp.json starts it.
+    """
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

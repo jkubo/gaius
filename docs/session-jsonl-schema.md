@@ -104,7 +104,7 @@ Codex CLI stores rollouts as date-nested JSONL files:
 ```jsonl
 {"type": "session_meta", "payload": {"id": "cdx-1", "timestamp": "2026-03-11T12:34:38Z"}}
 {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "which storageclass for a new DRBD PVC?"}]}}
-{"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "block-sata for RPi DRBD; block-nvme for fwd-gpu nodes."}]}}
+{"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "block-standard for replicated small nodes; block-fast for compute nodes."}]}}
 ```
 
 - Line 0 is `session_meta`.

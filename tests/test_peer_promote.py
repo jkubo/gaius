@@ -39,7 +39,7 @@ def _isolate(tmp_path, monkeypatch):
 
 def _grok_session(root: Path, uuid: str, answer: str,
                   query: str = "What threats are active right now?") -> Path:
-    sess = root / "%2Fhome%2Fjkubo%2Fgrok-sweeps" / uuid
+    sess = root / "%2Fhome%2Fuser%2Fsweeps" / uuid
     sess.mkdir(parents=True, exist_ok=True)
     with open(sess / "chat_history.jsonl", "w") as f:
         f.write(json.dumps({"type": "user",

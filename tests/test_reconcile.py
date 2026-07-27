@@ -9,11 +9,25 @@ from gaius._core import (
 )
 
 
-def test_default_registry_has_gaius():
-    names = [s["name"] for s in load_source_registry()]
-    assert "gaius" in names
-    g = next(s for s in load_source_registry() if s["name"] == "gaius")
-    assert g.get("mirror_path") and g.get("facts")  # curated facts + a mirror to diff
+def test_default_registry_entries_well_formed(tmp_path, monkeypatch):
+    """Assert the registry CONTRACT, not one deployment's data.
+
+    Two ways the old assertion (`"gaius" in names`) was wrong:
+      1. DEFAULT_SOURCES is deployment-specific -- it names a private dev repo and
+         local paths -- so it is stripped at publish time and the shipped package
+         registers nothing until the user writes ~/.gaius/sources.yaml. The old
+         assertion passed in the dev tree and failed in the published one.
+      2. load_source_registry() reads the REAL ~/.gaius/sources.yaml, so the test
+         saw the developer's own sources and never the set a CI runner would.
+    Both are the same divergence this module exists to detect, so isolate HOME and
+    assert only the shape that every entry must satisfy.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))  # Path.home() honours $HOME on POSIX
+    sources = load_source_registry()
+    assert isinstance(sources, list)
+    for s in sources:
+        assert s.get("name")
+        assert s.get("facts")  # mirror_path is OPTIONAL -- not every source has a mirror
 
 
 def test_excludes():

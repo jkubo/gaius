@@ -342,6 +342,7 @@ semantic = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", marker = "extra == 'http'", specifier = ">=0.100" },
+    { name = "gaius-memory", extras = ["semantic", "mcp"], marker = "extra == 'all'" },
     { name = "gaius-memory", extras = ["semantic", "mcp", "http"], marker = "extra == 'all'" },
     { name = "httpx", marker = "extra == 'http'", specifier = ">=0.24" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.0" },

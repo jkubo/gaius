@@ -80,6 +80,51 @@ The roster is read from the coding CLI's own session registry (for Claude Code:
 `~/.claude/sessions/*.json`), with pid-liveness checks layered on top — the registry
 itself has no garbage collection.
 
+### 5. Baton pass — hand a saturated session to a fresh successor
+
+```bash
+gaius concord handoff --next "verify quorum,re-run playbook 03"   # or pipe a full body on stdin
+gaius concord handoff --no-handoff                                # claim→pool transfer only
+gaius concord handoff --spawn                                     # + LAUNCH an inert plan-mode successor
+```
+
+When a session's context window saturates (the ⛽ context gauge hits 🔴 RED — or ⚫ BLACK,
+the "stop now" band above it), pushing more work through a degraded working set is how
+plan-drift and confidently-wrong creep in.
+`handoff` passes the baton to a fresh context instead. In one command it:
+
+1. **writes a structured handoff** (via `gaius-session-handoff` — a body on stdin, or a
+   skeleton from `--next`),
+2. **converts this session's active claims into `baton:<resource>` pool tasks** a fresh
+   successor can atomically `take` and re-`claim`. The parent's claims are released with
+   reason `handed-off`, so nothing is orphaned and no sibling silently double-owns a lane, and
+3. **prints the successor bootstrap** — `task next` → `take` → read the handoff → continue.
+
+The successor picks up near the context floor with full reasoning capacity. This is
+**model-initiated, never a hook**: the saturated session decides to hand off and runs the
+command; nothing auto-relaunches behind the operator's back.
+
+**`--spawn`** goes one step further and *launches* the successor for you — a labeled
+`claude --bg --name baton:<skill>:<sid8> --permission-mode plan` session, pre-hydrated with the
+handoff via `--append-system-prompt-file`, opening prompt = the compact baton loader (so it
+starts near the context floor). It is gated by a **y/N confirmation read off `/dev/tty`** (stdin
+carries the piped handoff body); declined / headless / spawn-failure all fall back to a
+paste-ready `~/.gaius/baton/<sid>.launch`. Because plan mode is physically read-only and a
+`--bg` agent does nothing until you adopt it (`claude /resume "baton:<skill>:<sid8>"`), `--spawn`
+**still executes nothing** — it only stages a hydrated successor waiting for you. This is the
+model-initiated twin of the `gaius-baton-watch` step-7 spawner; the two build the identical
+command (that watcher is the source of truth if they ever drift).
+
+**The baton moves context + claims + capacity — never authorization.** The successor still
+hits every gate; a handed-off destructive or irreversible operation still stops for the
+operator (the bright line below). `handoff` only moves the baton — it never executes the
+handed-off work.
+
+> Terminal cue: the claim tab-retitle (`--no-title`) writes OSC sequences to `/dev/tty`,
+> which is a silent no-op on Claude Code ≥ 2.1.139 (hooks/tools run detached from the
+> terminal). Saturation is surfaced instead by the `gaius-statusline` context-band bar
+> (🟢→🟡→🟠→🔴), which appends `⚑ baton` at ORANGE/RED.
+
 ---
 
 ## Hook wiring (optional, recommended)

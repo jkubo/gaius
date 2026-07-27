@@ -2,12 +2,20 @@
 
 **Ops memory lifecycle manager for AI coding agents.**
 
+[![PyPI](https://img.shields.io/pypi/v/gaius-memory)](https://pypi.org/project/gaius-memory/)
+[![Python](https://img.shields.io/pypi/pyversions/gaius-memory)](https://pypi.org/project/gaius-memory/)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+
 Not another RAG chatbot memory — a production-grade system that extracts facts from Claude Code, Gemini CLI, Grok, and Codex sessions, ranks them into an inject-ready corpus, enforces behavioral gates, and prevents you from breaking prod at 3am.
 
 > **Why gaius** — three things most agent-memory tools skip:
 > - **Runs unattended** — extract → promote → inject with no human in the hot path; correction is optional.
 > - **Prevents actions, not just recalls them** — hard gates `exit:2` on force-push, unconfirmed live-trade, prod-delete.
 > - **Fully offline** — BM25 + sqlite-vec in one SQLite file. No API keys, no cloud.
+
+```
+pip install gaius-memory   # installs the `gaius` command (offline core; extras: [semantic], [mcp], [http])
+```
 
 ```
 gaius retire      # scan sessions → stage summaries
@@ -113,14 +121,33 @@ recovers the recall naive whole-session embedding loses to the 256-token cap: ch
 ### Install
 
 ```bash
-# Option 1: development install (editable, reads from repo)
+# Option 1: Claude Code plugin (recommended — wires the hooks, skill, and MCP server for you)
+/plugin marketplace add jkubo/claude-plugins
+/plugin install gaius@jkubo-tools
+/reload-plugins
+
+# Option 2: development install (editable, reads from repo)
 git clone https://github.com/jkubo/gaius
 cd gaius
 pip install -e ".[semantic]"   # includes sentence-transformers + sqlite-vec
 
-# Option 2: script install (no pip, uses system/venv python)
+# Option 3: script install (no pip, uses system/venv python)
 install -m 755 gaius_cli ~/.local/bin/gaius
 ```
+
+The plugin bundles the `gaius` skill, the MCP server, and three hooks: corpus
+injection at session start, a mnemosyne health check after memory-file edits, and
+an optional per-prompt injection (`GAIUS_PROMPT_INJECT=1`, off by default because it
+bills tokens every turn). It needs [`uv`](https://docs.astral.sh/uv/) for the MCP
+server, and it stays out of the way if you already run a standalone install — the
+hooks yield to `~/.local/bin/gaius-*` wrappers rather than injecting the corpus twice
+(`GAIUS_PLUGIN_HOOKS=force` overrides).
+
+Token budgets are deliberately conservative (2000 corpus + 1500 skills per session);
+raise with `GAIUS_INJECT_BUDGET` / `GAIUS_SKILLS_BUDGET`.
+
+You still run `gaius init` once after installing — the plugin wires Claude Code, not
+your corpus.
 
 ### Initialize
 

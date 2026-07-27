@@ -25,7 +25,12 @@ case "$FILE_PATH" in
   *) exit 0 ;;
 esac
 
-MNEMOSYNE="$HOME/.local/bin/mnemosyne"
+# PATH first — a plugin install has no reason to own ~/.local/bin
+if command -v mnemosyne >/dev/null 2>&1; then
+  MNEMOSYNE="$(command -v mnemosyne)"
+else
+  MNEMOSYNE="$HOME/.local/bin/mnemosyne"
+fi
 [[ -x "$MNEMOSYNE" ]] || exit 0
 
 # Run health — only print if there's something to report

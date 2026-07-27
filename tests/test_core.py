@@ -1,7 +1,7 @@
 """gaius core test suite.
 
 Tests cover the public API surface of gaius._core with no dependency on
-a live corpus, external services, or kub0-specific configuration.
+a live corpus, external services, or deployment-specific configuration.
 
 Run:
     pytest tests/ -v
@@ -25,6 +25,12 @@ os.environ["GAIUS_CONFIG"] = "/dev/null"
 # Add repo root to path so `from gaius._core import ...` works in-tree
 _REPO = Path(__file__).parent.parent
 sys.path.insert(0, str(_REPO))
+
+# Presets ship inside the package; fall back to the repo root for an
+# un-migrated checkout (mirrors the lookup in _core.cmd_init).
+_PRESETS = _REPO / "gaius" / "presets"
+if not _PRESETS.is_dir():
+    _PRESETS = _REPO / "presets"
 
 from gaius._core import (
     _load_gaius_config,
@@ -565,34 +571,34 @@ class TestGaiusInit:
 
 class TestPresets:
     def test_k8s_preset_exists(self):
-        preset = _REPO / "presets" / "k8s.yaml"
+        preset = _PRESETS / "k8s.yaml"
         assert preset.exists(), "presets/k8s.yaml must exist"
 
     def test_default_preset_exists(self):
-        preset = _REPO / "presets" / "default.yaml"
+        preset = _PRESETS / "default.yaml"
         assert preset.exists(), "presets/default.yaml must exist"
 
     def test_k8s_preset_is_valid_yaml(self):
         import yaml
-        preset = _REPO / "presets" / "k8s.yaml"
+        preset = _PRESETS / "k8s.yaml"
         doc = yaml.safe_load(preset.read_text())
         assert isinstance(doc, dict)
 
     def test_default_preset_is_valid_yaml(self):
         import yaml
-        preset = _REPO / "presets" / "default.yaml"
+        preset = _PRESETS / "default.yaml"
         doc = yaml.safe_load(preset.read_text())
         assert isinstance(doc, dict)
 
     def test_presets_have_no_hardcoded_internal_paths(self):
         for preset_name in ["k8s.yaml", "default.yaml"]:
-            content = (_REPO / "presets" / preset_name).read_text()
+            content = (_PRESETS / preset_name).read_text()
             assert "/home/jkubo" not in content
             assert "kub0" ".net" not in content  # split literal so this guard doesn't trip leak scanners
-            # kub0.io is acceptable in examples (it's the public domain)
+            # the public product domain IS acceptable in examples -- only the internal one is not
 
     def test_k8s_preset_has_no_internal_agent_names(self):
-        content = (_REPO / "presets" / "k8s.yaml").read_text()
+        content = (_PRESETS / "k8s.yaml").read_text()
         for name in ["geminius", "vigiles", "orramaus", "claudeus", "juleis"]:
             assert name not in content, f"internal name '{name}' found in k8s.yaml"
 
@@ -698,10 +704,10 @@ class TestDriftLive:
         assert code == 0 and "uncheckable" in capsys.readouterr().out.lower()
 
     def test_contains_comparator_matches_substring(self, tmp_path, monkeypatch, capsys):
-        code = self._run(tmp_path, monkeypatch, "- Traefik on **aus-fwd-gpu-02** not gpu-01\n",
+        code = self._run(tmp_path, monkeypatch, "- Traefik on **r1-web-gpu-02** not gpu-01\n",
             {"id": "t", "file": "MEMORY.md",
-             "pattern": r"Traefik on \*\*(aus-fwd-gpu-\d+)\*\*",
-             "probe": "echo k8s-aus-fwd-gpu-02", "compare": "contains"})
+             "pattern": r"Traefik on \*\*(r1-web-gpu-\d+)\*\*",
+             "probe": "echo k8s-r1-web-gpu-02", "compare": "contains"})
         assert code == 0 and "OK" in capsys.readouterr().out
 
 

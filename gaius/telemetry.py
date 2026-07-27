@@ -73,6 +73,15 @@ def _init_schema(conn: sqlite3.Connection):
             source TEXT                          -- 'corpus','memory_feedback','memory_domain','memory_project'
         );
 
+        CREATE TABLE IF NOT EXISTS skill_injections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,                  -- unix timestamp
+            session_id TEXT,
+            skill TEXT,                           -- skill name
+            gate TEXT,                            -- skill gate (always/mandate/hard/reference)
+            score REAL                            -- per-token score at injection time (nullable)
+        );
+
         CREATE TABLE IF NOT EXISTS coaching_tips (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             tip_key TEXT UNIQUE NOT NULL,         -- e.g. 'short_prompt', 'no_domain_terms'
@@ -87,6 +96,8 @@ def _init_schema(conn: sqlite3.Connection):
         CREATE INDEX IF NOT EXISTS idx_enforce_ts ON enforcement_events(ts);
         CREATE INDEX IF NOT EXISTS idx_injfact_key ON injection_facts(fact_key);
         CREATE INDEX IF NOT EXISTS idx_injfact_prompt ON injection_facts(prompt_hash);
+        CREATE INDEX IF NOT EXISTS idx_skillinj_ts ON skill_injections(ts);
+        CREATE INDEX IF NOT EXISTS idx_skillinj_skill ON skill_injections(skill);
     """)
     # Seed coaching tips if empty
     count = conn.execute("SELECT COUNT(*) FROM coaching_tips").fetchone()[0]
@@ -267,6 +278,42 @@ def log_injection_fact(
         (time.time(), session_id, prompt_hash, fact_key, score, priority, cosine, source)
     )
     conn.commit()
+
+
+def log_skill_injection(session_id: str, skills: list):
+    """Best-effort: one row per injected skill.
+
+    `skills` is a list of skill dicts (from load_skills / cmd_inject) — each has
+    at least 'name' and 'gate'; per-token score may be stashed under '_score'.
+    Non-finite scores (e.g. the gate:always float('inf') sentinel) are stored as
+    NULL. Mirrors the try/except pattern of log_injection_fact — a telemetry
+    failure must never break injection.
+    """
+    import math
+    try:
+        conn = _get_conn()
+        ts = int(time.time())
+        rows = []
+        for s in skills or []:
+            score = s.get("_score")
+            if score is not None:
+                try:
+                    if not math.isfinite(float(score)):
+                        score = None
+                    else:
+                        score = float(score)
+                except (TypeError, ValueError):
+                    score = None
+            rows.append((ts, session_id, s.get("name", ""), s.get("gate", ""), score))
+        if rows:
+            conn.executemany(
+                "INSERT INTO skill_injections (ts, session_id, skill, gate, score) "
+                "VALUES (?, ?, ?, ?, ?)",
+                rows,
+            )
+            conn.commit()
+    except Exception:
+        pass  # telemetry must never break injection
 
 
 def get_summary(hours: int = 24) -> dict:

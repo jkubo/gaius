@@ -536,9 +536,9 @@ def cmd_kg(args):
 # delimited footer. Deterministic + idempotent: same files + patterns → same
 # footers. Edges are evidence-derived, never invented.
 
-# Directories whose files RECEIVE a Related footer. (malint/ deliberately
-# absent: its md files are per-session detonation logs in subdirs — logs don't
-# get links, same rule as handoffs/.)
+# Directories whose files RECEIVE a Related footer. (Per-session log dirs are
+# deliberately absent: their md files are append-only logs in subdirs — logs
+# don't get links, same rule as handoffs/.)
 _EXPORT_RECIPIENT_DIRS = ["feedback", "project", "troubleshooting", "reference", "user"]
 # Directories whose files are link TARGETS only (hand-curated hubs / byte-gated
 # domain files gain inbound edges without being rewritten).
@@ -705,7 +705,9 @@ def cmd_kg_export_links(args):
           f"{len(no_links)} without qualifying links, {len(skipped_size)} skipped (> {_EXPORT_MAX_BYTES}B), "
           f"{len(skipped_generated)} skipped (generated)")
     print(f"  corpus: {n_files} files ({len(recipients)} recipient-dir, {len(targets_only)} target-only); "
-          f"dirs not scanned by design: handoffs/ daily/ malint/ skills/ skills-grok/ juleis/ gaius/")
+          f"scanned: {', '.join(d + '/' for d in _EXPORT_RECIPIENT_DIRS)} (recipients), "
+          f"{', '.join(d + '/' for d in _EXPORT_TARGET_ONLY_DIRS)} (targets only); "
+          f"every other dir skipped by design")
     if skipped_size:
         for path in skipped_size:
             print(f"  size-skipped: {path.relative_to(root)}")

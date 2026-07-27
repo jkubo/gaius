@@ -63,6 +63,132 @@ _TRAILING_PTR_RE = re.compile(
 _ENDS_WITH_LINK_RE = re.compile(r"\[[^\]]+\]\([^)]+\)[.)]*\s*$")
 
 
+# ── homing-verification guard ─────────────────────────────────────────────────
+# A bullet may pass age+done+pointer+non-veto yet still be UNSAFE to evict when its
+# trailing "→ pointer" names a home file that does NOT actually contain the fact
+# (e.g. a live "deploy-target=github" bullet pointing at a file that never absorbed
+# it). Evicting such a bullet drops the fact from the always-injected MEMORY.md into
+# a non-injected archive — silent loss. This guard re-reads the pointer target and
+# refuses eviction unless the home genuinely contains the bullet's distinctive
+# content. CONSERVATIVE: anything we cannot positively verify → KEEP.
+
+HOME_MATCH_FRACTION = 0.5
+MIN_HOME_HITS = 1
+
+_CODE_SPAN_RE = re.compile(r"`([^`]+)`")
+_BOLD_SPAN_RE = re.compile(r"\*\*([^*]+)\*\*")
+_COMPOUND_RE = re.compile(r"\b\w+[-_/][\w./#@-]+\b")
+_REF_RES = (
+    re.compile(r"#\d+"),
+    re.compile(r"\bpr\s*#?\d+", re.IGNORECASE),
+    re.compile(r"\b[0-9a-f]{7,40}\b"),
+)
+_SECTION_SUFFIX_RE = re.compile(r"§.*$")
+_MD_LINK_TARGET_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
+
+# Generic done-marker / filler words: a bare "LIVE"/"SHIPPED" in prose is NOT a
+# distinctive signature (the done-marker gate already keyed on it), so it must not
+# count toward homing — otherwise every done bullet would trivially "home" on any
+# file that merely mentions the word.
+_SIG_STOPWORDS = frozenset({
+    "the", "and", "this", "that", "from", "with", "into",
+    "live", "done", "fixed", "merged", "shipped", "resolved", "verified", "fallback",
+})
+
+
+def _norm_sig_token(tok: str) -> str:
+    return tok.strip().strip("`*_()[]{}<>\"'.,;:!?§ ").lower()
+
+
+def _signature_tokens(text: str) -> set:
+    """Distinctive lowercased tokens that identify a bullet's fact: `code` spans,
+    **bold** words, compound identifiers (deploy-target, project/foo.md, ao#114) and
+    refs (#123, PR #45, hex commits). Generic short/stopword tokens are dropped so a
+    stray 'LIVE' in prose can never be a signature."""
+    raw = []
+    for m in _CODE_SPAN_RE.finditer(text):
+        raw.append(m.group(1))
+    for m in _BOLD_SPAN_RE.finditer(text):
+        raw.extend(m.group(1).split())
+    for m in _COMPOUND_RE.finditer(text):
+        raw.append(m.group(0))
+    for rx in _REF_RES:
+        for m in rx.finditer(text):
+            raw.append(m.group(0))
+    sig = set()
+    for tok in raw:
+        t = _norm_sig_token(tok)
+        if len(t) < 4:
+            continue
+        if t in _SIG_STOPWORDS:
+            continue
+        sig.add(t)
+    return sig
+
+
+def _pointer_target_paths(text: str) -> list:
+    """Candidate relative file paths named in the TRAILING pointer region (after the
+    final →/->): markdown-link targets, backtick paths, and bare path-like tokens.
+    Section suffixes (``§...``) and surrounding punctuation are stripped."""
+    t = text.rstrip()
+    pos, alen = -1, 0
+    for arrow in ("→", "->"):
+        p = t.rfind(arrow)
+        if p > pos:
+            pos, alen = p, len(arrow)
+    if pos == -1:
+        return []
+    region = t[pos + alen:]
+
+    candidates = []
+    for p in _MD_LINK_TARGET_RE.findall(region):
+        candidates.append(p)
+    for p in _CODE_SPAN_RE.findall(region):
+        if "/" in p or p.endswith(".md"):
+            candidates.append(p)
+    bare = _MD_LINK_TARGET_RE.sub(" ", region)
+    bare = _CODE_SPAN_RE.sub(" ", bare)
+    for tok in re.split(r"[\s,+]+", bare):
+        tok = _SECTION_SUFFIX_RE.sub("", tok).strip("()[]{}<>\"'.,;:!?§ ")
+        if tok and ("/" in tok or tok.endswith(".md")):
+            candidates.append(tok)
+
+    out, seen = [], set()
+    for p in candidates:
+        p = _SECTION_SUFFIX_RE.sub("", p).strip().strip("()[]{}<>\"'.,;:!?§ ")
+        if p and p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def _resolve_home_text(text: str, memory_dir) -> str:
+    """Concatenated, LOWERCASED contents of every pointer-target file that resolves
+    (relative to ``memory_dir``) and exists. ``''`` if none resolve/exist."""
+    memory_dir = Path(memory_dir)
+    parts = []
+    for rel in _pointer_target_paths(text):
+        try:
+            fp = memory_dir / rel
+            if fp.is_file():
+                parts.append(fp.read_text(encoding="utf-8", errors="ignore"))
+        except OSError:
+            pass
+    return "\n".join(parts).lower()
+
+
+def _is_homed(text: str, home_text: str) -> bool:
+    """True iff the bullet's distinctive signature is genuinely present in its home
+    file(s). No signature (can't verify) or no home text → False → KEEP."""
+    sig = _signature_tokens(text)
+    if not sig:
+        return False
+    if not home_text:
+        return False
+    hits = sum(1 for tok in sig if tok in home_text)  # home_text already lowercased
+    return hits >= MIN_HOME_HITS and (hits / len(sig)) >= HOME_MATCH_FRACTION
+
+
 def _has_veto(text: str) -> bool:
     return VETO_MARK in text
 
@@ -126,9 +252,14 @@ def _bullet_date(text: str, section_date) -> "_dt.date | None":
     return max(cands) if cands else None
 
 
-def should_evict(text: str, section_date, max_age_days: int) -> bool:
+def should_evict(text: str, section_date, max_age_days: int, home_text_provider=None) -> bool:
     """The whole safety gate: ALL of (age>threshold, done-marker, trailing pointer)
-    AND NOT veto. Any single failure → KEEP (the fact stays in MEMORY.md)."""
+    AND NOT veto. Any single failure → KEEP (the fact stays in MEMORY.md).
+
+    ``home_text_provider`` (optional) is a callable ``text -> home_text`` used for the
+    homing-verification guard: even after every gate passes, refuse eviction unless the
+    pointer target actually contains the bullet's fact. When it is ``None`` the behavior
+    is IDENTICAL to before (the guard is a no-op)."""
     if _has_veto(text):
         return False
     if not _has_trailing_pointer(text):
@@ -140,7 +271,11 @@ def should_evict(text: str, section_date, max_age_days: int) -> bool:
     bd = _bullet_date(text, section_date)
     if bd is None:
         return False
-    return (section_date - bd).days > max_age_days
+    if (section_date - bd).days <= max_age_days:
+        return False
+    if home_text_provider is not None and not _is_homed(text, home_text_provider(text)):
+        return False
+    return True
 
 
 # ── atomic MEMORY.md rewrite ────────────────────────────────────────────────
@@ -163,7 +298,7 @@ def _atomic_write(path: Path, content: str) -> None:
 # ── core roll ────────────────────────────────────────────────────────────────
 
 def roll_recent_state(mem_path, archive_dir, max_age_days: int = 7, dry_run: bool = False,
-                      _probe=None):
+                      verify_homing: bool = False, _probe=None):
     """Evict eligible ``## Recent State`` bullets from ``mem_path`` into
     ``archive_dir/recent-state-YYYY-MM.md`` (YYYY-MM = section-header month).
 
@@ -205,10 +340,12 @@ def roll_recent_state(mem_path, archive_dir, max_age_days: int = 7, dry_run: boo
                 end = j
                 break
         out = lines[: start + 1]
+        provider = (lambda body: _resolve_home_text(body, mem_path.parent)) if verify_homing else None
         for j in range(start + 1, end):
             raw = lines[j]
             body = raw.rstrip("\n")
-            if body.lstrip().startswith(("-", "*")) and should_evict(body, section_date, max_age_days):
+            if body.lstrip().startswith(("-", "*")) and should_evict(
+                    body, section_date, max_age_days, home_text_provider=provider):
                 evicted.append(raw if raw.endswith("\n") else raw + "\n")
             else:
                 out.append(raw)
@@ -274,7 +411,8 @@ def cmd_recent_roll(args):
 
     result = roll_recent_state(mem_path, archive_dir,
                                max_age_days=parsed.max_age_days,
-                               dry_run=parsed.dry_run)
+                               dry_run=parsed.dry_run,
+                               verify_homing=True)
     if result.get("skipped_concurrent"):
         print("[recent-roll] SKIPPED: MEMORY.md changed under us (concurrent write) "
               "— wrote nothing; the next run retries.")

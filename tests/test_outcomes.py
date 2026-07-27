@@ -11,13 +11,13 @@ def _conn(tmp_path):
 def test_ingest_idempotent_and_winrates(tmp_path):
     conn = _conn(tmp_path)
     recs = [
-        {"key": "kub0-ai/x#1", "scope": "scope:a", "model": "sonnet", "status": "done",
+        {"key": "acme/x#1", "scope": "scope:a", "model": "sonnet", "status": "done",
          "result_status": "done", "success": True, "cost_usd": 0.1, "verdicts": ["g:pass"],
          "at": "2026-06-23T00:00:00Z"},
-        {"key": "kub0-ai/x#2", "scope": "scope:a", "model": "sonnet", "status": "done",
+        {"key": "acme/x#2", "scope": "scope:a", "model": "sonnet", "status": "done",
          "result_status": "error", "success": False, "cost_usd": 0.2, "verdicts": [],
          "at": "2026-06-23T00:01:00Z"},
-        {"key": "kub0-ai/x#3", "scope": "scope:b", "model": "opus", "status": "done",
+        {"key": "acme/x#3", "scope": "scope:b", "model": "opus", "status": "done",
          "result_status": "done", "success": True, "cost_usd": 0.3, "verdicts": ["g:pass"],
          "at": "2026-06-23T00:02:00Z"},
     ]
@@ -44,7 +44,7 @@ def test_skips_records_without_key(tmp_path):
 def test_never_touches_facts_table(tmp_path):
     # task_outcomes is the only table this path creates; the facts corpus is untouched.
     conn = _conn(tmp_path)
-    ingest_outcomes(conn, [{"key": "kub0-ai/x#9", "scope": "scope:z", "success": True}])
+    ingest_outcomes(conn, [{"key": "acme/x#9", "scope": "scope:z", "success": True}])
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
     assert "task_outcomes" in tables
     assert "facts" not in tables  # ingestion never creates/mutates facts

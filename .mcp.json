@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "gaius": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "gaius-memory[mcp] @ git+https://github.com/jkubo/gaius",
+        "gaius-mcp"
+      ]
+    }
+  }
+}

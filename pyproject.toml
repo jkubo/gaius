@@ -7,13 +7,14 @@ name = "gaius-memory"
 version = "0.1.0"
 description = "Ops memory lifecycle manager for AI coding agents"
 readme = "README.md"
-license = { file = "LICENSE" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
+authors = [{ name = "Jay Kubo", email = "jaykubo@outlook.com" }]
 keywords = ["memory", "ai", "agents", "claude-code", "ops", "knowledge-graph"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -32,13 +33,8 @@ semantic = [
 mcp = [
     "mcp>=1.0",
 ]
-http = [
-    "fastapi>=0.100",
-    "httpx>=0.24",
-    "uvicorn[standard]>=0.23",
-]
 all = [
-    "gaius-memory[semantic,mcp,http]",
+    "gaius-memory[semantic,mcp]",
 ]
 dev = [
     "pytest>=8.0",
@@ -46,6 +42,7 @@ dev = [
 
 [project.scripts]
 gaius = "gaius._core:main"
+gaius-mcp = "gaius.mcp_server:main"
 
 [project.urls]
 Homepage = "https://github.com/jkubo/gaius"
@@ -56,7 +53,7 @@ where = ["."]
 include = ["gaius*"]
 
 [tool.setuptools.package-data]
-gaius = ["py.typed", "../presets/*.yaml", "../skill/SKILL.md"]
+gaius = ["presets/*.yaml", "skill/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

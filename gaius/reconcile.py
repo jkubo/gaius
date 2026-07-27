@@ -31,22 +31,12 @@ from gaius._core import init_db, upsert_fact, DB_PATH
 # And (b) runs a DIVERGENCE SENTINEL diffing dev vs mirror, reporting drift (the check that would
 # have screamed "jkubo/gaius is behind agent-memory"). Mechanical, no LLM, dry-run by default.
 
+# The built-in registry is DEPLOYMENT-SPECIFIC: it names a maintainer's private dev repo,
+# local tree paths, and push credentials. It is stripped at publish time, so the shipped
+# package ships `DEFAULT_SOURCES = []` and users supply their own registry via
+# ~/.gaius/sources.yaml (same shape — see load_source_registry below). Keep every entry
+# INSIDE the strip markers; anything added outside them is published verbatim.
 DEFAULT_SOURCES = [
-    {
-        "name": "gaius",
-        "dev_path": str(Path.home() / "Projects/agent-memory/gaius"),
-        "mirror_path": str(Path.home() / "Projects/gaius"),
-        "publish_cmd": "make publish  (then push ~/Projects/gaius to github via gh-token HTTPS)",
-        "facts": [
-            "gaius dev repo = kub0-ai/agent-memory (Forgejo, private); the OSS mirror = jkubo/gaius "
-            "(GitHub, PUBLIC, Apache-2.0). The gaius/ subdir is the published package.",
-            "Sync gaius dev -> OSS: from the gaius/ dir run `make publish` (rsync to the ~/Projects/gaius "
-            "mirror clone + leak scan), review the diff, then push the mirror to github via gh-token "
-            "HTTPS (the ~/.ssh/keys/gh_claudeus_ai key is passphrase-locked, so SSH push is blocked).",
-            "After ANY change to gaius source, publish to the OSS mirror in the same session — it drifts "
-            "silently otherwise (the 2026-06-24 divergence: the closed-loop commands sat unpublished for days).",
-        ],
-    },
 ]
 
 # Mirrors the Makefile `publish` rsync excludes so the divergence check compares the publishable set.

@@ -279,3 +279,48 @@ class TestConcurrencyGuard:
         res = roll_recent_state(mem, tmp_path / "archive", max_age_days=7)
         assert res["skipped_concurrent"] is False
         assert len(res["evicted"]) == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# homing-verification guard: a pointered/aged/done bullet is only evicted when its
+# home file ACTUALLY contains the fact (else it would be silently lost from the
+# always-injected MEMORY.md). Conservative: unverifiable → KEEP.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestHomingGuard:
+    # aged (07-01), done (RESOLVED), trailing pointer, no veto — passes every old gate.
+    CID = ("- **CI/deploy** (07-01): deploy-target=`github` RESOLVED. "
+           "→ project/foo.md")
+
+    def test_pointer_target_missing_signature_keeps(self, tmp_path):
+        # home file exists but does NOT contain the bullet's signature → KEEP
+        mem = tmp_path / "MEMORY.md"
+        mem.write_text(_doc(self.CID))
+        (tmp_path / "project").mkdir()
+        (tmp_path / "project" / "foo.md").write_text(
+            "# Foo\n\nUnrelated notes about storage volumes and PVC provisioning.\n")
+        res = roll_recent_state(mem, tmp_path / "archive", max_age_days=7, verify_homing=True)
+        assert res["evicted"] == []
+        assert "**CI/deploy**" in mem.read_text()          # bullet stays put
+        assert not (tmp_path / "archive").exists()          # nothing archived
+
+    def test_pointer_target_has_signature_evicts(self, tmp_path):
+        # same bullet, but the home file DOES contain the signature → EVICT
+        mem = tmp_path / "MEMORY.md"
+        mem.write_text(_doc(self.CID))
+        (tmp_path / "project").mkdir()
+        (tmp_path / "project" / "foo.md").write_text(
+            "# Foo\n\nThe ci/deploy pipeline: deploy-target is `github` now.\n")
+        res = roll_recent_state(mem, tmp_path / "archive", max_age_days=7, verify_homing=True)
+        assert len(res["evicted"]) == 1
+        assert "**CI/deploy**" not in mem.read_text()       # evicted out
+
+    def test_pointer_target_absent_keeps(self, tmp_path):
+        # home file does not exist at all → cannot verify → KEEP (conservative)
+        bullet = ("- **CI/deploy** (07-01): deploy-target=`github` RESOLVED. "
+                  "→ project/missing.md")
+        mem = tmp_path / "MEMORY.md"
+        mem.write_text(_doc(bullet))
+        res = roll_recent_state(mem, tmp_path / "archive", max_age_days=7, verify_homing=True)
+        assert res["evicted"] == []
+        assert "**CI/deploy**" in mem.read_text()

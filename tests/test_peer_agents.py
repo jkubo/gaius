@@ -51,7 +51,7 @@ class TestContentBlocks:
 
 class TestGrokParser:
     def _session(self, tmp_path, rows, summary=None):
-        sess = tmp_path / "%2Fhome%2Fjkubo%2Fansible" / "019ed463-uuid"
+        sess = tmp_path / "%2Fhome%2Fuser%2Fproject" / "019ed463-uuid"
         _write_jsonl(sess / "chat_history.jsonl", rows)
         if summary is not None:
             (sess / "summary.json").write_text(json.dumps(summary))
@@ -124,7 +124,7 @@ class TestGrokParser:
     def test_missing_summary_falls_back_to_dirname(self, tmp_path):
         rows = [
             {"type": "user", "content": [{"type": "text", "text": "describe the storage tiers please"}]},
-            {"type": "assistant", "content": "SATA on RPi, NVMe on fwd-gpu, edge on DGX — all DRBD-backed."},
+            {"type": "assistant", "content": "Standard tier on small nodes, fast tier on compute nodes, edge tier elsewhere — all replicated."},
         ]
         sess = self._session(tmp_path, rows)  # no summary.json
         events = parse_grok_events(sess)
@@ -139,10 +139,10 @@ class TestGrokParser:
 
     def test_discover(self, tmp_path):
         sessions = tmp_path / "sessions"
-        s1 = sessions / "%2Fhome%2Fjkubo%2Fansible" / "uuid1"
+        s1 = sessions / "%2Fhome%2Fuser%2Fproject" / "uuid1"
         _write_jsonl(s1 / "chat_history.jsonl", [{"type": "system", "content": "x"}])
         # a stray non-session dir without chat_history must be ignored
-        (sessions / "%2Fhome%2Fjkubo%2Fansible" / "not-a-session").mkdir(parents=True)
+        (sessions / "%2Fhome%2Fuser%2Fproject" / "not-a-session").mkdir(parents=True)
         found = list(_discover_grok_sessions(sessions))
         assert s1 in found
         assert all((p / "chat_history.jsonl").exists() for p in found)
@@ -157,17 +157,17 @@ class TestCodexParser:
     def test_answer_kept_injected_context_skipped(self, tmp_path):
         rows = [
             {"type": "session_meta", "payload": {
-                "id": "cdx-1", "timestamp": "2026-03-11T12:34:38Z", "cwd": "/home/jkubo/ansible"}},
+                "id": "cdx-1", "timestamp": "2026-03-11T12:34:38Z", "cwd": "/srv/project"}},
             {"type": "event_msg", "payload": {"type": "task_started"}},
             {"type": "response_item", "payload": {"type": "message", "role": "developer",
              "content": [{"type": "input_text", "text": "<permissions instructions> ..."}]}},
             {"type": "response_item", "payload": {"type": "message", "role": "user",
-             "content": [{"type": "input_text", "text": "<environment_context><cwd>/home/jkubo/ansible</cwd>"}]}},
+             "content": [{"type": "input_text", "text": "<environment_context><cwd>/srv/project</cwd>"}]}},
             {"type": "response_item", "payload": {"type": "message", "role": "user",
              "content": [{"type": "input_text", "text": "which storageclass for a new DRBD PVC?"}]}},
             {"type": "response_item", "payload": {"type": "reasoning", "summary": [], "content": []}},
             {"type": "response_item", "payload": {"type": "message", "role": "assistant",
-             "content": [{"type": "output_text", "text": "Use block-sata for RPi DRBD; block-nvme for fwd-gpu nodes."}]}},
+             "content": [{"type": "output_text", "text": "Use block-standard for replicated small nodes; block-fast for compute nodes."}]}},
         ]
         path = self._rollout(tmp_path, rows)
         events = parse_codex_events(path)
@@ -178,7 +178,7 @@ class TestCodexParser:
         assert ev["timestamp"] == "2026-03-11T12:34:38Z"
         # env-context user message must NOT become the subject
         assert ev["subject"].startswith("which storageclass")
-        assert "block-sata" in ev["description"]
+        assert "block-standard" in ev["description"]
 
     def test_developer_role_ignored(self, tmp_path):
         rows = [

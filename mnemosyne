@@ -10,8 +10,10 @@ Options:
 
 Commands:
   health           Line counts, byte budget, and threshold status for all memory files.
-                   Also lints MEMORY.md for index-line gloss accretion (Gap-32) and,
-                   when over byte budget, points at the heaviest lines to compress.
+                   Also lints MEMORY.md for index-line gloss accretion (Gap-32),
+                   pointers that no longer resolve (Gap-42), changelog bullets that
+                   duplicate an event already recorded (Gap-43), and, when over byte
+                   budget, points at the heaviest lines to compress.
   audit            Scan common.md for entries that belong in domain files
   split <file>     Propose a split plan for an oversized file (never auto-executes)
   prune <file>     Identify redundant or stale entries (never auto-deletes)
@@ -210,6 +212,468 @@ def scan_recent_state_bullets(path: Path, threshold: int = RECENT_STATE_BULLET_W
     return fat
 
 
+# ── Recent State event duplication (Gap-43 structural cure) ──────────────────
+# The index is APPEND-oriented: every session ends by writing a bullet for what
+# it just learned, and nothing checks whether a bullet already covers that event.
+# In practice one incident gets written TWICE by two sessions that each summarise
+# it independently — same issues, same root cause, different prose. Merging a
+# single such pair reclaimed more bytes than every prose trim in that pass
+# combined. So duplication, not growth, is the dominant driver of a RED byte
+# budget. Nothing detected it.
+#
+# Detection is by SHARED RARE IDENTIFIERS, not prose similarity: two bullets on
+# one event cite the same issue/PR numbers, the same commit SHA, the same
+# backticked symbols. Two bullets merely about the same SUBSYSTEM share none of
+# those. Tokens appearing in more than DUP_DF_CAP bullets are common vocabulary
+# for this file and are dropped from every signature.
+#
+# Zero false positives is the bar (same as scan_pointer_resolution). Measured
+# over 30 committed MEMORY.md versions (15-44 bullets each): ONE pair flagged,
+# hand-verified a TRUE duplicate (a multi-issue salvage bullet written twice a
+# day apart, never noticed by any session); zero false positives. A replay of
+# the reconstructed pair rediscovers it.
+#
+# Advisory only. The fix for a hit is a MERGE, never a delete — two bullets on
+# one event usually each carry a detail the other lacks.
+EARLIER_HEADER = "## Earlier"     # rolled changelog — a re-add after roll is the same defect
+DUP_DF_CAP        = 3   # token in > this many bullets = common vocabulary, not an event id
+DUP_MIN_STRONG    = 2   # shared issue/PR refs or SHAs alone
+DUP_MIN_MIXED_WEAK = 2  # ...or 1 strong + this many shared backticked symbols
+DUP_MIN_WEAK      = 4   # ...or this many shared symbols with no strong token
+
+# #NNN issue/PR refs. Bounded to 2-4 digits: `#1` is too common, and longer runs
+# are timestamps/ports, not issues.
+#
+# ENDPOINTS ONLY, deliberately. "#285-#288" contributes {#285, #288} and not the
+# interior. Expanding the span was BUILT AND REVERTED after replay over 40
+# committed MEMORY.md versions: only 3 bullets in that whole history carry a
+# bounded range, expansion found ZERO additional true duplicates, and it produced
+# ONE false positive (two same-day bullets from unrelated workstreams, citing
+# "#144-148" and "#147-154" — flagged as one event purely because two
+# hand-written ranges happen to overlap). Ranges in this file are
+# approximations, so their interiors are not evidence of a shared event. Do not
+# re-add without a population count first; the zero-false-positive bar is what
+# makes this scanner worth reading.
+_DUP_ISSUE = re.compile(r"#(\d{2,4})\b")
+# Hex SHAs. Lookaheads force at least one digit AND one a-f letter, so English
+# words ("added", "deface") and pure numbers never qualify as a commit id.
+_DUP_SHA = re.compile(r"\b(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])([0-9a-f]{7,40})\b")
+# A backticked token counts only if it is identifier-SHAPED: punctuation that
+# occurs in symbols/paths/flags, or a word long enough not to be prose emphasis.
+_DUP_IDENTISH = re.compile(r"[_\-./=]|[a-z]{5,}")
+
+
+def _dup_signature(line: str):
+    """(strong, weak) identifier sets for one bullet. strong = issue refs + SHAs
+    (an event fingerprint); weak = backticked identifier-shaped symbols."""
+    strong = {"#" + m.group(1) for m in _DUP_ISSUE.finditer(line)}
+    strong |= {"sha:" + m.group(1)[:8] for m in _DUP_SHA.finditer(line)}
+    weak = set()
+    for m in RE_TICK.finditer(line):
+        t = m.group(1).strip().lower()
+        if 5 <= len(t) <= 60 and _DUP_IDENTISH.search(t):
+            weak.add(t)
+    return strong, weak
+
+
+def scan_recent_state_duplicates(path: Path, df_cap: int = DUP_DF_CAP):
+    """Pairs of changelog bullets that cite the same rare identifiers — i.e. two
+    sessions wrote the same event twice. Scans '## Recent State' AND '## Earlier'
+    (a bullet re-added after being rolled is the same defect). Returns
+    [(lineno_a, lineno_b, kind, shared_strong, shared_weak, preview_a, preview_b)]
+    strongest-first. Advisory only — the fix is a MERGE, not a delete."""
+    entries = []
+    in_section = False
+    try:
+        for i, raw in enumerate(path.open(), 1):
+            line = raw.rstrip("\n")
+            if line.startswith((RECENT_STATE_HEADER, EARLIER_HEADER)):
+                in_section = True
+                continue
+            if in_section and line.startswith("## "):
+                in_section = False      # keep scanning: Earlier may follow later
+                continue
+            if in_section and line.lstrip().startswith(("-", "*")):
+                body = line.lstrip()
+                s, w = _dup_signature(body)
+                entries.append((i, s, w, body[:50]))
+    except Exception:
+        return []
+
+    df = {}
+    for _, s, w, _ in entries:
+        for t in s | w:
+            df[t] = df.get(t, 0) + 1
+    rare = {t for t, c in df.items() if c <= df_cap}
+
+    hits = []
+    for a in range(len(entries)):
+        for b in range(a + 1, len(entries)):
+            la, sa, wa, pa = entries[a]
+            lb, sb, wb, pb = entries[b]
+            ss, sw = (sa & sb) & rare, (wa & wb) & rare
+            if len(ss) >= DUP_MIN_STRONG:
+                kind = "same-ids"
+            elif ss and len(sw) >= DUP_MIN_MIXED_WEAK:
+                kind = "same-id+symbols"
+            elif len(sw) >= DUP_MIN_WEAK:
+                kind = "same-symbols"
+            else:
+                continue
+            hits.append((la, lb, kind, sorted(ss), sorted(sw), pa, pb))
+    hits.sort(key=lambda h: (-len(h[3]), -len(h[4])))
+    return hits
+
+
+# ── MEMORY.md pointer resolution (Gap-42 structural cure) ────────────────────
+# A pointer is a CLAIM about another file, and it rots independently of the
+# bullet it sits on — in one surgeon pass ~30% of MEMORY.md pointers
+# were wrong while their bullets were still true. Three rot classes were seen:
+#   (b) dangling      — the target path does not exist
+#   (c) ambiguous     — `networking.md` is BOTH domain/ and troubleshooting/,
+#                       different content; picking one silently reads the wrong file
+#   (a) points at content the target never asserts
+# (b) and (c) are mechanical. The mechanical SUBSET of (a) is a `§anchor` naming
+# a heading/label the target does not have. Semantic (a) — target exists but
+# contradicts the claim — needs a reader and stays with the /mnemos surgeon.
+#
+# Zero false positives is the bar (same as scan_index_completeness). MEMORY.md is
+# dense with backticked code identifiers, k8s verbs, HTTP routes, shell commands
+# and paths into OTHER repos — none are pointers. Everything is rejected unless
+# it looks like a memory-root .md path; see _resolve_pointer's reject ladder.
+
+# Directories a MEMORY.md pointer can legitimately name. Derived from the tree,
+# not from docs (no doc enumerates them). A slashed target whose first segment is
+# absent here is a file in another repo (postmortem/…, manifests/…) — silent.
+POINTER_ROOTS = ("", "domain", "troubleshooting", "project", "specs",
+                 "reference", "skills", "feedback", "user", "sop", "handoffs")
+
+# finditer, never search: 25 MEMORY.md lines carry >=2 targets (one carries 5).
+RE_MD_LINK    = re.compile(r"\[[^\]\n]+\]\((?P<target>[^)\s]+)\)")
+RE_ARROW_BARE = re.compile(r"→\s*\**\s*(?P<target>[A-Za-z0-9_~./-]+\.md)\b")
+RE_TICK       = re.compile(r"`(?P<target>[^`\n]+)`")
+RE_ANCHOR     = re.compile(r"§(?P<anchor>[\w./-]+(?:\s+[a-z]+\s+\d+)?)")
+
+_SCHEME = re.compile(r"^(?:https?|mailto|ftp|git\+ssh)://|^//")
+# Characters that cannot occur in a memory path but are everywhere in the code
+# tokens MEMORY.md quotes: verbs like pods/exec:create, glob-shaped config keys,
+# wildcarded module paths, and bare prefixes such as WIP:
+_BAD_PATH_CHARS = set(":@$(){}<>|&!*?")
+# A trailing "step 5" / "line 3" qualifier is not part of the section name.
+_ANCHOR_STOPWORDS = {"step", "steps", "line", "lines", "section", "part", "item", "no"}
+
+
+def _normalize_target(raw: str, root: Path):
+    """Root-relative POSIX string, or None if the target is out of scope.
+
+    Absolute and ~-rooted targets are resolved and kept only if they land inside
+    the memory root — the same tree is addressable three ways here
+    (a config dir, a checkout, and a symlinked alias can all name it), so the
+    root is canonicalized once and everything is compared against it.
+    """
+    t = raw.strip()
+    if t.startswith("~") or t.startswith("/"):
+        try:
+            p = Path(t).expanduser().resolve()
+            return p.relative_to(root).as_posix()
+        except (OSError, RuntimeError, ValueError):
+            return None          # unreadable, or a real file in another tree
+    return t
+
+
+def _resolve_pointer(raw: str, root: Path):
+    """('ok', Path|None) | ('dangling', None) | ('ambiguous', [Path,...]) | ('skip', None).
+
+    'skip' means "not a pointer" — the reject ladder below is what makes this
+    check quiet, not the resolver.
+    """
+    if not raw or _SCHEME.match(raw):
+        return ("skip", None)                       # URLs
+    if any(c.isspace() for c in raw):
+        return ("skip", None)                       # shell commands, prose
+    if any(c in _BAD_PATH_CHARS for c in raw):
+        return ("skip", None)                       # k8s verbs, globs, env vars
+
+    # Read the trailing-slash intent BEFORE normalizing: Path.resolve() strips it,
+    # which would silently demote a `<memory-root>/sop/` dir to a non-.md skip.
+    is_dir_ptr = raw.rstrip().endswith("/")
+    rel = _normalize_target(raw, root)
+    if rel is None:
+        return ("skip", None)
+    rel = rel.rstrip("/")
+    if not rel or rel == ".":
+        return ("skip", None)
+
+    if is_dir_ptr:                                  # `domain/`, `sop/` — but not `oms/`
+        if rel not in POINTER_ROOTS:
+            return ("skip", None)
+        return ("ok", root / rel) if (root / rel).is_dir() else ("dangling", None)
+
+    if not rel.endswith(".md"):
+        return ("skip", None)                       # ci.yml, k0.py, ./deploy.sh, `networking`
+
+    if "/" in rel:
+        if rel.split("/", 1)[0] not in POINTER_ROOTS:
+            return ("skip", None)                   # another repo's .md
+        p = root / rel
+        return ("ok", p) if p.exists() else ("dangling", None)
+
+    hits, seen = [], set()                          # bare basename — may collide
+    for r in POINTER_ROOTS:
+        p = (root / r / rel) if r else (root / rel)
+        try:
+            if not p.exists():
+                continue
+            key = p.resolve()
+        except OSError:
+            continue
+        if key not in seen:
+            seen.add(key)
+            hits.append(p)
+    if not hits:
+        return ("dangling", None)
+    if len(hits) > 1:
+        return ("ambiguous", hits)                   # never pick one — ambiguity must be loud
+    if hits[0].parent == root:
+        return ("ok", hits[0])                       # bare name that IS at the root
+    # Resolves, but only because we searched. Gap 42 calls this class (c)
+    # "unresolvable path": the six bare `project_*.md` refs "do not exist at the
+    # memory root", and the surgeon's repair was to path-qualify them. A reader
+    # following the pointer has to guess the directory, so a unique hit is not a
+    # pass — it is an unqualified pointer with a known repair.
+    return ("unqualified", hits)
+
+
+def _anchor_tokens(anchor: str):
+    out = []
+    for t in re.split(r"[\s/_-]+", anchor.strip().lower()):
+        if not t:
+            continue
+        if t.isdigit() or t in _ANCHOR_STOPWORDS:
+            break
+        t = re.sub(r"[^\w]", "", t)
+        if t:
+            out.append(t)
+    return out
+
+
+def _anchor_present(anchor: str, path: Path) -> bool:
+    """Does `anchor` name a heading or a bold label run in `path`?
+
+    Bold labels are mandatory, not a nicety: domain/services.md has no `Registry`
+    heading — the section lives under `**Registry**:`. A heading-only matcher
+    false-positives there. Prefix matching + the stopword/digit break keep
+    `§RBAC step 5` (-> `## RBAC Review Pattern`) a pass.
+    """
+    want = _anchor_tokens(anchor)
+    if not want:
+        return True                                 # e.g. "§5" — nothing checkable
+    try:
+        text = path.read_text(errors="ignore")
+    except (OSError, UnicodeDecodeError):
+        return True                                 # fail quiet
+    for line in text.splitlines():
+        s = line.strip()
+        if not (s.startswith("#") or s.startswith("**")):
+            continue
+        hay = re.sub(r"[^\w\s]", " ", s.lower()).split()
+        if all(any(h.startswith(w) for h in hay) for w in want):
+            return True
+    return False
+
+
+def _extract_pointers(line: str):
+    """[(start, end, target)] — extractors applied in precedence order, with
+    overlapping spans dropped so a link target is not re-read as a bare path."""
+    found = []
+    for rx in (RE_MD_LINK, RE_ARROW_BARE, RE_TICK):
+        for m in rx.finditer(line):
+            s, e = m.span("target")
+            if any(s < pe and ps < e for ps, pe, _ in found):
+                continue
+            found.append((s, e, m.group("target")))
+    found.sort()
+    return found
+
+
+def scan_pointer_resolution(memory_dir: Path):
+    """Every `[x](path)` / `→ path` / backticked `.md` pointer in MEMORY.md must
+    resolve to exactly one real file under the memory root, and a named §anchor
+    must name a real heading or bold label in that file.
+
+    Returns [(relfile, lineno, kind, target, detail)] sorted by line, where kind
+    is 'dangling' | 'ambiguous' | 'anchor'. WARN-mode (advisory) — never blocks:
+    mnemosyne's only blocking channel is the RED token the pre-commit hook greps,
+    and stranding the nightly memory auto-commit over a broken link is a worse
+    failure than the broken link. Scope is MEMORY.md (the always-injected file);
+    MNEMOSYNE_POINTER_FILES overrides for experimentation.
+    Kill switch: ~/.gaius/pointer-check-disabled.
+    """
+    try:
+        if (Path.home() / ".gaius" / "pointer-check-disabled").exists():
+            return []
+        root = Path(memory_dir).resolve()
+    except (OSError, RuntimeError):
+        return []
+
+    names = os.environ.get("MNEMOSYNE_POINTER_FILES", "MEMORY.md")
+    findings, seen = [], set()
+    for name in [n.strip() for n in names.split(",") if n.strip()]:
+        path = root / name
+        try:
+            if not path.exists():
+                continue
+            lines = path.read_text(errors="ignore").splitlines()
+        except (OSError, UnicodeDecodeError):
+            continue
+
+        for i, line in enumerate(lines, 1):
+            pointers = _extract_pointers(line)
+            if not pointers:
+                continue
+            resolved = []
+            for s, e, raw in pointers:
+                kind, payload = _resolve_pointer(raw, root)
+                resolved.append((e, raw, kind, payload))
+                if kind == "dangling":
+                    findings.append((name, i, "dangling", raw,
+                                     "no such file under the memory root"))
+                elif kind == "ambiguous":
+                    rels = ", ".join(p.relative_to(root).as_posix() for p in payload)
+                    findings.append((name, i, "ambiguous", raw,
+                                     f"resolves to {len(payload)} files: {rels}"))
+                elif kind == "unqualified":
+                    rel = payload[0].relative_to(root).as_posix()
+                    findings.append((name, i, "unqualified", raw,
+                                     f"not at the memory root — path-qualify it as {rel}"))
+
+            for m in RE_ANCHOR.finditer(line):       # anchor binds to nearest preceding pointer
+                prior = [r for r in resolved if r[0] < m.start()]
+                if not prior:
+                    continue
+                _, raw, kind, payload = max(prior, key=lambda r: r[0])
+                if kind == "unqualified":
+                    payload = payload[0]   # unique hit — the anchor is still checkable
+                elif kind != "ok":
+                    continue
+                if payload is None or not payload.is_file():
+                    continue
+                anchor = m.group("anchor")
+                if not _anchor_present(anchor, payload):
+                    findings.append((name, i, "anchor", raw,
+                                     f"§{anchor} names no heading or bold label in "
+                                     f"{payload.relative_to(root).as_posix()}"))
+
+    out = []
+    for f in findings:                               # dedupe within a line, never across
+        key = (f[0], f[1], f[2], f[3])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(f)
+    out.sort(key=lambda t: (t[0], t[1]))
+    return out
+
+
+# Backticked token that is specific enough that its ABSENCE from the pointer target
+# is evidence. Needs a structural char (path/dot/dash/underscore/colon/bracket) so
+# prose words in backticks don't qualify.
+RE_IDENT = re.compile(r"`([^`\n]{3,80})`")
+RE_IDENT_STRUCT = re.compile(r"[/._:\-\[\]]")
+RE_LINENO_SUFFIX = re.compile(r":\d+(-\d+)?$")
+
+
+def _distinctive_idents(line: str):
+    """Backticked identifiers from a MEMORY.md bullet, minus the pointer paths
+    themselves and anything too generic to be evidence."""
+    out, seen = [], set()
+    for raw in RE_IDENT.findall(line):
+        t = raw.strip().strip(".,;:—")
+        t = RE_LINENO_SUFFIX.sub("", t)        # `drift-scan.sh:23` → `drift-scan.sh`
+        if len(t) < 6 or " " in t:
+            continue
+        if t.endswith(".md"):                  # that's the pointer, not the fact
+            continue
+        if not RE_IDENT_STRUCT.search(t):
+            continue
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def scan_pointer_content(memory_dir: Path):
+    """Gap-42 class (a): a MEMORY.md bullet whose `→ file` pointer RESOLVES but whose
+    target does not actually contain the fact. scan_pointer_resolution goes GREEN on
+    exactly these — it only proves the file exists, never that the content landed —
+    so the mechanical check and the real failure mode were disjoint until this.
+
+    Partial by design, and deliberately so: flags a line only when it carries >=2
+    distinctive backticked identifiers and NOT ONE of them appears in ANY of the
+    line's resolvable targets. That is total absence, which needs no semantic
+    understanding; a fact homed under different wording is NOT flagged (accepted
+    false-negative — the bar here is zero false POSITIVES, same as its sibling).
+
+    Returns [(relfile, lineno, idents, targets, preview)]. WARN-mode (advisory).
+    Kill switch: ~/.gaius/pointer-check-disabled (shared with scan_pointer_resolution).
+    """
+    try:
+        if (Path.home() / ".gaius" / "pointer-check-disabled").exists():
+            return []
+        root = Path(memory_dir).resolve()
+    except (OSError, RuntimeError):
+        return []
+
+    names = os.environ.get("MNEMOSYNE_POINTER_FILES", "MEMORY.md")
+    findings = []
+    for name in [n.strip() for n in names.split(",") if n.strip()]:
+        path = root / name
+        try:
+            if not path.exists():
+                continue
+            lines = path.read_text(errors="ignore").splitlines()
+        except (OSError, UnicodeDecodeError):
+            continue
+
+        for i, line in enumerate(lines, 1):
+            idents = _distinctive_idents(line)
+            if len(idents) < 2:                       # too fragile to judge on one
+                continue
+            targets = []
+            for _s, _e, raw in _extract_pointers(line):
+                kind, payload = _resolve_pointer(raw, root)
+                if kind == "ok" and payload is not None:
+                    targets.append(payload)
+                elif kind == "unqualified" and payload:
+                    targets.append(payload[0])
+            targets = [t for t in targets if t is not None and t.is_file()]
+            if not targets:                           # dangling is the sibling's job
+                continue
+
+            blob = ""
+            for t in targets:
+                try:
+                    blob += t.read_text(errors="ignore")
+                except (OSError, UnicodeDecodeError):
+                    continue
+            if not blob:
+                continue
+            # Whitespace-insensitive: MEMORY.md compresses `pods:create` where the
+            # target writes YAML-style `pods: create`. Same fact, and treating them
+            # as different produced this check's only false positive in testing.
+            # Erring permissive is correct here — the bar is zero false POSITIVES.
+            squash = re.sub(r"\s+", "", blob)
+            if any(ident in blob or re.sub(r"\s+", "", ident) in squash
+                   for ident in idents):
+                continue                              # at least one landed — good enough
+
+            rels = ", ".join(t.relative_to(root).as_posix() for t in targets)
+            findings.append((name, i, idents, rels, line.lstrip()[:50]))
+
+    findings.sort(key=lambda t: (t[0], t[1]))
+    return findings
+
+
 def heaviest_lines(path: Path, n: int = 5):
     """The n longest lines in a file (targeting aid when over byte budget):
     [(lineno, length, preview)] heaviest-first."""
@@ -340,7 +804,10 @@ def cmd_health(memory_dir: Path, args: list):
     yellows = [r for r in files if r[2] <= r[1] < r[3]]
     mem_gloss = scan_index_gloss(_mem) if _mem.exists() else []
     rs_gloss = scan_recent_state_bullets(_mem) if _mem.exists() else []
+    rs_dupes = scan_recent_state_duplicates(_mem) if _mem.exists() else []
     idx_incomplete = scan_index_completeness(memory_dir)
+    ptr_rot = scan_pointer_resolution(memory_dir)
+    ptr_empty = scan_pointer_content(memory_dir)
     if reds:
         print(f"{RED}{BOLD}⚠  {len(reds)} file(s) over limit:{RESET} "
               + ", ".join(r[0] for r in reds))
@@ -370,6 +837,32 @@ def cmd_health(memory_dir: Path, args: list):
               f"file + leave a pointer, or `gaius recent-roll` evicts it once done):{RESET}")
         for lineno, gloss, total, preview in rs_gloss:
             print(f"   MEMORY.md:{lineno}  {gloss}B gloss / {total}B line  {preview}…")
+    if rs_dupes:
+        print(f"{YELLOW}⚡  {len(rs_dupes)} changelog bullet pair(s) cite the SAME event "
+              f"(Gap-43 duplication — two sessions wrote one event twice; this is the "
+              f"dominant byte-growth vector. MERGE them, never delete: each usually "
+              f"carries a detail the other lacks):{RESET}")
+        for la, lb, kind, ss, sw, pa, pb in rs_dupes:
+            shared = ", ".join(ss + sw[:4])
+            print(f"   MEMORY.md:{la} ~ :{lb}  [{kind}] shared: {shared}")
+            print(f"      :{la}  {pa}…")
+            print(f"      :{lb}  {pb}…")
+    if ptr_rot:
+        print(f"{YELLOW}⚡  {len(ptr_rot)} MEMORY.md pointer(s) do not resolve "
+              f"(Gap-42 pointer rot — a pointer is a CLAIM about another file and "
+              f"rots independently of its bullet; repair the path or re-home the "
+              f"fact, do not just delete the arrow):{RESET}")
+        for relfile, lineno, kind, target, detail in ptr_rot:
+            print(f"   {relfile}:{lineno}  {kind}: {target} — {detail}")
+    if ptr_empty:
+        print(f"{YELLOW}⚡  {len(ptr_empty)} MEMORY.md pointer(s) RESOLVE but the target "
+              f"does not contain the fact (Gap-42 class (a) — the bullet was compressed "
+              f"behind an arrow before it was homed; promote the content, then compress):{RESET}")
+        for relfile, lineno, idents, rels, preview in ptr_empty:
+            shown = ", ".join(f"`{d}`" for d in idents[:4])
+            more = f" +{len(idents) - 4}" if len(idents) > 4 else ""
+            print(f"   {relfile}:{lineno}  none of {shown}{more} in {rels}")
+            print(f"                 {preview}…")
     if idx_incomplete:
         miss = [k for k, knd in idx_incomplete if knd == "missing"]
         ghost = [k for k, knd in idx_incomplete if knd == "ghost"]
@@ -390,7 +883,8 @@ def cmd_health(memory_dir: Path, args: list):
             print(f"     MEMORY.md:{lineno}  {length}B  {preview}…")
     if (not reds and not yellows and not joined and not longish
             and not byte_red and not byte_yellow and not mem_gloss
-            and not rs_gloss and not idx_incomplete):
+            and not rs_gloss and not rs_dupes and not idx_incomplete and not ptr_rot
+            and not ptr_empty):
         print(f"{GREEN}✓  All files within threshold.{RESET}")
     print()
 

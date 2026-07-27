@@ -21,7 +21,7 @@ from gaius._core import init_db
 # Pulls completed-task outcomes from the orchestrator GET /outcomes into facts.db's
 # task_outcomes table. ADDITIVE — never touches the facts table; idempotent by task key.
 # Foundation for outcome-grounded corpus scoring (Phase 2) + the gaius router (Phase 3).
-# Scope: ~/ansible/drafts/closed-loop-self-improvement-scope-20260623.md
+# Scope: closed-loop self-improvement (internal design note)
 
 def _ensure_outcomes_table(conn: sqlite3.Connection) -> None:
     conn.execute(

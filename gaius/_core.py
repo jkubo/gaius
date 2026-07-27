@@ -1829,11 +1829,83 @@ NOISE_PATTERNS = [
     re.compile(r'^(Remaining from|Blocked on|blocked on you)', re.IGNORECASE),
 ]
 
+# ── Anchored mid-reasoning narration ───────────────────────────────────────
+# A session's own planning prose ("Let me find out why…", "Now let me verify…")
+# gets mined as a pending "fact", so one session's reasoning becomes the next
+# session's review queue — measured ~7 new/day steady-state, which makes hand
+# draining a treadmill.
+#
+# The clause must BEGIN within the first _NARRATION_ANCHOR_CHARS characters.
+# That offset bound is the entire safety property: measured against the live
+# pending set, the anchored form is ~100% precision over a 28-sample read, while
+# the loose anywhere-in-text form matches ~24% of the queue and swallows real
+# operational facts embedded mid-paragraph. Do NOT relax the bound.
+_NARRATION_ANCHOR_CHARS = 40
+
+_NARRATION_CLAUSE = re.compile(
+    r"\b(?:"
+    r"let me"
+    r"|let['’]s(?!\s+encrypt\b)"   # "Let's Encrypt" is an issuer, not narration
+    r"|i['’]ll"
+    r"|i will"
+    r"|i need to"
+    r"|i['’]m going to"
+    r"|i am going to"
+    r")\s+\S",
+    re.IGNORECASE,
+)
+
+# Reviewer-of-record verdict prose from a prior mnemos session — meta, not ops.
+# Covers the QUOTED form ("… is my own prior verdict: \"Fact 3941 = … Keep\" …"),
+# where the fact-ref sits mid-sentence and the verdict word follows closely.
+_REVIEWER_VERDICT = re.compile(
+    r"\bfact\s+\d+\s*=.{0,120}?\b(?:reject|keep via agent-review|defer)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# The AUTHORED form — the verdict a mnemos session writes about a numbered fact.
+# Measured 2026-07-26 over the 19,817 live facts: the pattern above caught 2 of
+# the 13 live instances (~15% recall), because the assessment clause between the
+# "=" and the verdict routinely runs 150-200 chars — past the 120-char window and
+# past the 200-char head slice. Split into two conditions instead of widening it:
+#
+#   OPENER — the fact-ref must OPEN the text (markdown emphasis tolerated). This
+#            is the precision anchor, same discipline as _NARRATION_ANCHOR_CHARS.
+#            All 12 live texts that open this way are reviewer verdicts.
+#   TERM   — a gaius review VERB (`agent-review`, `gaius reject`) anywhere, or a
+#            verdict token that TERMINATES the text. Terminal-only is what keeps
+#            a mid-sentence "…the operator may reject the claim." out of scope.
+#
+# Both must hold. Yield: 11 of 12 (the 12th carries no verdict term at all —
+# under-catching is the intended failure mode).
+_REVIEWER_VERDICT_OPENER = re.compile(r"^[\s*_#>\-]{0,8}fact\s+\d+\s*=", re.IGNORECASE)
+
+_REVIEWER_VERDICT_TERM = re.compile(
+    r"\bagent-review\b"
+    r"|\bgaius\s+(?:reject|defer)\b"
+    r"|\b(?:reject|keep|defer)\b[^.!?]{0,20}[.!]\s*$"
+    r"|\bdefer(?:red)?\b[^.]{0,24}\bdays?\b",
+    re.IGNORECASE,
+)
+
+
 def _is_noise(text: str) -> bool:
     """Return True if text matches known boilerplate/navigation patterns."""
+    head = text[:200]  # only check first 200 chars
     for pat in NOISE_PATTERNS:
-        if pat.search(text[:200]):  # only check first 200 chars
+        if pat.search(head):
             return True
+    if _REVIEWER_VERDICT.search(head):
+        return True
+    # Authored reviewer verdict: anchored opener AND a review term. Checked over
+    # the FULL text — the verdict is the last clause, not the first 200 chars.
+    if _REVIEWER_VERDICT_OPENER.search(text) and _REVIEWER_VERDICT_TERM.search(text):
+        return True
+    # Anchored only — a planning clause that STARTS past the bound is prose
+    # wrapped around a real fact, and dropping it destroys signal.
+    m = _NARRATION_CLAUSE.search(text[:_NARRATION_ANCHOR_CHARS + 20])
+    if m and m.start() < _NARRATION_ANCHOR_CHARS:
+        return True
     return False
 
 # ── Seeded scores: content-type → initial score ────────────────────────────
@@ -2088,9 +2160,20 @@ def _promote_mined_to_facts(conn: sqlite3.Connection, session_stem: str,
         # Use seeded score based on content type
         score = _seeded_score(block)
 
+        # fact_type is 'operational' (the schema default), NOT 'structural'.
+        # An auto-mined block is arbitrary session prose — it may be design, but it is just
+        # as often a point-in-time state snapshot. 'structural' is the no-decay class
+        # (volatility_recency() returns exactly 1.0 for it), so tagging every mined block
+        # structural made stale state claims immortal: 89% of the corpus sat decay-proof.
+        # Only rate a fact 'structural' where something actually knows it is design-level.
+        # ⚠️ GO-FORWARD ONLY. This fixes new writes; it migrates nothing. Measured
+        # 2026-07-26, AFTER the fix: 17,631 of 19,818 live facts (88.9%) are still
+        # 'structural', and no shipped command can reclassify them — `_corroborate`'s
+        # UPDATE does not touch fact_type, and cmd_rescore rewrites provenance/score
+        # only. Do not read this comment as "the decay-proof corpus problem is closed."
         upsert_fact(conn, domain, fact_key, block[:500],
                     _DEFAULT_PRINCIPAL, session_stem, "auto-mined",
-                    score=score, source="autonomous", fact_type="structural",
+                    score=score, source="autonomous", fact_type="operational",
                     injection_weight=0.7)
         count += 1
 
@@ -2149,9 +2232,10 @@ def cmd_retire(args):
                         domain = _d
                         break
                 
+                # 'operational', not 'structural' — same reasoning as _promote_mined_to_facts.
                 upsert_fact(conn, domain, fact_key, fact_text,
                             _DEFAULT_PRINCIPAL, path.stem, provenance,
-                            outcome=outcome, source="autonomous", fact_type="structural",
+                            outcome=outcome, source="autonomous", fact_type="operational",
                             injection_weight=0.7, score=_seeded_score(fact_text))
                 new_facts += 1
         print(f"Imported {new_facts} facts from Claude sessions.")
@@ -2842,6 +2926,9 @@ def cmd_s3_retire(args):
 
 
 SKILL_STALE_DAYS = 90  # flag skills not touched in git for this many days
+SKILL_PATH_WEIGHT = 10.0  # per-glob-match weight in compute_skill_score — a path match is
+                          # ground truth (the file IS this skill's domain), weighted well
+                          # above keyword overlap (frontmatter=3.0, body=0.5)
 
 
 def get_skill_git_date(skill_path: Path) -> str | None:
@@ -2890,6 +2977,10 @@ def load_skills(domain_filter=None):
         if isinstance(also_load_raw, str):
             also_load_raw = [s.strip() for s in also_load_raw.split(",") if s.strip()]
 
+        paths_raw = fm.get("paths", []) or []
+        if isinstance(paths_raw, str):
+            paths_raw = [s.strip() for s in paths_raw.split(",") if s.strip()]
+
         skills.append({
             "name":      p.stem,
             "fm":        fm,
@@ -2898,7 +2989,9 @@ def load_skills(domain_filter=None):
             "tokens":    estimate_tokens(text),
             "domain":    fm.get("domain", ""),
             "gate":      fm.get("gate", "reference"),
+            "hidden":    bool(fm.get("hidden", False)),
             "also_load": also_load_raw,
+            "paths":     paths_raw,
             "git_date":  git_date or "unknown",
             "is_stale":  is_stale,
             "path":      p,
@@ -2907,25 +3000,113 @@ def load_skills(domain_filter=None):
     return skills
 
 
-def compute_skill_score(skill: dict, context_terms: set) -> float:
-    """Score a skill against context terms. Returns score-per-token (density).
+def _skill_path_match(path: str, pattern: str) -> bool:
+    """Match a repo-relative path against a gitignore-style glob.
 
-    Scoring:
+    Version-agnostic (works pre-3.13, unlike PurePath.full_match). Supports
+    '*' (matches within one path segment, not across '/'), '**' (matches any
+    number of segments, including zero), and '?' (single non-'/' char). Anchored.
+    """
+    i, n = 0, len(pattern)
+    out = ["(?s:"]
+    while i < n:
+        c = pattern[i]
+        if c == "*":
+            if pattern[i:i+2] == "**":
+                i += 2
+                if pattern[i:i+1] == "/":
+                    i += 1
+                    out.append("(?:.*/)?")   # '**/' → zero or more segments
+                else:
+                    out.append(".*")          # trailing '**' → anything
+                continue
+            out.append("[^/]*")               # single '*' → within one segment
+        elif c == "?":
+            out.append("[^/]")
+        elif c == "/":
+            out.append("/")
+        else:
+            out.append(re.escape(c))
+        i += 1
+    out.append(r")\Z")
+    try:
+        return re.match("".join(out), path) is not None
+    except re.error:
+        return False
+
+
+def _glob_specificity(pattern: str) -> float:
+    """Higher = more specific glob. Literal path segments score full; '**' is penalized so
+    a catch-all ('manifests/**/*.yaml') can't outrank a precise one ('manifests/tetragon/*.yaml').
+    Floored at 0.5 so any match still counts for something.
+    """
+    segs = [s for s in pattern.split("/") if s]
+    literal = sum(1 for s in segs if "*" not in s and "?" not in s)
+    return max(0.5, literal - 0.5 * pattern.count("**"))
+
+
+def compute_skill_score(skill: dict, context_terms: set, files: list | None = None,
+                        explain: bool = False):
+    """Score a skill against context terms and active file paths. Returns score-per-token.
+
+    Scoring (highest precedence first):
     - gate:always → float('inf') sentinel; injected outside budget unconditionally
+    - Path-glob signal: active `files` matched against the skill's `paths:` frontmatter
+      globs via PurePath.full_match (real ** support). Ground truth — the file IS this
+      skill's domain — so weighted SKILL_PATH_WEIGHT per match, well above keyword overlap.
     - gate:mandate and gate:hard → floor score + 1.5x multiplier (always beats reference)
-    - gate:reference → score 0 if no context terms (excluded when no signal)
+    - gate:reference → score 0 if NO keyword terms AND NO path match (excluded when no signal)
     - Frontmatter signal (trigger + description + domain) weighted 3x body keywords
     - Returns score-per-token so dense high-signal skills beat long diffuse ones
+
+    Backward-compatible: callers passing no `files` get identical pre-path behavior.
+
+    When explain=True, returns (score, reason) where reason is a dict
+    {primary_signal, detail, matched_terms} naming the single highest-precedence
+    signal that actually contributed (always > path-glob > gate-floor(sole) >
+    keyword > body-keyword). Default (explain=False) returns the bare float,
+    unchanged — many positional callers depend on this.
     """
-    if skill["gate"] == "always":
-        return float("inf")
+    def _ret(score, reason):
+        return (score, reason) if explain else score
 
-    is_hard = skill["gate"] in ("hard", "mandate")
+    gate = skill["gate"]
+    if gate == "always":
+        return _ret(float("inf"),
+                    {"primary_signal": "always", "detail": "gate: always", "matched_terms": []})
 
-    if not context_terms:
-        # No context signal — only inject hard gates, everything else excluded
-        raw = 0.5 if is_hard else 0.0
-        return (raw * 1.5 if is_hard else 0.0) / skill["tokens"]
+    is_hard = gate in ("hard", "mandate")
+    tokens = skill["tokens"] if skill["tokens"] > 0 else 1
+
+    # Path-glob signal (strongest). For each active file, take its MOST specific matching
+    # glob so a precise skill outranks a catch-all. Repo-relative paths expected.
+    path_score = 0.0
+    best_pat = None
+    best_spec = 0.0
+    skill_paths = skill.get("paths") or []
+    if files and skill_paths:
+        for f in files:
+            best = 0.0
+            best_f_pat = None
+            for pat in skill_paths:
+                if _skill_path_match(f, pat):
+                    spec = _glob_specificity(pat)
+                    if spec > best:
+                        best = spec
+                        best_f_pat = pat
+            path_score += best
+            if best > best_spec:
+                best_spec = best
+                best_pat = best_f_pat
+
+    if not context_terms and not path_score:
+        # No keyword and no path signal — only inject hard gates, everything else excluded
+        raw = 0.5 * 1.5 if is_hard else 0.0
+        if is_hard:
+            reason = {"primary_signal": "gate-floor", "detail": f"gate: {gate}", "matched_terms": []}
+        else:
+            reason = {"primary_signal": "none", "detail": "no signal", "matched_terms": []}
+        return _ret(raw / tokens, reason)
 
     # Build term sets from frontmatter (high signal) and body (low signal)
     def _terms(text: str) -> set:
@@ -2938,17 +3119,38 @@ def compute_skill_score(skill: dict, context_terms: set) -> float:
     )
     body_signal = _terms(skill["body"])
 
-    overlap_fm   = len(context_terms & fm_signal)
-    overlap_body = len(context_terms & body_signal)
+    matched_fm   = sorted(context_terms & fm_signal)
+    matched_body = sorted(context_terms & body_signal)
+    overlap_fm   = len(matched_fm)
+    overlap_body = len(matched_body)
 
-    score = (overlap_fm * 3.0) + (overlap_body * 0.5)
+    score = (path_score * SKILL_PATH_WEIGHT) + (overlap_fm * 3.0) + (overlap_body * 0.5)
 
     # Hard gate floor — injected even with weak context match
     if is_hard:
         score = max(score, 0.5)
         score *= 1.5
 
-    return score / skill["tokens"] if skill["tokens"] > 0 else 0.0
+    # Choose the single primary signal by precedence (mirrors the score ladder).
+    if path_score > 0:
+        reason = {"primary_signal": "path-glob",
+                  "detail": f"path-glob match on {best_pat}", "matched_terms": []}
+    elif is_hard and overlap_fm == 0 and overlap_body == 0:
+        # gate-floor is the only thing keeping it in
+        reason = {"primary_signal": "gate-floor", "detail": f"gate: {gate}", "matched_terms": []}
+    elif overlap_fm > 0:
+        reason = {"primary_signal": "keyword",
+                  "detail": f"frontmatter keyword match: {', '.join(matched_fm[:4])}",
+                  "matched_terms": matched_fm}
+    elif overlap_body > 0:
+        reason = {"primary_signal": "body-keyword",
+                  "detail": f"body keyword match: {', '.join(matched_body[:4])}",
+                  "matched_terms": matched_body}
+    else:
+        reason = {"primary_signal": "gate-floor" if is_hard else "none",
+                  "detail": f"gate: {gate}" if is_hard else "no signal", "matched_terms": []}
+
+    return _ret(score / tokens, reason)
 
 
 # ── Landscape Protocol → extracted to gaius/landscape.py (facade re-import below) ──
@@ -3337,7 +3539,7 @@ def cmd_ansible(args):
     """Scan Ansible inventory and manifests, extract operational facts."""
     parser = argparse.ArgumentParser(prog="gaius ansible")
     parser.add_argument("--path", type=str, default=str(Path.home() / "ansible"),
-                        help="Path to ansible repo root (default: ~/ansible)")
+                        help="Path to ansible repo root (default: ~/ansible)")  # leak-scan:allow -- generic default for an Ansible-scanning command, not one deployment's tree
     parser.add_argument("--dry-run", action="store_true",
                         help="Show what would be extracted without writing to facts.db")
     parser.add_argument("--max-chars", type=int, default=50000,
@@ -4877,7 +5079,11 @@ def cmd_skills(args):
     parser.add_argument("--stale", action="store_true", help="Show only stale skills")
     parser.add_argument("--score", type=str, default=None,
                         help="Score skills against this context string and show ranked output")
+    parser.add_argument("--files", type=str, default=None,
+                        help="Comma-separated file paths to match against skill `paths:` globs")
     parsed = parser.parse_args(args)
+
+    score_files = [f.strip() for f in parsed.files.split(",") if f.strip()] if parsed.files else None
 
     skills = load_skills()
 
@@ -4890,10 +5096,11 @@ def cmd_skills(args):
         print("No skills found.")
         return
 
-    # If --score provided, rank by score descending
-    if parsed.score:
-        context_terms = set(re.sub(r'[^\w\s]', ' ', parsed.score.lower()).split())
-        skills = sorted(skills, key=lambda s: compute_skill_score(s, context_terms), reverse=True)
+    # If --score/--files provided, rank by score descending
+    score_active = bool(parsed.score or parsed.files)
+    if score_active:
+        score_ctx = set(re.sub(r'[^\w\s]', ' ', (parsed.score or "").lower()).split())
+        skills = sorted(skills, key=lambda s: compute_skill_score(s, score_ctx, files=score_files), reverse=True)
 
     col_name   = max(len(s["name"])   for s in skills) + 2
     col_domain = max((len(s["domain"]) for s in skills), default=6) + 2
@@ -4902,7 +5109,7 @@ def cmd_skills(args):
     stale_marker = f"  {YELLOW}STALE{RESET}"
 
     header = f"\n{'Name':<{col_name}} {'Domain':<{col_domain}} {'Gate':<{col_gate}} {'Modified':<12} {'Lines':>5}"
-    if parsed.score:
+    if score_active:
         header += "   Score/tok"
     print(header)
     print("─" * (col_name + col_domain + col_gate + 42))
@@ -4915,9 +5122,9 @@ def cmd_skills(args):
         if s["is_stale"]:
             stale_count += 1
         row = f"{s['name']:<{col_name}} {s['domain']:<{col_domain}} {s['gate']:<{col_gate}} {date:<12} {lines:>5}"
-        if parsed.score:
-            context_terms = set(re.sub(r'[^\w\s]', ' ', parsed.score.lower()).split())
-            sc = compute_skill_score(s, context_terms)
+        if score_active:
+            score_ctx = set(re.sub(r'[^\w\s]', ' ', (parsed.score or "").lower()).split())
+            sc = compute_skill_score(s, score_ctx, files=score_files)
             row += f"   {sc:.4f}"
         print(row + stale)
 
@@ -4933,6 +5140,49 @@ def cmd_skills(args):
 # Legacy format: ~/.claude/commands/<name>.md (kept for backwards compat)
 CLAUDE_SKILLS_DIR = Path.home() / ".claude" / "skills"
 CLAUDE_COMMANDS_DIR = Path.home() / ".claude" / "commands"
+
+# Frontmatter keys the wired copy must NOT carry. `paths:` makes Claude Code treat
+# the skill as file-glob-conditional, so it drops out of the always-available Skill
+# list (verified 2026-07-25). The source keeps `paths:` — gaius injection reads it.
+STUB_STRIP_FM_KEYS = ("paths",)
+
+
+def _strip_frontmatter_key(text: str, key: str) -> str:
+    """Drop a top-level frontmatter key and its indented continuation lines.
+
+    Everything outside the frontmatter block is left byte-identical. Returns text
+    unchanged if there is no frontmatter.
+    """
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return text
+    end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+    if end is None:
+        return text
+
+    out, i = [lines[0]], 1
+    while i < end:
+        if re.match(rf"^{re.escape(key)}\s*:", lines[i]):
+            i += 1
+            while i < end and lines[i][:1] in (" ", "\t"):
+                i += 1          # swallow the key's indented block/list
+            continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out + lines[end:])
+
+
+def _stub_content(skill: dict) -> str:
+    """Content for the wired copy at ~/.claude/skills/<name>/SKILL.md.
+
+    Keeps the frontmatter — Claude Code shows `description` in the skill picker,
+    and dropping it degrades the picker to the first `#` heading — minus the keys
+    in STUB_STRIP_FM_KEYS.
+    """
+    text = skill["full_text"]
+    for key in STUB_STRIP_FM_KEYS:
+        text = _strip_frontmatter_key(text, key)
+    return text.strip() + "\n"
 
 
 def cmd_commands(args):
@@ -4959,6 +5209,10 @@ def cmd_commands(args):
     skip = {"base", "verification-gate"}
     skills = [s for s in skills if s["name"] not in skip]
 
+    # Soft-hide: skills with `hidden: true` frontmatter are never synced as
+    # slash-command stubs (they still rank/inject via compute_skill_score).
+    skills = [s for s in skills if not s.get("hidden")]
+
     CLAUDE_SKILLS_DIR.mkdir(parents=True, exist_ok=True)
 
     wrote = 0
@@ -4968,32 +5222,36 @@ def cmd_commands(args):
     for s in skills:
         skill_dir = CLAUDE_SKILLS_DIR / s["name"]
         stub_path = skill_dir / "SKILL.md"
-        description = s["fm"].get("description", s["name"])
 
-        # Inline the full skill body so Claude Code gets the content directly
-        # Strip frontmatter — Claude Code doesn't need YAML metadata
-        stub_content = s["body"].strip() + "\n"
+        # Inline the whole skill file so Claude Code gets the content directly.
+        stub_content = _stub_content(s)
 
-        if stub_path.exists():
-            existing = stub_path.read_text()
-            if existing == stub_content:
-                unchanged += 1
-                continue
+        # A symlinked wired copy points back at the source skill file, so both the
+        # read below and write_text() would follow it — comparing against (and then
+        # CLOBBERING) the source file in the skills source dir. Replace the link instead.
+        linked = stub_path.is_symlink()
+        existed = stub_path.exists() and not linked
+        if existed and stub_path.read_text() == stub_content:
+            unchanged += 1
+            continue
 
         if parsed.dry_run:
-            print(f"  {'update' if stub_path.exists() else 'create'}: {s['name']}/SKILL.md")
+            action = "relink" if linked else ("update" if existed else "create")
+            print(f"  {action}: {s['name']}/SKILL.md")
             wrote += 1
             continue
 
         skill_dir.mkdir(parents=True, exist_ok=True)
+        if linked:
+            stub_path.unlink()
         stub_path.write_text(stub_content)
         wrote += 1
-        print(f"  {'updated' if skill_dir.exists() else 'created'}: /{s['name']}")
+        print(f"  {'relinked' if linked else 'updated' if existed else 'created'}: /{s['name']}")
 
     # Prune stale stubs
     pruned = 0
     if parsed.prune:
-        skill_names = {s["name"] for s in load_skills()}
+        skill_names = {s["name"] for s in load_skills() if not s.get("hidden")}
         # Prune modern format (skip symlinks — belong to other tools)
         if CLAUDE_SKILLS_DIR.is_dir():
             for d in CLAUDE_SKILLS_DIR.iterdir():
@@ -5066,11 +5324,11 @@ def cmd_init(args):
     preset_name = "k8s" if preset_choice == "2" else "default"
 
     # Find preset file
-    _script_dir = Path(__file__).parent.parent  # gaius package root
+    _script_dir = Path(__file__).parent  # gaius package dir (ships presets/ + skill/)
     preset_src = _script_dir / "presets" / f"{preset_name}.yaml"
     if not preset_src.exists():
-        # Try relative to installed package
-        preset_src = Path(__file__).parent.parent.parent / "presets" / f"{preset_name}.yaml"
+        # Fallback: un-migrated repo checkout (presets/ still at repo root)
+        preset_src = Path(__file__).parent.parent / "presets" / f"{preset_name}.yaml"
     if not preset_src.exists():
         print(f"ERROR: preset file not found: {preset_src}")
         print("Run from the gaius repo directory or install with pip install gaius-memory.")
@@ -5181,11 +5439,11 @@ def cmd_scaffold_skill(args):
                         help="Write the prompt to PATH instead of stdout")
     parsed = parser.parse_args(args)
 
-    # skill/<name>-scaffold.md lives at the repo root (like presets/ and skill/SKILL.md)
-    _script_dir = Path(__file__).parent.parent  # gaius package root
+    # skill/<name>-scaffold.md ships inside the package (like presets/ and skill/SKILL.md)
+    _script_dir = Path(__file__).parent  # gaius package dir (ships presets/ + skill/)
     tmpl = _script_dir / "skill" / f"{parsed.name}-scaffold.md"
     if not tmpl.exists():
-        tmpl = Path(__file__).parent.parent.parent / "skill" / f"{parsed.name}-scaffold.md"
+        tmpl = Path(__file__).parent.parent / "skill" / f"{parsed.name}-scaffold.md"
     if not tmpl.exists():
         print(f"ERROR: no scaffold template for '{parsed.name}' "
               f"(looked for {parsed.name}-scaffold.md)")
@@ -5876,7 +6134,7 @@ def _generate_skill_draft(candidate: dict) -> str:
     return f"""---
 name: {domain}
 description: "Auto-suggested skill for {domain} domain ({candidate['facts']} facts)"
-origin: kub0
+origin: gaius
 domain: {domain}
 gate: mandate
 trigger: "{domain} operations, debugging, configuration"
@@ -5955,8 +6213,7 @@ def _drift_live(parsed):
         return
     prefix = (registry.get("probe_prefix") or "").strip()
     timeout = registry.get("probe_timeout", 30)
-    mem_base = MEMORY_DIR or (Path.home() / ".claude" / "projects"
-                              / "-home-jkubo-ansible" / "memory")
+    mem_base = MEMORY_DIR or (Path.home() / ".gaius" / "memory")
 
     def _asserted(fil, pattern):
         p = Path(fil).expanduser()
@@ -6104,8 +6361,6 @@ def cmd_drift(args):
     else:
         # Default: alongside the gaius package source
         registry_path = Path(__file__).parent.parent / "drift-facts.yaml"
-        if not registry_path.exists():
-            registry_path = Path.home() / "Projects" / "agent-memory" / "gaius" / "drift-facts.yaml"
 
     if not registry_path.exists():
         print(f"[drift] ERROR: registry not found at {registry_path}", file=sys.stderr)
@@ -6367,6 +6622,11 @@ from gaius.outcomes import (  # noqa: E402,F401  re-export (outcomes split 2026-
     _ensure_outcomes_table, ingest_outcomes, outcome_winrates, cmd_ingest_outcomes,
 )
 
+from gaius.degradation import (  # noqa: E402,F401  re-export (degradation split 2026-07-24)
+    detect_events, store as store_degradation, report as degradation_report,
+    band_for, cmd_degradation,
+)
+
 from gaius.corpus_audit import (  # noqa: E402,F401  re-export (corpus_audit split 2026-07-01)
     REPETITION_THRESHOLD, CONTRADICTION_ENFORCE_MIN_CC, repetition_candidates,
     corpus_audit_stats, enforce_demote, route_suggest, cmd_corpus_audit, cmd_route_suggest,
@@ -6530,6 +6790,7 @@ COMMANDS = {
     "record":          cmd_record,
     "rescore":         cmd_rescore,
     "ingest-outcomes": cmd_ingest_outcomes,
+    "degradation":     cmd_degradation,
     "corpus-audit":    cmd_corpus_audit,
     "route-suggest":   cmd_route_suggest,
     "reconcile":       cmd_reconcile,

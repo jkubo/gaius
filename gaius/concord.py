@@ -881,6 +881,272 @@ def _concord_sync(ns):
         conn.close()
 
 
+# ── baton pass (P0): hand a saturated session to a fresh successor ─────────────────────
+# Model-initiated (never a hook): at 🔴 RED the session runs `gaius concord handoff`, which
+# MOVES THE BATON — writes a structured handoff, converts this session's active claims into
+# `baton:<resource>` pool tasks a fresh successor can atomically take + re-claim, and prints
+# the successor bootstrap. Transfers CONTEXT + CLAIMS + CAPACITY, never AUTHORIZATION: the
+# successor still hits every gate; a handed-off irreversible op still stops for the operator
+# (the "handoffs are not authorization" bright line). With --spawn it also LAUNCHES the
+# successor (an inert `claude --bg --permission-mode plan` session, read-only until the operator
+# adopts it) — but still executes nothing itself: it only moves the baton + stages a successor.
+
+def _active_skill(sid):
+    """This session's active /skill (gaius-inject-prompt persists it to /tmp/.gaius-skill-<sid>)."""
+    try:
+        p = Path(f"/tmp/.gaius-skill-{sid}")
+        if sid and p.exists():
+            return p.read_text().strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _write_handoff(skill, next_steps, sid, severity, body):
+    """Best-effort shell-out to gaius-session-handoff (the canonical writer: frontmatter,
+    session scrape, attestation mirror). Returns the written path or '' on any failure. The
+    claim→pool transfer is the primary artifact; a missing handoff file never aborts it."""
+    import shutil
+    import subprocess
+    exe = shutil.which("gaius-session-handoff") or os.path.expanduser(
+        "~/.local/bin/gaius-session-handoff")
+    if not os.path.exists(exe):
+        return ""
+    cmd = [exe, "--skill", skill or "session", "--session-id", sid or "",
+           "--severity", severity or "normal"]
+    if next_steps and not body:
+        cmd += ["--next", next_steps]  # writer prefers a stdin body, ignoring --next when present
+    try:
+        r = subprocess.run(cmd, input=body or "", capture_output=True, text=True, timeout=15)
+        for line in r.stdout.splitlines():
+            if line.startswith("Handoff written:"):
+                return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _successor_hint(seeded, handoff_path):
+    """The bootstrap a fresh successor (Agent or relaunched session) runs to pick up the baton."""
+    steps = []
+    if handoff_path:
+        steps.append(f"read the handoff: {handoff_path}")
+    if seeded:
+        ids = ", ".join(f"#{s['task_id']}" for s in seeded)
+        steps.append(f"drain the baton pool (`gaius concord task next` → `take`; {ids}), "
+                     f"re-`claim` each resource as you lock on")
+    steps.append("continue the work — escalate any irreversible op to the operator")
+    return " → ".join(steps)
+
+
+# ── launcher (--spawn): the model-initiated twin of the gaius-baton-watch spawner ─────────────
+# `gaius concord handoff --spawn` optionally LAUNCHES the successor it just prepared: a labeled,
+# `--permission-mode plan` (physically read-only) `claude --bg` session pre-hydrated with the
+# handoff via --append-system-prompt-file. This MIRRORS hooks/gaius-baton-watch's step-7 spawn
+# primitive (_build_spawn_cmd / _spawn / _stage_launch there) so the two paths stay behaviorally
+# identical — kept here rather than imported because that spawner lives in a hyphenated hook
+# SCRIPT, not an importable module. Unlike the watcher (a systemd oneshot that needs KillMode=
+# none / systemd-run to keep the cc-daemon off its cgroup), this runs in the operator's own
+# shell where a --bg agent persists on its own. The successor opens INERT: plan mode is
+# read-only and a --bg agent does nothing until the operator adopts it, so --spawn still never
+# executes the handed-off work — it only stages a hydrated successor. Handoffs are context, not
+# authorization. (If these two copies ever drift, gaius-baton-watch is the source of truth.)
+
+# claude --bg prints `backgrounded · <id8> · <name>` — capture the first 8-hex after the word.
+_BG_ID_RE = re.compile(r"backgrounded\D+([0-9a-f]{8})", re.I)
+
+# The successor's opening instruction (verbatim from gaius-baton-watch LOAD_BATON_PROMPT).
+_LOAD_BATON_PROMPT = (
+    "Load this baton: read the handoff in your system prompt, restate the plan and every "
+    "PENDING and IRREVERSIBLE op verbatim, then STOP and wait for the operator. Execute "
+    "nothing — a handoff is context, not authorization.")
+
+
+def _claude_exe():
+    import shutil
+    return shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+
+
+def _build_spawn_cmd(skill, sid8, handoff, model="", effort=""):
+    """Build the `claude --bg --permission-mode plan` successor launch → (name, argv).
+    Mirrors gaius-baton-watch:_build_spawn_cmd — keep the two in sync."""
+    name = f"baton:{skill}:{sid8}"
+    cmd = [_claude_exe(), "--bg", "--name", name,
+           "--append-system-prompt-file", handoff,
+           "--permission-mode", "plan"]
+    if model:
+        cmd += ["--model", model]
+    if effort:
+        cmd += ["--effort", effort]
+    cmd.append(_LOAD_BATON_PROMPT)
+    return name, cmd
+
+
+def _run_spawn(name, cmd, cwd):
+    """Exec the --bg spawn in the predecessor's cwd. Returns the successor's 8-char id, or None
+    on any failure (caller then stages the paste-ready fallback)."""
+    import subprocess
+    try:
+        r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=60)
+    except Exception:
+        return None
+    m = _BG_ID_RE.search((r.stdout or "") + "\n" + (r.stderr or ""))
+    return m.group(1) if m else None
+
+
+def _stage_spawn_launch(sid, name, handoff, model=""):
+    """Write a paste-ready manual-adoption command to ~/.gaius/baton/<sid>.launch (safe-degrade,
+    mirrors gaius-baton-watch:_stage_launch). Returns the path, or '' on failure."""
+    import shlex
+    try:
+        d = Path.home() / ".gaius" / "baton"
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / f"{sid}.launch"
+        m = f" --model {model}" if model else ""
+        p.write_text(
+            "# Paste-ready baton launch — operator fallback if --spawn was declined or the "
+            "--bg spawn failed.\n"
+            f"# Successor label: {name}\n"
+            f"claude --name {shlex.quote(name)} "
+            f"--append-system-prompt-file {shlex.quote(handoff)}{m} --permission-mode plan\n")
+        return str(p)
+    except Exception:
+        return ""
+
+
+def _confirm_tty(prompt):
+    """Read a y/N confirmation from the controlling terminal — NOT stdin, which carries the piped
+    handoff body. Returns True/False, or None when there is no /dev/tty (headless → caller fails
+    closed and skips the spawn)."""
+    try:
+        with open("/dev/tty", "r+") as tty:
+            tty.write(prompt)
+            tty.flush()
+            return tty.readline().strip().lower() in ("y", "yes")
+    except Exception:
+        return None
+
+
+def _spawn_successor(skill, sid, handoff_path, cwd):
+    """Optionally launch the prepared successor. Gated by an interactive y/N (prompt-before-spawn)
+    read off /dev/tty; drops to the paste-ready launch file when declined / headless / spawn
+    fails. Returns an outcome dict for the caller to render + emit in --json. Never raises."""
+    sid8 = (sid or "")[:8] or "session"
+    if not handoff_path:
+        return {"spawned": False, "reason": "no handoff file to hydrate a plan successor "
+                "(--no-handoff, or the writer failed) — spawn skipped"}
+    name, cmd = _build_spawn_cmd(skill, sid8, handoff_path)
+    ok = _confirm_tty(
+        f"\n  spawn successor {name} now?  (claude --bg --permission-mode plan)  [y/N] ")
+    if ok:
+        succ = _run_spawn(name, cmd, cwd)
+        if succ:
+            return {"spawned": True, "name": name, "id": succ}
+        reason = "claude --bg spawn failed"
+    else:
+        reason = ("no controlling terminal (headless) — not spawning"
+                  if ok is None else "declined at the prompt")
+    return {"spawned": False, "name": name,
+            "launch": _stage_spawn_launch(sid, name, handoff_path),
+            "reason": reason + " — staged a paste-ready launch instead"}
+
+
+def _print_spawn(r):
+    if r.get("spawned"):
+        print(f"\n  {_C['green']}⚑ successor spawned{_C['reset']} {r['name']} (id {r['id']}) — "
+              f"plan mode, INERT until you adopt it:")
+        print(f"      claude /resume \"{r['name']}\"      # or: claude agents")
+    else:
+        print(f"\n  {_C['yellow']}⚑ successor NOT spawned{_C['reset']} — {r['reason']}")
+        if r.get("launch"):
+            print(f"      launch when ready: {r['launch']}")
+
+
+def _concord_handoff(ns):
+    conn = init_concord(ns.db or None)
+    sid, pid, name = _self_session()
+    who = name or sid[:8]
+
+    body = ""
+    try:
+        if not sys.stdin.isatty():
+            body = sys.stdin.read()
+    except Exception:
+        body = ""
+
+    skill = ns.skill or _active_skill(sid) or "session"
+    mine = [c for c in _active_claims(conn) if c["session_id"] == sid]
+
+    # True no-op: nothing claimed AND no --next / stdin body. Return BEFORE writing any handoff
+    # file — a bare `handoff` must never litter the handoffs dir (the writer always writes one)
+    # or prune real handoffs via the 3-per-skill cap.
+    if not (mine or ns.next or body):
+        conn.close()
+        if ns.json:
+            print(json.dumps({"handoff": "", "skill": skill, "tasks": [], "successor": ""}))
+        else:
+            print("nothing to hand off — no active claims and no --next / stdin body")
+        return
+
+    now = _utcnow()
+    seeded = []
+
+    def _seed(resource, note):
+        bits = [b for b in (note, ("next: " + ns.next) if ns.next else "") if b]
+        conn.execute(
+            "INSERT INTO pool_tasks (title, detail, resource, created_by, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (f"baton: {resource or skill}", " · ".join(bits), resource, who, now))
+        seeded.append({"task_id": conn.execute("SELECT last_insert_rowid()").fetchone()[0],
+                       "resource": resource})
+
+    for c in mine:
+        _seed(c["resource"], c["note"])
+        conn.execute(
+            "UPDATE claims SET released_at=?, released_reason='handed-off' "
+            "WHERE resource=? AND session_id=? AND released_at IS NULL",
+            (now, c["resource"], sid))
+    if not mine:
+        _seed("", "")  # claimless baton — Edit/Write-only work the hook never auto-claimed
+    conn.commit()  # PRIMARY state (claims released + batons seeded) committed FIRST
+
+    # Handoff file is best-effort and written AFTER the DB transfer commits — so a handoff
+    # artifact can never exist implying a claim transfer that didn't happen. Append its path to
+    # the seeded batons (a fresh successor also gets the file via skill-match injection).
+    handoff_path = "" if ns.no_handoff else _write_handoff(skill, ns.next, sid, ns.severity, body)
+    if handoff_path and seeded:
+        conn.execute(
+            "UPDATE pool_tasks SET detail = detail || ? WHERE id IN (%s)"
+            % ",".join("?" * len(seeded)),
+            [" · handoff: " + handoff_path] + [s["task_id"] for s in seeded])
+        conn.commit()
+
+    if not ns.no_title:
+        _retitle_from_claims(conn, sid, name)  # claims released → tab clears (no-op with no tty)
+    conn.close()
+
+    hint = _successor_hint(seeded, handoff_path)
+    if ns.json:
+        out = {"handoff": handoff_path, "skill": skill, "tasks": seeded, "successor": hint}
+        if getattr(ns, "spawn", False):
+            out["spawn"] = _spawn_successor(skill, sid, handoff_path, os.getcwd())
+        print(json.dumps(out, indent=2))
+        return
+    print(f"{_C['green']}⚑ baton ready{_C['reset']} (skill {skill}, session {who})")
+    if handoff_path:
+        print(f"  handoff: {handoff_path}")
+    for s in seeded:
+        r = f" [{s['resource']}]" if s["resource"] else ""
+        print(f"  {_C['yellow']}pool #{s['task_id']}{_C['reset']}{r} — successor: "
+              f"gaius concord task take {s['task_id']}")
+    print(f"\n  successor bootstrap: {hint}")
+    print(f"\n  {_C['dim']}baton moves context + claims + capacity, NEVER authorization — the "
+          f"successor still hits every gate; a handed-off irreversible op still stops for the "
+          f"operator.{_C['reset']}")
+    if getattr(ns, "spawn", False):
+        _print_spawn(_spawn_successor(skill, sid, handoff_path, os.getcwd()))
+
+
 def cmd_concord(args):
     """Local cross-session coordination (Concord P0). Sidecar DB at ~/.gaius/concord.db.
 
@@ -896,6 +1162,7 @@ def cmd_concord(args):
       gaius concord finding  review <id-prefix> --status confirmed|refuted|reviewing
       gaius concord task     add TITLE [--detail D] [--resource R]   seed the shared pool
       gaius concord task     list [--all] | next | take [ID] | done ID | drop ID
+      gaius concord handoff  [--next "a,b"] [--severity ...] [--no-handoff]  baton pass (body on stdin)
 
     Resource key conventions: subsystem:<name> (e.g. subsystem:storage), node:<name>, svc:<name>,
     incident:IC (incident commander). Claims are ADVISORY — surfaced, never self-enforcing.
@@ -978,6 +1245,19 @@ def cmd_concord(args):
     psy.add_argument("--quiet", action="store_true")
     psy.add_argument("--timeout", type=int, default=4)
 
+    pha = sub.add_parser("handoff", help="baton pass: active claims → pool + structured handoff")
+    pha.add_argument("--skill", default="", help="handoff skill (default: this session's active /skill)")
+    pha.add_argument("--next", default="", help="comma-separated next steps for the successor")
+    pha.add_argument("--severity", default="normal", choices=["normal", "urgent", "critical"])
+    pha.add_argument("--no-handoff", action="store_true",
+                     help="claim→pool transfer only; skip writing the handoff file")
+    pha.add_argument("--no-title", action="store_true")
+    pha.add_argument("--spawn", action="store_true",
+                     help="after preparing the baton, LAUNCH an inert `claude --bg "
+                          "--permission-mode plan` successor hydrated with the handoff "
+                          "(y/N gated; read-only until you adopt it)")
+    pha.add_argument("--json", action="store_true")
+
     ns = p.parse_args(args)
 
     if ns.sub == "claim":
@@ -1005,3 +1285,5 @@ def cmd_concord(args):
         return _concord_brief(ns)
     if ns.sub == "sync":
         return _concord_sync(ns)
+    if ns.sub == "handoff":
+        return _concord_handoff(ns)

@@ -52,7 +52,7 @@ class TestExtraction:
         assert ("cve:cve-2026-43503", "cve-2026-43503", "cve") in ents
 
     def test_model_extraction(self):
-        ents = extract_entities("vigiles runs gemma4-31b on the gx10")
+        ents = extract_entities("the scanner runs gemma4-31b on the edge box")
         assert any(e[2] == "model" and e[1] == "gemma4-31b" for e in ents)
         # bare-number version segments must not break the chain (llama-3-70b)
         ents = extract_entities("benchmarked llama-3-70b and qwen2-72b today")
@@ -102,7 +102,7 @@ class TestExtraction:
         assert any(e[0] == "namespace:seaweedfs-ns" for e in ents)
 
     def test_node_pattern_unchanged(self):
-        ents = extract_entities("k8s-aus-fwd-gpu-01 rebooted")
+        ents = extract_entities("k8s-r1-web-gpu-01 rebooted")
         assert any(e[2] == "node" for e in ents)
 
     def test_high_frequency_prose_incidents_removed(self):
@@ -162,13 +162,13 @@ class TestKgIndexFact:
         # Co-occurrence must never assert strong semantics (affected_by etc.) —
         # a Splunk-CVE fact would otherwise brand postgresql as affected. Cross-
         # type pairs get symmetric mentioned_with with sorted subject.
-        text = "k8s-aus-fwd-gpu-01 vulnerable to CVE-2026-43503"
+        text = "k8s-r1-web-gpu-01 vulnerable to CVE-2026-43503"
         _insert_fact(conn, 1, text, "security")
         kg_index_fact(conn, 1, text, "security")
         row = conn.execute("SELECT subject, predicate, object FROM triples").fetchone()
         assert row[1] == "mentioned_with"
         assert row[0] == "cve:cve-2026-43503"       # sorted: c < n
-        assert row[2] == "node:k8s-aus-fwd-gpu-01"
+        assert row[2] == "node:k8s-r1-web-gpu-01"
         strong = conn.execute(
             "SELECT COUNT(*) FROM triples WHERE predicate IN "
             "('affected_by','has_storage','runs_model')").fetchone()[0]
@@ -184,7 +184,7 @@ class TestKgIndexFact:
         assert {"service:drbd", "service:linstor"} <= fe
 
     def test_relation_derived_entities_get_fact_links(self, conn):
-        text = "cctv-api runs on k8s-aus-fwd-gpu-02 now"
+        text = "cctv-api runs on k8s-r1-web-gpu-02 now"
         _insert_fact(conn, 1, text, "services")
         kg_index_fact(conn, 1, text, "services")
         row = conn.execute(
@@ -205,14 +205,14 @@ class TestKgIndexFact:
     def test_excluded_types_get_no_edges_but_keep_membership(self, conn, monkeypatch):
         import re as _re
         monkeypatch.setattr(kg, "_ENTITY_PATTERNS", {
-            "agent": _re.compile(r"\bclaudeus\b", _re.I),
+            "agent": _re.compile(r"\bnova\b", _re.I),
             "service": _re.compile(r"\bdrbd\b", _re.I),
         })
-        _insert_fact(conn, 1, "claudeus fixed drbd", "storage")
-        kg_index_fact(conn, 1, "claudeus fixed drbd", "storage")
+        _insert_fact(conn, 1, "nova fixed drbd", "storage")
+        kg_index_fact(conn, 1, "nova fixed drbd", "storage")
         assert conn.execute("SELECT COUNT(*) FROM triples").fetchone()[0] == 0
         fe = {r[0] for r in conn.execute("SELECT entity_id FROM fact_entities").fetchall()}
-        assert "agent:claudeus" in fe and "service:drbd" in fe
+        assert "agent:nova" in fe and "service:drbd" in fe
 
     def test_refresh_entity_domains_majority_vote(self, conn):
         for fid, domain in [(1, "storage"), (2, "storage"), (3, "general")]:

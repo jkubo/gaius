@@ -234,6 +234,11 @@ def cmd_inject(args):
                 continue
             injected_skills.append(skill)
             already_injected.add(skill["name"])
+            # Capture why-loaded reason + score for render + telemetry. Second
+            # explain=True call on the winner only — keeps the hot ranking loop
+            # (above, sorted key) free of tuple unpacking.
+            _, skill["_reason"] = compute_skill_score(skill, context_terms, explain=True)
+            skill["_score"] = score
             skills_remaining -= skill["tokens"]
             if skills_remaining <= 0:
                 break
@@ -250,6 +255,16 @@ def cmd_inject(args):
                     injected_skills.append(dep)
                     skills_remaining -= dep["tokens"]
                     seen_names.add(dep_name)
+
+    # Injection telemetry (forward-only, best-effort) — one row per injected skill.
+    # injected_skills is fully assembled here (nothing below appends to it). Runs
+    # even when --skills-budget is 0, to capture gate:always skills. Must never
+    # break inject.
+    try:
+        from gaius.telemetry import log_skill_injection
+        log_skill_injection(os.environ.get("CLAUDE_SESSION_ID", ""), injected_skills)
+    except Exception:
+        pass
 
     # 1. Handle SOP injection if requested or inferred
     sops_to_inject = []
@@ -286,26 +301,15 @@ def cmd_inject(args):
     # Handoffs are structured notes left by previous sessions for skill continuity.
     # Injected BEFORE memory files (1.5) because handoffs are direct session context.
     # Only inject the most recent handoff per skill, and only if <48h old.
-    _HANDOFF_DIR = Path.home() / "Projects" / "agent-memory" / "handoffs"
-    # Alias map: common task names → canonical skill names they should match
-    _SKILL_ALIASES = {
-        "jdt": "jetint",
-        "japan deluxe": "jetint",
-        "japandeluxe": "jetint",
-        "malware": "malint",
-        "detonation": "malint",
-        "trading": "finint",
-        "autotrade": "finint",
-        "polymarket": "finint",
-        "memory": "mnemos",
-        "surgeon": "mnemos",
-        "frontend": "vantage",
-        "console": "vantage",
-        "kub0.ai": "vantage",
-        "storage": "linstor-drbd",
-        "drbd": "linstor-drbd",
-        "linstor": "linstor-drbd",
-    }
+    # Where handoffs live. Override with GAIUS_HANDOFF_DIR.
+    _HANDOFF_DIR = Path(
+        os.environ.get("GAIUS_HANDOFF_DIR", str(Path.home() / ".gaius" / "handoffs"))
+    ).expanduser()
+    # Alias map: common task names → canonical skill names they should match.
+    # Deployment-specific — every install has its own skill vocabulary, so this
+    # ships empty. Populate it with your own {alias: skill} pairs; an exact skill
+    # name in the task string already matches without an alias.
+    _SKILL_ALIASES = {}
     injected_handoffs = []
     if parsed.task and _HANDOFF_DIR.is_dir():
         _ho_task_lower = parsed.task.lower()
@@ -814,7 +818,15 @@ def cmd_inject(args):
     budget_remaining = max(0, parsed.budget - feedback_tokens_used - handoff_tokens_used)
     injected = []
     seen_content_hashes: set = set()
-    _MAX_CORPUS_ENTRIES = 15  # cap to avoid overwhelming context with low-signal tail
+    # Cap to avoid overwhelming context with low-signal tail.
+    # 15 -> 8 (2026-07-26, Gap 40): measured across 6 real tasks, the tail past ~8 is
+    # near-duplicate auto-mined prose. Score CANNOT trim (it is a >0.35 ranking boost,
+    # never a filter -- see landscape.py inject WHERE clause and corpus_audit.enforce_demote),
+    # so this cap, tombstoning, and the INJECT_MIN_PRIORITY floor applied 6 lines below
+    # (default 0.04, _core.py:447 -- live, not opt-in) are the levers that shrink injected
+    # context. Score is not one of them.
+    # Tunable: raise toward 10-12 if a task starts missing context it needs.
+    _MAX_CORPUS_ENTRIES = 8
     for se in scored_entries:
         if se["tokens"] > budget_remaining and not se["in_bootstrap"]:
             continue
@@ -886,6 +898,12 @@ def cmd_inject(args):
             print(header)
             if desc:
                 print(f"_{desc}_")
+            # Why-loaded reason. Omit for gate:always/base (always-on = noise).
+            _reason = skill.get("_reason")
+            if skill["gate"] == "always" or skill["name"] == "base":
+                pass
+            elif _reason and _reason.get("detail"):
+                print(f"_loaded because: {_reason['detail']}_")
             if also:
                 print(f"_Also loads: {', '.join(also)}_")
             print()

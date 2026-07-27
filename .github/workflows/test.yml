@@ -42,10 +42,62 @@ jobs:
         run: |
           # Hardcoded absolute home paths and specific production domains must not appear
           # in shipped Python source. Config-driven substitutes belong in ~/.gaius/config.yaml.
-          INTERNAL="/home/[a-z]+/|kub0\.net|ansible\.venv"
-          SOURCES="gaius/ http_adapter.py gaius_cli presets/"
-          if grep -rE "$INTERNAL" $SOURCES --include="*.py" --include="*.yaml" --include="*.yml"; then
-            echo "FAIL: hardcoded deployment paths found in shipped code"
+          #
+          # SOURCES must list only paths that exist in the published tree. grep exits 2 on a
+          # missing path, and a bare `if grep ...; then fail; fi` reads that error as "no
+          # matches" — which silently disabled this gate: http_adapter.py was dropped from the
+          # mirror (b7dab4b) but left in SOURCES, so the step printed OK while a planted
+          # /home/<user>/ string in gaius/ went unreported. Hence the explicit rc=2 fail-closed
+          # branch below — do not collapse it back into `if grep`.
+          # gaius/ is recursive, so gaius/presets/*.yaml is covered without a separate entry.
+          #
+          # SOURCES and --include are two INDEPENDENT filters: a path listed in SOURCES is
+          # still discarded unless some --include matches it. gaius_cli, mnemosyne and
+          # mnemos-audit are extensionless, so --include="*.py" silently filtered them back
+          # out -- a planted leak in gaius_cli alone returned rc=1 "OK". That mattered most
+          # for gaius_cli, the one shipped file known to carry an absolute path pre-scrub
+          # (the dev tree's shebang), which `make publish` rewrites (Makefile: "shebang:
+          # gaius_cli normalized").
+          # PATTERN PARITY with the Makefile's publish-time leak scan is the point of this
+          # step. It previously matched only absolute /home roots and one production
+          # domain, which is strictly weaker than the publish scan: every private path in
+          # this tree is written ~-rooted, so home-relative maintainer paths and the
+          # private org name all passed this gate and were caught only by `make publish`.
+          # A green run here never meant "safe to push". Keep this pattern, the --include
+          # set, and the leak-scan:allow handling in sync with that scan.
+          #
+          # NOTE: describe additions in the abstract, never by quoting the literal string
+          # -- a comment naming what the pattern hunts makes this file self-match, which is
+          # why the pattern line below carries an allow marker.
+          #
+          # Scan the whole checkout, not just gaius/: this repo IS the published tree, and
+          # the configs most likely to carry an internal endpoint (*.json, *.yml) live at
+          # the root. tests/ is deliberately INCLUDED -- fixtures ship.
+          INTERNAL='kub0\.(net|io)|k8s-(aus|hnd|lax|toa)-|10\.(250|42|43)\.|100\.(64|67)\.|/home/[a-z]+/|(~|\$HOME)/(ansible|\.ssh)|Projects/(agent-memory|Brain)|kub0-ai'  # leak-scan:allow -- this IS the pattern
+          set +e
+          out=$(grep -rInE "$INTERNAL" . \
+                  --include='*.py' --include='*.md' --include='*.yaml' --include='*.yml' \
+                  --include='*.json' --include='*.toml' --include='*.sh' \
+                  --include='gaius_cli' --include='mnemosyne' --include='mnemos-audit' \
+                  --exclude-dir=.git --exclude-dir=__pycache__ --exclude-dir=build)
+          rc=$?
+          set -e
+          if [ "$rc" -eq 2 ]; then
+            echo "FAIL: scan errored (rc=2) — could not read a path. Not the same as clean."
             exit 1
           fi
-          echo "OK: no hardcoded paths found"
+          # A line may carry a `leak-scan:allow` marker (publish.yml holds the pattern
+          # itself, so it self-matches). Allowlisted lines are PRINTED, never silently
+          # dropped -- a marker slapped on a real leak must stay visible every run.
+          allow=$(printf '%s\n' "$out" | grep -F 'leak-scan:allow' || true)
+          hits=$(printf '%s\n' "$out" | grep -Fv 'leak-scan:allow' | grep -v '^$' || true)
+          if [ -n "$allow" ]; then
+            echo "ALLOWLISTED (marker present -- re-review each):"
+            printf '%s\n' "$allow"
+          fi
+          if [ -n "$hits" ]; then
+            printf '%s\n' "$hits"
+            echo "FAIL: internal references found in the published tree"
+            exit 1
+          fi
+          echo "OK: no internal references found"

@@ -113,8 +113,8 @@ For vLLM-served models (Gemma, Nemotron, etc.), session capture requires either:
 
 ### Claude Code
 ```bash
-# From pip
-pip install gaius-memory
+# From git (PyPI name not published yet — do not pip install gaius-memory from PyPI)
+pip install "gaius-memory @ git+https://github.com/jkubo/gaius"
 gaius init --backend claude
 
 # Or manual

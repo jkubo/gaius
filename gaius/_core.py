@@ -5331,7 +5331,7 @@ def cmd_init(args):
         preset_src = Path(__file__).parent.parent / "presets" / f"{preset_name}.yaml"
     if not preset_src.exists():
         print(f"ERROR: preset file not found: {preset_src}")
-        print("Run from the gaius repo directory or install with pip install gaius-memory.")
+        print('Run from the gaius repo directory or: pip install "gaius-memory @ git+https://github.com/jkubo/gaius"')
         return
 
     # Sessions dir (backend-specific default)

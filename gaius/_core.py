@@ -375,7 +375,13 @@ FORMAT_BY_AGENT: dict = {
 #     mapping:
 #       my-claude-agent: operator
 #       my-gemini-agent: researcher
-_DEFAULT_PRINCIPAL_BY_AGENT: dict = {}
+# Gap 48: peer coding agents (Grok CLI / Codex CLI) are self-principals so their
+# facts do not collapse into the shared "operator" bucket by default. Claude and
+# Gemini stay on the operator default unless config overrides.
+_DEFAULT_PRINCIPAL_BY_AGENT: dict = {
+    "grok": "grok",
+    "codex": "codex",
+}
 PRINCIPAL_BY_AGENT: dict = {
     **_DEFAULT_PRINCIPAL_BY_AGENT,
     **_gaius_cfg.get("principals", {}).get("mapping", {}),
@@ -6586,6 +6592,7 @@ from gaius.parsers import (  # noqa: E402
     parse_pentagi_flow_from_jsonl,
     parse_ollama_events,
     _content_blocks_to_text,
+    _grok_operator_query,
     parse_grok_events,
     parse_codex_events,
     _discover_grok_sessions,

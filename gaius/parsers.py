@@ -440,6 +440,37 @@ def _content_blocks_to_text(content) -> str:
     return ""
 
 
+# Harness-injected user-turn noise (Grok Build / Grok CLI wrappers). Not operator.
+_GROK_HARNESS_NOISE = (
+    "<system-reminder>",
+    "<user_info>",
+    "MCP servers currently connecting",
+    "This session is being continued from a previous conversation",
+)
+
+
+def _grok_operator_query(text) -> str | None:
+    """Return real operator text from a Grok user turn, or None for harness noise.
+
+    Grok wraps operator turns in ``<user_query>…</user_query>`` and also injects
+    system-reminder / user_info / MCP-status / continuation blobs as synthetic
+    user messages. Retire/subject extraction must not treat those as queries.
+    """
+    if not isinstance(text, str):
+        return None
+    raw = text.strip()
+    if not raw:
+        return None
+    m = re.search(r"<user_query>\s*(.*?)\s*</user_query>", raw, flags=re.DOTALL | re.IGNORECASE)
+    if m:
+        inner = m.group(1).strip()
+        return inner or None
+    for marker in _GROK_HARNESS_NOISE:
+        if marker in raw:
+            return None
+    return raw
+
+
 def parse_grok_events(session_dir: Path) -> list[dict]:
     """Parse a Grok CLI session directory into gaius decision events.
 
@@ -479,9 +510,11 @@ def parse_grok_events(session_dir: Path) -> list[dict]:
                     continue
                 mtype = msg.get("type")
                 if mtype == "user":
-                    # Grok wraps operator turns in literal <user_query> tags
-                    last_user = re.sub(r'</?user_query>', '',
-                                       _content_blocks_to_text(msg.get("content"))).strip()
+                    # Prefer real operator text; ignore harness-injected user turns
+                    # so a system-reminder does not overwrite the last real query.
+                    q = _grok_operator_query(_content_blocks_to_text(msg.get("content")))
+                    if q is not None:
+                        last_user = q
                 elif mtype == "assistant":
                     # tool_calls present → mid-turn narration, not the answer
                     if msg.get("tool_calls"):

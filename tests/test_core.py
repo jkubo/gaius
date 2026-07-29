@@ -119,9 +119,11 @@ class TestDefaultPrincipal:
         """With blank config, default principal should be 'operator'."""
         assert _DEFAULT_PRINCIPAL == "operator"
 
-    def test_default_principal_by_agent_is_empty(self):
-        """No hardcoded agent→principal mappings in public defaults."""
-        assert _DEFAULT_PRINCIPAL_BY_AGENT == {}
+    def test_peer_agents_are_self_principals(self):
+        """Gap 48: Grok/Codex self-principals; no other hardcoded mappings."""
+        assert _DEFAULT_PRINCIPAL_BY_AGENT == {"grok": "grok", "codex": "codex"}
+        assert agent_to_principal("grok") == "grok"
+        assert agent_to_principal("codex") == "codex"
 
     def test_unknown_agent_falls_back(self):
         result = agent_to_principal("totally-unknown-xyz-999")

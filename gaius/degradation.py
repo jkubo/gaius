@@ -76,13 +76,21 @@ def _fill(usage: dict) -> int:
 
 
 def _main_assistant_usage(obj: dict):
-    """usage dict of a MAIN (non-sidechain, non-meta) assistant turn, else None."""
+    """usage dict of a MAIN (non-sidechain, non-meta) assistant turn, else None.
+
+    ABORTED-TURN GUARD (2026-07-28, keep in sync with hooks/gaius-context-gauge): an interrupted
+    turn (dropped connection, cancel, timeout) still writes a usage record with EVERY token field
+    0. That is the absence of a measurement, not a measurement of zero. In the gauge it produced
+    a false GREEN at ~280K fill; here it would poison the turn_fuel table with phantom 0-fill
+    turns and drag every band's event-rate denominator. A real assistant turn always carries
+    nonzero input+cache_read, so an all-zero fill is unambiguously a stub — drop it.
+    """
     if obj.get("isSidechain") or obj.get("isMeta"):
         return None
     msg = obj.get("message") or {}
     usage = msg.get("usage")
     if usage and (msg.get("role") == "assistant" or obj.get("type") == "assistant"):
-        return usage
+        return usage if _fill(usage) > 0 else None
     return None
 
 

@@ -204,6 +204,9 @@ def _run_handoff(db, monkeypatch, sid="baton-sess", next_steps="", body="", as_j
                  spawn=False):
     import argparse
     import io
+    # Clear Grok ambient flags so Claude session identity wins in dual-harness shells.
+    monkeypatch.delenv("GROK_AGENT", raising=False)
+    monkeypatch.delenv("GROK_SESSION_ID", raising=False)
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", sid)
     monkeypatch.setattr("sys.stdin", io.StringIO(body))  # deterministic; never blocks/raises
     cc._concord_handoff(argparse.Namespace(
@@ -288,6 +291,8 @@ def _run_handoff_writer_spy(db, monkeypatch, sid="baton-sess", next_steps="", bo
     import io
     calls = []
     monkeypatch.setattr(cc, "_write_handoff", lambda *a, **k: (calls.append(a), ret)[1])
+    monkeypatch.delenv("GROK_AGENT", raising=False)
+    monkeypatch.delenv("GROK_SESSION_ID", raising=False)
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", sid)
     monkeypatch.setattr("sys.stdin", io.StringIO(body))
     cc._concord_handoff(argparse.Namespace(
@@ -415,6 +420,8 @@ def test_handoff_spawn_launches_when_confirmed(tmp_path, monkeypatch, capsys):
     seen = {}
     monkeypatch.setattr(cc, "_run_spawn",
                         lambda name, cmd, cwd: seen.update(name=name, cmd=cmd) or "abcd1234")
+    monkeypatch.delenv("GROK_AGENT", raising=False)
+    monkeypatch.delenv("GROK_SESSION_ID", raising=False)
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "baton-sess")
     monkeypatch.setattr("sys.stdin", io.StringIO("real body"))
     cc._concord_handoff(argparse.Namespace(
@@ -438,9 +445,303 @@ def test_handoff_without_spawn_flag_never_launches(tmp_path, monkeypatch):
     conn = cc.init_concord(db)
     cc._try_claim(conn, "subsystem:x", "baton-sess", 0, "", "", 3600)
     conn.close()
+    monkeypatch.delenv("GROK_AGENT", raising=False)
+    monkeypatch.delenv("GROK_SESSION_ID", raising=False)
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "baton-sess")
     monkeypatch.setattr("sys.stdin", io.StringIO("body"))
     cc._concord_handoff(argparse.Namespace(
         db=db, skill="", next="", severity="normal",
         no_handoff=True, no_title=True, spawn=False, json=True))
     assert ran == []
+
+
+# ── prompt-delta: peer CLAIM acquisition (2026-07-27 gap) ───────────────────────────
+# Before this, the delta carried findings + steals but never a peer ACQUIRING a lane.
+# The full roster renders only at --scope session-start, so a claim created after a
+# session started was invisible to it forever. Observed live: a /mythos session audited
+# subsystem:mythos-audit-ansible for ~1h while a peer held the claim; nothing surfaced.
+
+def test_peer_claim_surfaces_in_prompt_delta(tmp_path, capsys):
+    """The load-bearing case: peer claims a lane AFTER my session started."""
+    import os
+    db = str(tmp_path / "c.db")
+    cc.init_concord(db).close()
+    assert _brief(db, "prompt", "viewer", capsys) == ""  # cursor init
+    conn = cc.init_concord(db)
+    cc._try_claim(conn, "subsystem:mythos-audit-ansible", "peer", os.getpid(), "ansible-6c", "", 3600)
+    conn.close()
+    out = _brief(db, "prompt", "viewer", capsys)
+    assert "peer claimed subsystem:mythos-audit-ansible" in out
+    assert "ansible-6c" in out
+    assert _brief(db, "prompt", "viewer", capsys) == ""  # delivered exactly once
+
+
+def test_claim_renewal_does_not_reannounce(tmp_path, capsys):
+    """Claim renewals re-touch created_at on a sliding TTL; a created_at-keyed delta would spam
+    the lane forever. first_claimed_at must be immune to renewal."""
+    import os
+    db = str(tmp_path / "c.db")
+    cc.init_concord(db).close()
+    _brief(db, "prompt", "viewer", capsys)
+    conn = cc.init_concord(db)
+    cc._try_claim(conn, "subsystem:drbd", "peer", os.getpid(), "sib", "", 1200)
+    conn.close()
+    assert "peer claimed subsystem:drbd" in _brief(db, "prompt", "viewer", capsys)
+    conn = cc.init_concord(db)
+    cc._try_claim(conn, "subsystem:drbd", "peer", os.getpid(), "sib", "renew", 1200)  # renewal
+    first, created = conn.execute(
+        "SELECT first_claimed_at, created_at FROM claims WHERE resource='subsystem:drbd'").fetchone()
+    conn.close()
+    assert created >= first
+    assert _brief(db, "prompt", "viewer", capsys) == ""  # renewal is NOT a new claim
+
+
+def test_dead_holder_claim_not_announced(tmp_path, capsys):
+    """A ghost lease must not be announced — the reaper will collect it."""
+    db = str(tmp_path / "c.db")
+    cc.init_concord(db).close()
+    _brief(db, "prompt", "viewer", capsys)
+    conn = cc.init_concord(db)
+    cc._try_claim(conn, "subsystem:ghost", "peer", 999999, "dead-sib", "", 3600)
+    conn.close()
+    assert _brief(db, "prompt", "viewer", capsys) == ""
+
+
+def test_own_claim_not_self_announced(tmp_path, capsys):
+    import os
+    db = str(tmp_path / "c.db")
+    cc.init_concord(db).close()
+    _brief(db, "prompt", "viewer", capsys)
+    conn = cc.init_concord(db)
+    cc._try_claim(conn, "subsystem:mine", "viewer", os.getpid(), "viewer", "", 3600)
+    conn.close()
+    assert "subsystem:mine" not in _brief(db, "prompt", "viewer", capsys)
+
+
+def test_first_claimed_at_migration_backfills(tmp_path):
+    """Pre-existing DBs must backfill first_claimed_at, else every old claim
+    re-announces once as 'new' after the upgrade."""
+    import sqlite3
+    db = str(tmp_path / "legacy.db")
+    conn = sqlite3.connect(db)
+    conn.execute("""CREATE TABLE claims (id INTEGER PRIMARY KEY AUTOINCREMENT,
+        resource TEXT NOT NULL, session_id TEXT NOT NULL, pid INTEGER DEFAULT 0,
+        holder TEXT DEFAULT '', note TEXT DEFAULT '', created_at TEXT NOT NULL,
+        ttl_sec INTEGER NOT NULL DEFAULT 14400, released_at TEXT,
+        released_reason TEXT DEFAULT '')""")
+    conn.execute("INSERT INTO claims (resource, session_id, created_at, ttl_sec) "
+                 "VALUES ('subsystem:old','s',?,3600)", (cc._utcnow(),))
+    conn.commit(); conn.close()
+    conn = cc.init_concord(db)
+    first, created = conn.execute(
+        "SELECT first_claimed_at, created_at FROM claims").fetchone()
+    conn.close()
+    assert first is not None and first == created
+
+
+def test_prompt_delta_retains_overflow_past_the_cap(tmp_path, capsys):
+    """>6 sibling findings in ONE prompt-interval must not be silently dropped.
+
+    Regression for the 2026-07-27 lossy-cursor bug: the cursor was advanced to `now`
+    BEFORE the capped fetch, so rows past LIMIT 6 were never emitted by any surface.
+    Fails on the old code — the second delta came back empty and 3 findings vanished.
+    """
+    db = str(tmp_path / "c.db")
+    cc.init_concord(db).close()
+    assert _brief(db, "prompt", "viewer", capsys) == ""  # init cursor silently
+
+    conn = cc.init_concord(db)
+    for i in range(9):
+        conn.execute(
+            "INSERT INTO findings (id, session_id, summary, severity, status,"
+            " created_at, updated_at) VALUES (?,'sib',?,'info','open',?,?)",
+            (f"f-{i:02d}", f"finding number {i}", cc._utcnow(), cc._utcnow()))
+    conn.commit()
+    conn.close()
+
+    seen, out = [], None
+    for _ in range(4):  # drain across successive prompts
+        out = _brief(db, "prompt", "viewer", capsys)
+        if not out:
+            break
+        seen += [i for i in range(9) if f"finding number {i}" in out]
+
+    assert sorted(set(seen)) == list(range(9)), f"dropped: {set(range(9)) - set(seen)}"
+    assert _brief(db, "prompt", "viewer", capsys) == ""  # and still terminates
+
+
+# ── multi-harness roster (Grok via active_sessions.json — Gap 48 residual 2026-07-29) ─
+
+def test_read_grok_registry_from_active_sessions(tmp_path, monkeypatch):
+    import json
+    import os
+    active = tmp_path / "active_sessions.json"
+    active.write_text(json.dumps([
+        {"session_id": "grok-aaa", "pid": os.getpid(), "cwd": "/tmp/ws",
+         "opened_at": "2026-07-29T00:00:00Z"},
+        {"session_id": "grok-dead", "pid": 999999999, "cwd": "/tmp/ws",
+         "opened_at": "2026-07-29T00:00:00Z"},
+    ]))
+    monkeypatch.setenv("GAIUS_GROK_ACTIVE_SESSIONS", str(active))
+    monkeypatch.setattr(cc, "SESSIONS_DIR", tmp_path / "no-claude")
+    # no Claude dir → empty claude half
+    rows = cc._read_registry()
+    by_id = {r["sessionId"]: r for r in rows}
+    assert "grok-aaa" in by_id
+    assert by_id["grok-aaa"]["harness"] == "grok"
+    assert by_id["grok-aaa"]["alive"] is True
+    assert by_id["grok-dead"]["alive"] is False
+    assert by_id["grok-aaa"]["name"].startswith("grok:")  # no summary.json → fallback
+
+
+def test_read_registry_merges_claude_and_grok(tmp_path, monkeypatch):
+    import json
+    import os
+    claude_dir = tmp_path / "claude"
+    claude_dir.mkdir()
+    (claude_dir / f"{os.getpid()}.json").write_text(json.dumps({
+        "pid": os.getpid(), "sessionId": "claude-sid-1", "name": "ansible-ab",
+        "status": "idle", "cwd": "/tmp/my-memory",
+    }))
+    active = tmp_path / "active.json"
+    active.write_text(json.dumps([
+        {"session_id": "grok-sid-1", "pid": os.getpid(), "cwd": "/tmp/my-memory",
+         "opened_at": "2026-07-29T00:00:00Z"},
+    ]))
+    monkeypatch.setattr(cc, "SESSIONS_DIR", claude_dir)
+    monkeypatch.setenv("GAIUS_GROK_ACTIVE_SESSIONS", str(active))
+    rows = cc._read_registry()
+    harnesses = {r["sessionId"]: r["harness"] for r in rows}
+    assert harnesses.get("claude-sid-1") == "claude"
+    assert harnesses.get("grok-sid-1") == "grok"
+
+
+def test_self_session_prefers_grok_env(tmp_path, monkeypatch):
+    import json
+    import os
+    active = tmp_path / "active.json"
+    active.write_text(json.dumps([
+        {"session_id": "grok-self", "pid": os.getpid(), "cwd": "/tmp",
+         "opened_at": "2026-07-29T00:00:00Z"},
+    ]))
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
+    monkeypatch.setenv("GROK_SESSION_ID", "grok-self")
+    monkeypatch.setenv("GROK_AGENT", "1")
+    monkeypatch.setenv("GAIUS_GROK_ACTIVE_SESSIONS", str(active))
+    monkeypatch.setattr(cc, "SESSIONS_DIR", tmp_path / "no-claude")
+    sid, pid, name = cc._self_session()
+    assert sid == "grok-self"
+    assert pid == os.getpid()
+
+
+def test_self_session_pid_ancestry_when_no_env(tmp_path, monkeypatch):
+    """Grok tool shells often lack GROK_SESSION_ID — match active_sessions via /proc."""
+    import json
+    import os
+    active = tmp_path / "active.json"
+    # Register a parent of this process as the Grok session pid so ancestry hits.
+    parent = os.getppid()
+    active.write_text(json.dumps([
+        {"session_id": "grok-via-ppid", "pid": parent, "cwd": "/tmp",
+         "opened_at": "2026-07-29T00:00:00Z"},
+    ]))
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    monkeypatch.delenv("GROK_SESSION_ID", raising=False)
+    monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
+    monkeypatch.setenv("GROK_AGENT", "1")
+    monkeypatch.setenv("GAIUS_GROK_ACTIVE_SESSIONS", str(active))
+    monkeypatch.setattr(cc, "SESSIONS_DIR", tmp_path / "no-claude")
+    sid, pid, _name = cc._self_session()
+    assert sid == "grok-via-ppid"
+    assert pid == parent
+
+
+def test_registry_live_keeps_unknown_liveness():
+    assert cc._registry_live({"alive": True}) is True
+    assert cc._registry_live({"alive": None}) is True
+    assert cc._registry_live({"alive": False}) is False
+    assert cc._registry_live({}) is True  # missing key → unknown, not dead
+
+
+def test_live_sessions_filters_dead_and_harness(tmp_path, monkeypatch):
+    """DRY helper: live-only, optional harness filter (baton/marathon use harness=claude)."""
+    import json
+    import os
+    claude_dir = tmp_path / "claude"
+    claude_dir.mkdir()
+    (claude_dir / f"{os.getpid()}.json").write_text(json.dumps({
+        "pid": os.getpid(), "sessionId": "claude-live", "name": "live",
+        "status": "idle", "cwd": "/tmp",
+    }))
+    (claude_dir / "dead.json").write_text(json.dumps({
+        "pid": 999999999, "sessionId": "claude-dead", "name": "dead",
+        "status": "idle", "cwd": "/tmp",
+    }))
+    active = tmp_path / "active.json"
+    active.write_text(json.dumps([
+        {"session_id": "grok-live", "pid": os.getpid(), "cwd": "/tmp",
+         "opened_at": "2026-07-29T00:00:00Z"},
+    ]))
+    monkeypatch.setattr(cc, "SESSIONS_DIR", claude_dir)
+    monkeypatch.setenv("GAIUS_GROK_ACTIVE_SESSIONS", str(active))
+
+    all_live = {r["sessionId"] for r in cc._live_sessions()}
+    assert "claude-live" in all_live
+    assert "grok-live" in all_live
+    assert "claude-dead" not in all_live
+
+    claude_only = {r["sessionId"] for r in cc._live_sessions(harness="claude")}
+    assert claude_only == {"claude-live"}
+
+    grok_only = {r["sessionId"] for r in cc._live_sessions(harness="grok")}
+    assert grok_only == {"grok-live"}
+
+
+def test_env_sid_not_in_registry_uses_pid_zero_not_ppid(tmp_path, monkeypatch):
+    """Unregistered env sid must not poison claims with a short-lived tool ppid."""
+    import json
+    active = tmp_path / "active.json"
+    active.write_text(json.dumps([]))
+    monkeypatch.setenv("GROK_SESSION_ID", "ghost-sid-xyz")
+    monkeypatch.setenv("GROK_AGENT", "1")
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
+    monkeypatch.setenv("GAIUS_GROK_ACTIVE_SESSIONS", str(active))
+    monkeypatch.setattr(cc, "SESSIONS_DIR", tmp_path / "no-claude")
+    sid, pid, _name = cc._self_session()
+    assert sid == "ghost-sid-xyz"
+    assert pid == 0
+
+
+def test_grok_agent_ignores_leaked_claude_env_for_ancestry(tmp_path, monkeypatch):
+    """Under GROK_AGENT, CLAUDE_CODE_SESSION_ID is ignored; ancestry finds Grok."""
+    import json
+    import os
+    parent = os.getppid()
+    active = tmp_path / "active.json"
+    active.write_text(json.dumps([
+        {"session_id": "real-grok", "pid": parent, "cwd": "/tmp",
+         "opened_at": "2026-07-29T00:00:00Z"},
+    ]))
+    monkeypatch.setenv("GROK_AGENT", "1")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "leaked-claude-sid")
+    monkeypatch.delenv("GROK_SESSION_ID", raising=False)
+    monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
+    monkeypatch.setenv("GAIUS_GROK_ACTIVE_SESSIONS", str(active))
+    monkeypatch.setattr(cc, "SESSIONS_DIR", tmp_path / "no-claude")
+    sid, pid, _name = cc._self_session()
+    assert sid == "real-grok"
+    assert pid == parent
+
+
+def test_claude_env_sid_unregistered_uses_pid_zero(tmp_path, monkeypatch):
+    """Claude handoff/claim path: env sid without registry row keeps sid, pid=0."""
+    monkeypatch.delenv("GROK_AGENT", raising=False)
+    monkeypatch.delenv("GROK_SESSION_ID", raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "baton-sess")
+    monkeypatch.setattr(cc, "SESSIONS_DIR", tmp_path / "no-claude")
+    monkeypatch.setenv("GAIUS_GROK_ACTIVE_SESSIONS", str(tmp_path / "missing-active.json"))
+    sid, pid, _name = cc._self_session()
+    assert sid == "baton-sess"
+    assert pid == 0

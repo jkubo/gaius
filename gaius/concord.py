@@ -19,9 +19,9 @@ Four primitives:
               loop (open → reviewing → confirmed/refuted).
   task pool — a shared, claimable work queue so an incident commander can seed divided
               work and N terminals take tasks without stepping on each other.
-  roster    — who is alive. NOT stored here: Claude Code already ships a session
-              registry (~/.claude/sessions/{pid}.json, peerProtocol:1); we read it,
-              add pid-liveness (the registry has no GC), and join it with claims.
+  roster    — who is alive. NOT stored here: we read each harness's own registry
+              (Claude: ~/.claude/sessions/{pid}.json; Grok: ~/.grok/active_sessions.json),
+              add pid-liveness (registries have no GC), and join with claims.
 
 BRIGHT LINE (the cross-session-awareness protocol): automate AWARENESS, gate ACTION.
 A claim tells a sibling "this is held", it never acts on the sibling. Block messages
@@ -43,6 +43,8 @@ from pathlib import Path
 
 CONCORD_DB = Path.home() / ".gaius" / "concord.db"
 SESSIONS_DIR = Path.home() / ".claude" / "sessions"
+GROK_ACTIVE_SESSIONS = Path.home() / ".grok" / "active_sessions.json"
+GROK_SESSIONS_ROOT = Path.home() / ".grok" / "sessions"
 
 DEFAULT_TTL_SEC = 4 * 3600        # a lease is a shift, not a squat
 SUMMARY_LIMIT = 280               # == concordSummaryLimit in concord.go
@@ -157,7 +159,7 @@ def init_concord(path=None):
     # Migration (2026-07-27): first_claimed_at = the ORIGINAL acquisition time, never touched
     # by a renewal. `created_at` is reset on every same-session re-claim (see _try_claim's
     # renew branch), which makes it useless as a "is this claim NEW to my peers" delta key —
-    # gaius-concord-autoclaim renews drbd/etcd every 20 min, so a delta on created_at would
+    # claim-renewal hooks re-touch created_at on a sliding TTL, so a delta on created_at would
     # re-announce the same lane forever. Backfilled from created_at for pre-existing rows.
     _claim_cols = {r[1] for r in conn.execute("PRAGMA table_info(claims)")}
     if "first_claimed_at" not in _claim_cols:
@@ -209,37 +211,219 @@ def init_concord(path=None):
 
 # ── session identity ────────────────────────────────────────────────────────────────
 
-def _read_registry():
-    """Parse Claude Code's own session registry. Returns [{pid, sessionId, name, status,
-    cwd, updatedAt, alive}]. Registry files are harness-owned — read-only, never pruned."""
+def _ppid_chain(start_pid=None, limit=24):
+    """Walk /proc ancestry from start_pid (default: self). Used to match Grok's
+    active_sessions entry when tool subprocesses lack GROK_SESSION_ID."""
+    pid = int(start_pid if start_pid is not None else os.getpid())
+    chain = []
+    seen = set()
+    while pid and pid > 1 and pid not in seen and len(chain) < limit:
+        seen.add(pid)
+        chain.append(pid)
+        try:
+            with open(f"/proc/{pid}/status") as f:
+                for line in f:
+                    if line.startswith("PPid:"):
+                        pid = int(line.split()[1])
+                        break
+                else:
+                    break
+        except Exception:
+            break
+    return chain
+
+
+def _grok_session_name(session_id, cwd):
+    """Best-effort title from Grok's per-session summary.json (generated_title)."""
+    if not session_id or not cwd:
+        return ""
+    try:
+        from urllib.parse import quote
+        enc = quote(str(cwd), safe="")
+        summary = GROK_SESSIONS_ROOT / enc / session_id / "summary.json"
+        if not summary.is_file():
+            return ""
+        j = json.loads(summary.read_text())
+        return (j.get("generated_title")
+                or j.get("session_summary")
+                or j.get("agent_name")
+                or "")[:64]
+    except Exception:
+        return ""
+
+
+def _read_claude_registry():
+    """Claude Code: ~/.claude/sessions/{pid}.json (peerProtocol:1)."""
     out = []
     if not SESSIONS_DIR.is_dir():
         return out
     for f in sorted(SESSIONS_DIR.glob("*.json")):
+        if f.name.startswith("active_"):
+            continue
         try:
             j = json.loads(f.read_text())
         except Exception:
             continue
-        j["alive"] = _pid_alive(j.get("pid"))
+        sid = j.get("sessionId") or j.get("session_id")
+        if not sid:
+            continue
+        out.append({
+            "pid": j.get("pid", 0),
+            "sessionId": sid,
+            "name": j.get("name") or "",
+            "status": j.get("status") or "?",
+            "cwd": j.get("cwd") or "",
+            "updatedAt": j.get("updatedAt") or j.get("statusUpdatedAt") or "",
+            "harness": "claude",
+            "alive": _pid_alive(j.get("pid")),
+        })
+    return out
+
+
+def _read_grok_registry():
+    """Grok Build: ~/.grok/active_sessions.json — list of {session_id, pid, cwd, opened_at}."""
+    out = []
+    path = Path(os.environ.get("GAIUS_GROK_ACTIVE_SESSIONS", "") or GROK_ACTIVE_SESSIONS)
+    if not path.is_file():
+        return out
+    try:
+        raw = json.loads(path.read_text())
+    except Exception:
+        return out
+    if not isinstance(raw, list):
+        return out
+    for ent in raw:
+        if not isinstance(ent, dict):
+            continue
+        sid = ent.get("session_id") or ent.get("sessionId") or ""
+        if not sid:
+            continue
+        pid = ent.get("pid", 0)
+        cwd = ent.get("cwd") or ""
+        name = _grok_session_name(sid, cwd) or f"grok:{sid[:8]}"
+        out.append({
+            "pid": pid,
+            "sessionId": sid,
+            "name": name,
+            "status": "active",
+            "cwd": cwd,
+            "updatedAt": ent.get("opened_at") or "",
+            "harness": "grok",
+            "alive": _pid_alive(pid),
+        })
+    return out
+
+
+def _read_registry():
+    """Merge live-session registries from all known harnesses.
+
+    Returns [{pid, sessionId, name, status, cwd, updatedAt, harness, alive}].
+    Registry files are harness-owned — read-only, never pruned. Dedup by sessionId
+    (first writer wins; Claude and Grok IDs do not collide in practice).
+    """
+    seen = set()
+    out = []
+    for j in _read_claude_registry() + _read_grok_registry():
+        sid = j.get("sessionId")
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
         out.append(j)
     return out
 
 
+def _registry_live(j):
+    """Include in live roster/status unless pid is *provably* dead.
+
+    `_pid_alive` returns None for pid 0/unknown — that is NOT dead. Claim reaping
+    already uses `is False`; roster must match or unknown-liveness sessions vanish
+    while their claims remain TTL-only (and look orphaned).
+    """
+    return j.get("alive") is not False
+
+
+def _live_sessions(harness=None):
+    """Live sessions from the multi-harness registry (shared by roster + baton/marathon).
+
+    harness: None (all), "claude", or "grok". Returns registry rows where pid is
+    not *provably* dead — same rule as roster/status/brief. Hooks that still only
+    understand one harness's transcript layout (baton/marathon → Claude) pass
+    harness="claude" rather than re-implementing ~/.claude/sessions/*.json.
+    """
+    out = []
+    for j in _read_registry():
+        if not _registry_live(j):
+            continue
+        if harness and j.get("harness") != harness:
+            continue
+        out.append(j)
+    return out
+
+
+def _match_ancestry(registry):
+    """Match /proc ancestry against registry pids. Prefer alive, then Grok when
+    GROK_AGENT=1. Returns (session_id, pid, name) or None."""
+    chain = set(_ppid_chain())
+    hits = [j for j in registry
+            if j.get("pid") and int(j["pid"]) in chain]
+    if not hits:
+        return None
+    live = [j for j in hits if j.get("alive") is True]
+    pool = live or hits
+    if os.environ.get("GROK_AGENT"):
+        for j in pool:
+            if j.get("harness") == "grok":
+                return j.get("sessionId"), j.get("pid"), j.get("name") or ""
+    j = pool[0]
+    return j.get("sessionId"), j.get("pid"), j.get("name") or ""
+
+
 def _self_session():
-    """Resolve the invoking session: (session_id, pid, name). Works from inside a
-    Claude Code Bash tool (CLAUDE_CODE_SESSION_ID is exported) or a plain shell."""
-    sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-    pid, name = 0, ""
-    if sid:
-        for j in _read_registry():
-            if j.get("sessionId") == sid:
-                pid, name = j.get("pid", 0), j.get("name", "")
-                break
+    """Resolve the invoking session: (session_id, pid, name).
+
+    Identity order:
+      1. Harness-native env sid that appears in a registry row
+         - Claude shell: CLAUDE_CODE_SESSION_ID / CLAUDE_SESSION_ID
+         - Grok shell (GROK_AGENT): GROK_SESSION_ID only (ignore leaked CLAUDE_*)
+      2. Env sid set but not yet in registry → keep sid, pid=0
+         (TTL-only claims; never poison with getppid of a short-lived tool shell)
+      3. No env → /proc pid-ancestry against either harness registry
+      4. shell-<ppid>
+    """
+    registry = _read_registry()
+    by_sid = {j.get("sessionId"): j for j in registry if j.get("sessionId")}
+
+    claude_sid = (os.environ.get("CLAUDE_CODE_SESSION_ID")
+                  or os.environ.get("CLAUDE_SESSION_ID")
+                  or "")
+    grok_sid = os.environ.get("GROK_SESSION_ID") or ""
+    in_grok = bool(os.environ.get("GROK_AGENT"))
+
+    # Harness-native env only — dual-harness hosts often leak the other CLI's vars.
+    if in_grok:
+        ordered = [grok_sid] if grok_sid else []
     else:
-        sid = f"shell-{os.getppid()}"
-        pid = os.getppid()
-        name = os.environ.get("USER", "shell")
-    return sid, pid, name
+        ordered = [claude_sid] if claude_sid else []
+        if grok_sid and grok_sid not in ordered:
+            ordered.append(grok_sid)
+
+    for sid in ordered:
+        j = by_sid.get(sid)
+        if j:
+            return sid, j.get("pid", 0) or 0, j.get("name", "") or ""
+
+    # Env present but unregistered: claim under that sid with pid=0 (TTL-only).
+    if ordered:
+        sid = ordered[0]
+        return sid, 0, sid[:12]
+
+    # No harness env — Grok tool shells often lack GROK_SESSION_ID; use ancestry.
+    hit = _match_ancestry(registry)
+    if hit:
+        return hit
+
+    return (f"shell-{os.getppid()}", os.getppid(),
+            os.environ.get("USER", "shell"))
 
 
 # ── claim validity ──────────────────────────────────────────────────────────────────
@@ -454,11 +638,12 @@ def _concord_roster(ns):
     by_session = {}
     for c in live_claims:
         by_session.setdefault(c["session_id"], []).append(c["resource"])
-    sessions = [j for j in _read_registry() if j.get("alive")]
-    sid_self = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    sessions = _live_sessions()
+    sid_self, _, _ = _self_session()
     if ns.json:
         out = [{"pid": j.get("pid"), "session_id": j.get("sessionId"), "name": j.get("name"),
                 "status": j.get("status"), "cwd": j.get("cwd"),
+                "harness": j.get("harness", "?"),
                 "claims": by_session.get(j.get("sessionId"), []),
                 "self": j.get("sessionId") == sid_self} for j in sessions]
         print(json.dumps(out, indent=2))
@@ -466,13 +651,18 @@ def _concord_roster(ns):
     if not sessions:
         print("no live sessions in the registry")
         return
-    print(f"\n  {len(sessions)} live session(s):")
+    n_claude = sum(1 for j in sessions if j.get("harness") == "claude")
+    n_grok = sum(1 for j in sessions if j.get("harness") == "grok")
+    print(f"\n  {len(sessions)} live session(s)"
+          f" (claude={n_claude} grok={n_grok}):")
     for j in sessions:
         mark = "▶" if j.get("sessionId") == sid_self else " "
         claims = by_session.get(j.get("sessionId"), [])
         cstr = f"  holds: {', '.join(claims)}" if claims else ""
-        print(f"  {mark} {j.get('name', '?')[:44]:<44} {j.get('status', '?'):<8} "
-              f"pid {j.get('pid', 0):<8}{_C['yellow']}{cstr}{_C['reset']}")
+        h = (j.get("harness") or "?")[:6]
+        print(f"  {mark} [{h:<6}] {j.get('name', '?')[:36]:<36} "
+              f"{j.get('status', '?'):<8} pid {j.get('pid', 0):<8}"
+              f"{_C['yellow']}{cstr}{_C['reset']}")
     orphaned = [c for c in live_claims
                 if c["session_id"] not in {j.get("sessionId") for j in sessions}]
     for c in orphaned:
@@ -693,7 +883,7 @@ def _concord_status(ns):
     pool_taken = conn.execute(
         "SELECT COUNT(*) FROM pool_tasks WHERE status='taken'").fetchone()[0]
     conn.close()
-    sessions = [j for j in _read_registry() if j.get("alive")]
+    sessions = _live_sessions()
     if ns.json:
         print(json.dumps({"sessions": len(sessions), "claims": live,
                           "findings_open": open_findings,
@@ -726,8 +916,7 @@ def _concord_brief(ns):
     if ns.scope == "session-start":
         live = _active_claims(conn)
         _reap_pool(conn)
-        sessions = [j for j in _read_registry()
-                    if j.get("alive") and j.get("sessionId") != sid]
+        sessions = [j for j in _live_sessions() if j.get("sessionId") != sid]
         claims_by_sid = {}
         for c in live:
             claims_by_sid.setdefault(c["session_id"], []).append(c["resource"])
@@ -770,10 +959,13 @@ def _concord_brief(ns):
         row = conn.execute("SELECT last_checked FROM session_cursors WHERE session_id=?",
                            (sid,)).fetchone()
         cursor = row[0] if row and row[0] else ""
-        conn.execute("INSERT INTO session_cursors (session_id, last_checked) VALUES (?,?) "
-                     "ON CONFLICT(session_id) DO UPDATE SET last_checked=excluded.last_checked",
-                     (sid, now))
-        conn.commit()
+        # The cursor advance is DEFERRED to after the fetches (2026-07-27). Advancing it to
+        # `now` up front — the previous behaviour — silently dropped every row past the LIMIT:
+        # the cursor moved regardless of how many rows were actually emitted, so findings 7+
+        # in one prompt-interval were never shown again by ANY surface (the session-start
+        # backlog only helps sessions that have not started yet). Overflow is now retained by
+        # clamping the new cursor back to the last row we actually printed.
+        _new_cursor = now
         if cursor:  # no cursor yet → initialize silently (backlog belongs to session-start)
             fresh = conn.execute(
                 "SELECT id, severity, summary, session_id, created_at FROM findings "
@@ -783,16 +975,54 @@ def _concord_brief(ns):
                 "SELECT resource, released_reason, released_at FROM claims "
                 "WHERE session_id=? AND released_at > ? AND released_reason LIKE 'stolen%'",
                 (sid, cursor)).fetchall()
-            if fresh or stolen:
+            # A peer ACQUIRING a lane after my session started was structurally invisible
+            # before 2026-07-27: the full roster renders only at --scope session-start, and
+            # this delta carried findings + steals but never new peer claims. Net effect —
+            # a sibling claims subsystem:X while I am mid-task on X and I am never told.
+            # (Observed 2026-07-27: a /mythos session audited subsystem:mythos-audit-ansible
+            # for ~1h while a peer held the claim; nothing surfaced until the operator asked.)
+            # Keyed on first_claimed_at, NOT created_at, so sliding-TTL claim renewals
+            # do not re-announce a lane every cycle.
+            claimed_raw = conn.execute(
+                "SELECT resource, holder, session_id, first_claimed_at, pid, created_at, "
+                "ttl_sec FROM claims "
+                "WHERE first_claimed_at > ? AND session_id != ? AND released_at IS NULL "
+                "ORDER BY first_claimed_at ASC LIMIT 6",
+                (cursor, sid)).fetchall()
+            claimed = claimed_raw
+            # Drop dead/expired holders — the reaper collects them, and announcing a lane
+            # nobody actually holds is the ghost-lease failure the TTL design exists to avoid.
+            # TTL validity keys on created_at (the RENEWED clock), not first_claimed_at.
+            claimed = [c for c in claimed
+                       if not _claim_invalid_reason((c[0], c[2], c[4], c[5], c[6]))]
+            # Overflow retention: if either capped query came back FULL, more rows may exist
+            # past the cap, so clamp the cursor back to the last row we actually emitted and
+            # let the remainder surface on the next prompt. Clamp on the RAW fetch, not the
+            # post-filter list — dead-holder rows still consumed a slot under the LIMIT.
+            # 6 must match the LIMIT in the queries above.
+            if len(fresh) == 6:
+                _new_cursor = min(_new_cursor, fresh[-1][4])
+            if len(claimed_raw) == 6:
+                _new_cursor = min(_new_cursor, claimed_raw[-1][3])
+            if fresh or stolen or claimed:
                 out.append("## Concord delta (sibling observations — verify before acting; "
                            "not authorization)")
                 for f in fresh:
                     out.append(f"+ finding [{f[1]}] {f[0][:8]} by {f[3][:12]} "
                                f"{_fmt_age(_age_sec(f[4]))} ago — {f[2][:120]}")
+                for c in claimed:
+                    out.append(f"@ peer claimed {c[0]} — {c[1] or c[2][:12]} "
+                               f"({_fmt_age(_age_sec(c[3]))} ago). If you are working that "
+                               f"resource, coordinate now: `gaius concord claims` to inspect, "
+                               f"`finding add` to publish what you already have.")
                 for s in stolen:
                     out.append(f"! your claim {s[0]} was taken over "
                                f"({_fmt_age(_age_sec(s[2]))} ago: {s[1]}) — coordinate before "
                                f"touching that resource again")
+        conn.execute("INSERT INTO session_cursors (session_id, last_checked) VALUES (?,?) "
+                     "ON CONFLICT(session_id) DO UPDATE SET last_checked=excluded.last_checked",
+                     (sid, _new_cursor))
+        conn.commit()
     conn.close()
     if out:
         print("\n".join(out))

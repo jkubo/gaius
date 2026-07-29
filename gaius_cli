@@ -2,7 +2,7 @@
 """gaius CLI entry point.
 
 Install: install -m 755 /path/to/gaius/gaius_cli ~/.local/bin/gaius
-Or:      pip install "gaius-memory @ git+https://github.com/jkubo/gaius"
+Or:      pip install gaius-memory  (installs 'gaius' command directly)
 """
 import sys
 import os

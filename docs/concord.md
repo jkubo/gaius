@@ -76,9 +76,23 @@ gaius concord roster    # live sessions + the claims each holds
 gaius concord status    # one-screen sitrep: sessions · claims · findings · pool
 ```
 
-The roster is read from the coding CLI's own session registry (for Claude Code:
-`~/.claude/sessions/*.json`), with pid-liveness checks layered on top — the registry
-itself has no garbage collection.
+The roster merges each coding CLI's own session registry, with pid-liveness layered
+on top (registries have no GC):
+
+| Harness | Source |
+|---------|--------|
+| Claude Code | `~/.claude/sessions/{pid}.json` (`sessionId`, `name`, `status`, …) |
+| Grok Build | `~/.grok/active_sessions.json` (`session_id`, `pid`, `cwd`); title from per-session `summary.json` when present |
+
+Self-identity for claims: `CLAUDE_CODE_SESSION_ID` / `GROK_SESSION_ID`, else Grok
+pid-ancestry match against `active_sessions` (tool shells often lack the env var),
+else `shell-<ppid>`. Roster lines are tagged `[claude]` / `[grok]`.
+
+**Shared helper (do not re-copy the registry):** `gaius.concord._live_sessions(harness=None)`
+is the single reader used by roster/status/brief and by the baton/marathon watchers.
+Pass `harness="claude"` (or `"grok"`) when a consumer only understands one harness's
+transcript layout — baton/marathon still spawn Claude successors today, so they filter
+to Claude rather than forking a second `~/.claude/sessions/*.json` scanner.
 
 ### 5. Baton pass — hand a saturated session to a fresh successor
 
@@ -149,9 +163,21 @@ fi
 ```
 
 **UserPromptSubmit** — inject only the *delta* since this session's last prompt (new
-sibling findings, takeovers of your claims). A per-session cursor guarantees each item
-is delivered at most once; timestamps are microsecond-resolution so a finding published
-the same second as a prompt cannot be skipped:
+sibling findings, **new peer claims**, takeovers of your claims). A per-session cursor
+guarantees each item is delivered at most once; timestamps are microsecond-resolution so
+a finding published the same second as a prompt cannot be skipped:
+
+> **Why peer claims are in the delta (added 2026-07-27).** The full roster renders only at
+> `--scope session-start`, so a claim acquired *after* a session started used to be invisible
+> to it for the session's entire life — the delta carried findings and steals but never a peer
+> acquiring a lane. That is the one event most likely to mean "you are about to duplicate
+> someone's work". It cost a real collision: a `/mythos` session audited
+> `subsystem:mythos-audit-ansible` for about an hour while a sibling held the claim, and
+> nothing surfaced until the operator asked. The delta keys on `claims.first_claimed_at`, not
+> `created_at` — `created_at` is reset by every same-session re-claim, and
+> claim-renewal hooks re-touch `created_at` on a sliding TTL, so a `created_at`-keyed
+> delta would re-announce the same lane forever. Dead/expired holders are filtered so a ghost
+> lease is never announced.
 
 ```bash
 if [[ -f "$HOME/.gaius/concord-hooks-enabled" ]]; then

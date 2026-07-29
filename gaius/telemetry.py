@@ -113,7 +113,7 @@ def _seed_coaching_tips(conn: sqlite3.Connection):
          "Gaius needs semantic signal to find relevant context. Short prompts like "
          "\"fix it\" or \"what's next\" produce zero BM25 matches.\n\n"
          "**Try instead:** Include the subsystem, symptom, or goal — "
-         "\"fix DRBD split-brain on toa\" gives gaius 4 useful search terms.",
+         "\"fix storage split-brain on node-01\" gives gaius 4 useful search terms.",
          "prompt", "info"),
 
         ("no_terms_after_filter", "All meaningful words were filtered as stop words",

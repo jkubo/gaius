@@ -84,9 +84,10 @@ Grok CLI stores each session as a **directory**, not a single file:
 {"type": "assistant", "content": "Flannel MTU is 1050 on cross-site Tailscale paths.", "model_id": "grok-composer-2.5-fast"}
 ```
 
-- `type: "user"` — queries are wrapped in `<user_query>...</user_query>` (the wrapper is stripped).
+- `type: "user"` — real operator turns are wrapped in `<user_query>...</user_query>`. The parser **extracts the inner text only** (trailing `<skill_information>` dumps are dropped). Harness-injected `type:user` turns (`<system-reminder>`, `<user_info>`, MCP connect notices) are **ignored** and do not overwrite the last operator query (Gap 48).
 - `type: "assistant"` — entries **with** `tool_calls` are mid-turn narration (skipped); entries **without** are terminal answers (extracted as decision facts).
 - `content` — a string, or a list of `{type, text}` blocks.
+- Agent/principal: events are tagged `agent: "grok"` and map to principal `grok` (built-in default + `principals.mapping`).
 
 Parser: `parse_grok_events()`; discovery: `_discover_grok_sessions()` (both in `gaius/parsers.py`).
 Ingest with `gaius grok-retire [--sessions-dir ...] [--dry-run]`, or let plain `gaius retire` auto-sweep it.

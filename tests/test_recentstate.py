@@ -1,83 +1,204 @@
 """recent-roll test suite — the ## Recent State auto-roll safety gate.
 
-Pure-function / tmp_path only; no facts.db, no live MEMORY_DIR. Every branch of
-the 3-condition eviction gate (+ the ⚠️ veto and the no-pointer floor) is asserted
-independently, plus the verbatim-archive landing and the dry-run no-mutation."""
+Pure-function / tmp_path only; no facts.db, no live MEMORY_DIR.
+
+The gate was REDESIGNED 2026-07-28 (mnemos #123). It is now a single safety
+property — PROVABLE REDUNDANCY — expressed in four fail-closed steps:
+
+  (1) an explicit ``📌`` / ``<!--pin-->`` pin → KEEP (⚠️ is NO LONGER a veto),
+  (2) no trailing pointer (``→ <file>`` / ``[label](path)``) → KEEP,
+  (3) ``home_text_provider is None`` → KEEP — "cannot verify ⇒ keep", the
+      INVERSE of the old contract where omitting it skipped the check,
+  (4) otherwise evict iff the pointer target genuinely contains the bullet's
+      signature (``MIN_HOME_HITS`` = 2 tokens, ``HOME_MATCH_FRACTION`` = 0.5).
+
+Age, the done-marker and the per-bullet date NO LONGER GATE ANYTHING;
+``section_date`` / ``max_age_days`` are accepted for call-site compatibility and
+deliberately not consulted. The retired behaviours are asserted RETIRED below
+(``test_*_no_longer_blocks_when_homed``) so a silent revert fails the suite.
+
+The helper predicates (``_has_trailing_pointer``, ``_has_done_marker``,
+``_bullet_date``, ``_section_date``) still exist and are still tested —
+``_section_date`` in particular still drives the archive filename.
+"""
 import datetime as dt
 from pathlib import Path
 
 import pytest
 
 from gaius.recentstate import (
+    MIN_HOME_HITS,
     should_evict,
     roll_recent_state,
     _has_trailing_pointer,
     _has_done_marker,
     _has_veto,
+    _has_pin,
     _bullet_date,
     _section_date,
 )
 
-SEC = dt.date(2026, 7, 20)   # section header date; max_age_days=7 → 07-13 boundary
+SEC = dt.date(2026, 7, 20)   # section header date; passed through, never consulted
 
-# All-three-pass, no veto → the one bullet that SHOULD roll off.
-EVICTABLE = "- **A** (07-01): pipeline RESOLVED and shipped. → project/a.md"
+# The canonical roll-off bullet: a trailing pointer plus two unmistakable
+# code-span/compound signature tokens, so the 2-hit homing floor is comfortably met.
+EVICTABLE = "- **A**: `drbd-socket-guard` armed on `flannel-mtu`. → project/a.md"
+EVICTABLE_SIG = ("drbd-socket-guard", "flannel-mtu")
+
+
+# ── fixture helpers ──────────────────────────────────────────────────────────
+
+def _homed(*tokens):
+    """A ``home_text_provider`` returning a (lowercased) home whose text contains
+    ``tokens`` — i.e. the pointer target really absorbed the fact."""
+    body = ("# home\n\n" + " ".join(tokens) + "\n").lower()
+    return lambda _text: body
+
+
+def _unrelated(_text):
+    """A home_text_provider whose target EXISTS but shares no signature."""
+    return "# home\n\nunrelated notes about pvc provisioning and volumes.\n"
+
+
+def _write_home(root, rel, *tokens):
+    """Write the pointer-target file under ``root`` (== MEMORY.md's parent) with
+    content carrying the bullet's signature tokens, so the real roll can resolve
+    and verify it. The relative path itself is included because it is a signature
+    token too (``project/a.md`` is a compound identifier)."""
+    p = Path(root) / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("# home\n\n" + " ".join(tokens) + "\n" + rel + "\n", encoding="utf-8")
+    return p
+
+
+def _write_unrelated_home(root, rel):
+    """Write the pointer target with content that does NOT contain the signature."""
+    p = Path(root) / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("# home\n\nUnrelated notes about storage volumes and PVC provisioning.\n",
+                 encoding="utf-8")
+    return p
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# The gate, condition by condition
+# The gate, step by step
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestShouldEvictGate:
-    def test_all_three_pass_evicts(self):
-        assert should_evict(EVICTABLE, SEC, 7) is True
-
-    def test_age_within_threshold_keeps(self):
-        # done + pointer + no veto, but dated 07-19 (age 1 ≤ 7) → KEEP
-        b = "- **B** (07-19): thing LIVE now. → project/b.md"
-        assert should_evict(b, SEC, 7) is False
-
-    def test_age_exactly_at_threshold_keeps(self):
-        # 07-13 is exactly 7 days before 07-20; gate is strict `> max_age_days`
-        b = "- **C** (07-13): thing FIXED. → project/c.md"
-        assert should_evict(b, SEC, 7) is False
-
-    def test_no_done_marker_keeps(self):
-        # old + pointer + no veto, but no done-marker → KEEP
-        b = "- **D** (07-01): investigation ongoing, pending. → project/d.md"
-        assert should_evict(b, SEC, 7) is False
+    def test_homed_pointered_bullet_evicts(self):
+        assert should_evict(EVICTABLE, SEC, 7,
+                            home_text_provider=_homed(*EVICTABLE_SIG)) is True
 
     def test_no_pointer_keeps(self):
-        # old + done + no veto, but NO trailing pointer (no durable home) → KEEP
-        b = "- **E** (07-01): rewrote the thing, RESOLVED, no home left."
-        assert should_evict(b, SEC, 7) is False
+        # homed, but NO trailing pointer (no durable home named) → KEEP
+        b = "- **E**: `drbd-socket-guard` and `flannel-mtu` rewritten, no home left."
+        assert should_evict(b, SEC, 7,
+                            home_text_provider=_homed(*EVICTABLE_SIG)) is False
 
-    def test_veto_keeps_even_if_all_three_pass(self):
-        # old + done + pointer AND ⚠️ → KEEP (veto beats the gate)
-        b = "- **F** (07-01): RESOLVED but ⚠️ do NOT re-run. → project/f.md"
-        # sanity: strip the veto and it WOULD evict (proves veto is the only blocker)
-        assert should_evict(b.replace("⚠️ ", ""), SEC, 7) is True
-        assert should_evict(b, SEC, 7) is False
+    def test_no_home_text_provider_keeps(self):
+        """⚠️ THE INVERTED CONTRACT. ``home_text_provider=None`` used to mean
+        "skip the homing check" (evict on the proxies alone); it now means
+        "cannot verify ⇒ KEEP". A caller that omits it must evict NOTHING."""
+        assert should_evict(EVICTABLE, SEC, 7) is False
+        assert should_evict(EVICTABLE, SEC, 7, home_text_provider=None) is False
 
-    def test_inline_transformation_arrow_is_not_a_pointer(self):
-        # "A→B" mid-bullet is not a trailing pointer → no home → KEEP
-        b = "- **G** (07-01): migrated LINSTOR→tailscale, RESOLVED."
-        assert should_evict(b, SEC, 7) is False
+    def test_pointer_target_without_signature_keeps(self):
+        # the home file exists and is readable, but does not contain the fact → KEEP
+        assert should_evict(EVICTABLE, SEC, 7, home_text_provider=_unrelated) is False
+
+    def test_empty_home_text_keeps(self):
+        # target resolved to nothing (missing/unreadable file) → KEEP
+        assert should_evict(EVICTABLE, SEC, 7, home_text_provider=lambda _t: "") is False
+
+    def test_pin_mark_keeps_even_when_homed(self):
+        b = "- **F**: 📌 `drbd-socket-guard` pins `flannel-mtu`. → project/f.md"
+        assert should_evict(b, SEC, 7, home_text_provider=_homed(*EVICTABLE_SIG)) is False
+        # sanity: drop the pin and the very same bullet evicts (pin is the only blocker)
+        assert should_evict(b.replace("📌 ", ""), SEC, 7,
+                            home_text_provider=_homed(*EVICTABLE_SIG)) is True
+
+    def test_html_comment_pin_keeps_even_when_homed(self):
+        b = "- **F**: <!--pin--> `drbd-socket-guard` pins `flannel-mtu`. → project/f.md"
+        assert should_evict(b, SEC, 7, home_text_provider=_homed(*EVICTABLE_SIG)) is False
 
     def test_markdown_link_pointer_evicts(self):
-        b = "- **H** (07-01): DONE and verified [see](project/h.md)"
-        assert should_evict(b, SEC, 7) is True
+        b = "- **H**: `dirty-clone` covers `kernel-lsm` now [see](project/h.md)"
+        assert should_evict(b, SEC, 7,
+                            home_text_provider=_homed("dirty-clone", "kernel-lsm",
+                                                      "project/h.md")) is True
 
-    def test_no_section_date_keeps(self):
-        assert should_evict(EVICTABLE, None, 7) is False
-
-    def test_no_bullet_date_keeps(self):
-        b = "- **I**: RESOLVED long ago. → project/i.md"   # no date-stamp at all
-        assert should_evict(b, SEC, 7) is False
+    def test_inline_transformation_arrow_is_not_a_pointer(self):
+        # "A→B" mid-bullet names no home file → KEEP even though fully homed
+        b = "- **G**: migrated `linstor-drbd`→tailscale, `flannel-mtu` retuned."
+        assert should_evict(b, SEC, 7,
+                            home_text_provider=_homed("linstor-drbd", "flannel-mtu")) is False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# helper predicates
+# Retired semantics — these MUST NOT come back. Each of these bullets was KEPT
+# by the old gate and is deliberately EVICTED by the new one.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestRetiredGateConditions:
+    def test_veto_mark_no_longer_blocks_when_homed(self):
+        """⚠️ was the old veto. It is ambient on nearly every Recent-State bullet,
+        which is precisely why the roll evicted nothing for weeks. Only 📌 pins now."""
+        b = "- **F**: ⚠️ `drbd-socket-guard` armed on `flannel-mtu`. → project/f.md"
+        assert _has_veto(b)                                    # the glyph IS still there
+        assert should_evict(b, SEC, 7,
+                            home_text_provider=_homed(*EVICTABLE_SIG)) is True
+
+    def test_missing_done_marker_no_longer_blocks_when_homed(self):
+        """No ✅ / LIVE / RESOLVED / MERGED anywhere, and no date-stamp either —
+        the old gate KEPT this; homing is the only ground truth now."""
+        b = "- **D**: `drbd-socket-guard` bound to `flannel-mtu`. → project/d.md"
+        assert not _has_done_marker(b)
+        assert _bullet_date(b, SEC) is None
+        assert should_evict(b, SEC, 7,
+                            home_text_provider=_homed(*EVICTABLE_SIG)) is True
+
+    def test_recent_bullet_no_longer_blocked_by_age(self):
+        # dated the same day as the header (age 0) — the old gate needed age > 7
+        b = "- **B** (2026-07-20): `drbd-socket-guard` on `flannel-mtu`. → project/b.md"
+        assert should_evict(b, SEC, 7,
+                            home_text_provider=_homed(*EVICTABLE_SIG, "2026-07-20")) is True
+
+    def test_missing_section_date_no_longer_blocks(self):
+        # section_date=None used to be an automatic KEEP; it is no longer consulted
+        assert should_evict(EVICTABLE, None, 7,
+                            home_text_provider=_homed(*EVICTABLE_SIG)) is True
+
+    def test_max_age_days_is_not_consulted(self):
+        # any max_age_days gives the same verdict — the kwarg is call-site compat only
+        prov = _homed(*EVICTABLE_SIG)
+        assert should_evict(EVICTABLE, SEC, 0, home_text_provider=prov) is True
+        assert should_evict(EVICTABLE, SEC, 99999, home_text_provider=prov) is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MIN_HOME_HITS = 2 — one shared token is too weak to authorise a delete
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestHomeHitFloor:
+    def test_floor_is_two(self):
+        assert MIN_HOME_HITS == 2
+
+    def test_single_signature_hit_keeps(self):
+        # sig = {alpha-widget, project/x.md}; home carries only ONE of them.
+        # fraction = 1/2 = 0.5 PASSES HOME_MATCH_FRACTION, so this isolates the
+        # raised hit floor: 1 hit < MIN_HOME_HITS → KEEP.
+        b = "- **X**: `alpha-widget` rolled out. → project/x.md"
+        assert should_evict(b, SEC, 7, home_text_provider=_homed("alpha-widget")) is False
+
+    def test_second_signature_hit_flips_to_evict(self):
+        b = "- **X**: `alpha-widget` rolled out. → project/x.md"
+        assert should_evict(b, SEC, 7,
+                            home_text_provider=_homed("alpha-widget",
+                                                      "project/x.md")) is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# helper predicates (still exported, still used — _section_date names the archive)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestPredicates:
@@ -105,9 +226,16 @@ class TestPredicates:
         assert not _has_done_marker("live state of the system")   # lowercase prose
 
     def test_veto_detects_warning_glyph(self):
+        # the predicate still exists (and still detects); it just no longer GATES.
         assert _has_veto("something ⚠️ careful")
         assert _has_veto("something ⚠ careful")   # bare glyph, no VS16
         assert not _has_veto("no warning here")
+
+    def test_pin_detects_only_explicit_markers(self):
+        assert _has_pin("hold this 📌")
+        assert _has_pin("hold this <!--pin-->")
+        assert not _has_pin("something ⚠️ careful")   # ambient warning is NOT a pin
+        assert not _has_pin("nothing special here")
 
     def test_section_date_parse(self):
         assert _section_date(["## Recent State (2026-07-20)"]) == dt.date(2026, 7, 20)
@@ -129,22 +257,6 @@ class TestPredicates:
         assert _bullet_date("thing (12-20) shipped", jan) == dt.date(2025, 12, 20)
 
 
-class TestDecJanBoundaryEviction:
-    def test_december_bullet_rolls_off_january_header(self, tmp_path):
-        doc = (
-            "# MEMORY\n\n## Recent State (2026-01-05)\n\n"
-            "- **Old** (12-20): pipeline RESOLVED. → project/o.md\n"
-            "- **New** (01-04): thing LIVE. → project/n.md\n"
-        )
-        mem = tmp_path / "MEMORY.md"
-        mem.write_text(doc)
-        res = roll_recent_state(mem, tmp_path / "archive", max_age_days=7)
-        assert len(res["evicted"]) == 1
-        assert "**Old**" in res["evicted"][0]
-        # archive bucket named by the section-header month
-        assert res["archive_path"].name == "recent-state-2026-01.md"
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # end-to-end roll: verbatim archive landing + MEMORY.md mutation
 # ─────────────────────────────────────────────────────────────────────────────
@@ -158,18 +270,27 @@ def _doc(*recent_bullets):
 
 
 class TestRollEndToEnd:
+    # one evictable bullet + one KEEP per surviving fail-closed step
+    KEEP_NO_POINTER = "- **D**: `etcd-quota` raised to 2GiB, no home left."
+    KEEP_PINNED = "- **E**: 📌 `drbd-socket-guard` and `flannel-mtu` pinned. → project/e.md"
+    KEEP_UNHOMED = "- **C**: `loki-compactor` stalled on `seaweedfs-s3`. → project/c.md"
+    KEEP_MISSING_HOME = "- **B**: `mullvad-exit` flapped on `apex-vm`. → project/missing.md"
+
     def _bullets(self):
-        return [
-            EVICTABLE,                                                   # evict
-            "- **B** (07-19): thing LIVE. → project/b.md",              # keep (recent)
-            "- **C** (07-01): pending, no marker. → project/c.md",      # keep (no marker)
-            "- **D** (07-01): RESOLVED but no home left.",              # keep (no pointer)
-            "- **E** (07-01): RESOLVED ⚠️ do NOT rerun. → project/e.md", # keep (veto)
-        ]
+        return [EVICTABLE, self.KEEP_MISSING_HOME, self.KEEP_UNHOMED,
+                self.KEEP_NO_POINTER, self.KEEP_PINNED]
+
+    def _seed(self, tmp_path, *bullets):
+        """Write MEMORY.md plus the home files the bullets point at."""
+        mem = tmp_path / "MEMORY.md"
+        mem.write_text(_doc(*(bullets or self._bullets())))
+        _write_home(tmp_path, "project/a.md", *EVICTABLE_SIG)
+        _write_home(tmp_path, "project/e.md", *EVICTABLE_SIG)   # homed, but PINNED
+        _write_unrelated_home(tmp_path, "project/c.md")          # exists, no signature
+        return mem
 
     def test_only_evictable_bullet_removed(self, tmp_path):
-        mem = tmp_path / "MEMORY.md"
-        mem.write_text(_doc(*self._bullets()))
+        mem = self._seed(tmp_path)
         res = roll_recent_state(mem, tmp_path / "archive", max_age_days=7)
         assert len(res["evicted"]) == 1
 
@@ -179,8 +300,7 @@ class TestRollEndToEnd:
             assert keep in after                    # everything else survived
 
     def test_evicted_line_lands_verbatim(self, tmp_path):
-        mem = tmp_path / "MEMORY.md"
-        mem.write_text(_doc(*self._bullets()))
+        mem = self._seed(tmp_path)
         res = roll_recent_state(mem, tmp_path / "archive", max_age_days=7)
         arch_text = res["archive_path"].read_text()
         assert res["archive_path"].name == "recent-state-2026-07.md"
@@ -190,34 +310,54 @@ class TestRollEndToEnd:
 
     def test_archive_appends_across_runs(self, tmp_path):
         arch = tmp_path / "archive"
+        _write_home(tmp_path, "project/a.md", *EVICTABLE_SIG)
+        _write_home(tmp_path, "project/z.md", "zeta-rollout", "kube-proxy")
         m1 = tmp_path / "M1.md"
         m1.write_text(_doc(EVICTABLE))
         roll_recent_state(m1, arch, max_age_days=7)
         m2 = tmp_path / "M2.md"
-        other = "- **Z** (07-02): rollout MERGED. → project/z.md"
+        other = "- **Z**: `zeta-rollout` swapped `kube-proxy`. → project/z.md"
         m2.write_text(_doc(other))
         res2 = roll_recent_state(m2, arch, max_age_days=7)
         arch_text = res2["archive_path"].read_text()
         assert EVICTABLE in arch_text and other in arch_text   # both runs accreted
 
-    def test_nothing_evictable_leaves_files_untouched(self, tmp_path):
+    def test_archive_bucket_named_by_section_header_month(self, tmp_path):
+        # _section_date still drives the archive filename (independent of any date
+        # inside the bullet, which the gate no longer reads at all).
         mem = tmp_path / "MEMORY.md"
-        content = _doc(
-            "- **B** (07-19): thing LIVE. → project/b.md",
-            "- **E** (07-01): RESOLVED ⚠️ veto. → project/e.md",
-        )
-        mem.write_text(content)
+        mem.write_text("# MEMORY\n\n## Recent State (2026-01-05)\n\n" + EVICTABLE + "\n")
+        _write_home(tmp_path, "project/a.md", *EVICTABLE_SIG)
+        res = roll_recent_state(mem, tmp_path / "archive", max_age_days=7)
+        assert len(res["evicted"]) == 1
+        assert res["archive_path"].name == "recent-state-2026-01.md"
+
+    def test_nothing_evictable_leaves_files_untouched(self, tmp_path):
+        mem = self._seed(tmp_path, self.KEEP_MISSING_HOME, self.KEEP_UNHOMED,
+                         self.KEEP_NO_POINTER, self.KEEP_PINNED)
+        content = mem.read_text()
         res = roll_recent_state(mem, tmp_path / "archive", max_age_days=7)
         assert res["evicted"] == []
         assert mem.read_text() == content               # byte-identical, no rewrite
         assert not res["archive_path"].exists()         # archive not created
 
+    def test_verify_homing_false_evicts_nothing(self, tmp_path):
+        """verify_homing=False passes home_text_provider=None → fail-closed KEEP.
+        The default is now True (was False), so the plain call above DOES roll."""
+        mem = self._seed(tmp_path, EVICTABLE)
+        content = mem.read_text()
+        res = roll_recent_state(mem, tmp_path / "archive", max_age_days=7,
+                                verify_homing=False)
+        assert res["evicted"] == []
+        assert mem.read_text() == content
+
 
 class TestDryRun:
     def test_dry_run_mutates_nothing(self, tmp_path):
         mem = tmp_path / "MEMORY.md"
-        content = _doc(EVICTABLE, "- **B** (07-19): LIVE. → project/b.md")
+        content = _doc(EVICTABLE, "- **B**: `mullvad-exit` flapped. → project/missing.md")
         mem.write_text(content)
+        _write_home(tmp_path, "project/a.md", *EVICTABLE_SIG)
         arch = tmp_path / "archive"
         res = roll_recent_state(mem, arch, max_age_days=7, dry_run=True)
         assert len(res["evicted"]) == 1                 # reports what WOULD go
@@ -229,7 +369,8 @@ class TestAtomicReread:
     def test_reads_file_fresh_each_call(self, tmp_path):
         # a peer append between two rolls must be seen by the second run
         mem = tmp_path / "MEMORY.md"
-        mem.write_text(_doc("- **B** (07-19): LIVE. → project/b.md"))
+        mem.write_text(_doc("- **B**: `mullvad-exit` flapped. → project/missing.md"))
+        _write_home(tmp_path, "project/a.md", *EVICTABLE_SIG)
         r1 = roll_recent_state(mem, tmp_path / "archive", max_age_days=7)
         assert r1["evicted"] == []
         # a live peer appends an evictable bullet to the section
@@ -244,11 +385,17 @@ class TestConcurrencyGuard:
     start-of-run snapshot and the write, the roll must BAIL — write nothing,
     clobber no peer append. Simulated deterministically via the ``_probe`` seam."""
 
-    def test_concurrent_append_bails_and_preserves(self, tmp_path):
+    def _seed(self, tmp_path):
         mem = tmp_path / "MEMORY.md"
-        mem.write_text(_doc(EVICTABLE, "- **B** (07-19): LIVE. → project/b.md"))
+        mem.write_text(_doc(EVICTABLE,
+                            "- **B**: `mullvad-exit` flapped. → project/missing.md"))
+        _write_home(tmp_path, "project/a.md", *EVICTABLE_SIG)
+        return mem
+
+    def test_concurrent_append_bails_and_preserves(self, tmp_path):
+        mem = self._seed(tmp_path)
         arch = tmp_path / "archive"
-        peer_line = "- **PEER** (07-20): landed mid-roll LIVE. → project/peer.md\n"
+        peer_line = "- **PEER**: landed mid-roll. → project/peer.md\n"
 
         def peer_append(p):
             # a live peer appends to MEMORY.md after our snapshot, before our write
@@ -263,8 +410,7 @@ class TestConcurrencyGuard:
 
     def test_probe_noop_writes_normally(self, tmp_path):
         # guard passes when the file is unchanged under it → normal eviction
-        mem = tmp_path / "MEMORY.md"
-        mem.write_text(_doc(EVICTABLE, "- **B** (07-19): LIVE. → project/b.md"))
+        mem = self._seed(tmp_path)
         arch = tmp_path / "archive"
         res = roll_recent_state(mem, arch, max_age_days=7, _probe=lambda p: None)
         assert res["skipped_concurrent"] is False
@@ -276,19 +422,18 @@ class TestConcurrencyGuard:
         # the normal no-probe path reports the flag and never trips it
         mem = tmp_path / "MEMORY.md"
         mem.write_text(_doc(EVICTABLE))
+        _write_home(tmp_path, "project/a.md", *EVICTABLE_SIG)
         res = roll_recent_state(mem, tmp_path / "archive", max_age_days=7)
         assert res["skipped_concurrent"] is False
         assert len(res["evicted"]) == 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# homing-verification guard: a pointered/aged/done bullet is only evicted when its
-# home file ACTUALLY contains the fact (else it would be silently lost from the
-# always-injected MEMORY.md). Conservative: unverifiable → KEEP.
+# homing-verification guard, exercised through the real file-resolution path
+# (_pointer_target_paths → _resolve_home_text). Conservative: unverifiable → KEEP.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestHomingGuard:
-    # aged (07-01), done (RESOLVED), trailing pointer, no veto — passes every old gate.
     CID = ("- **CI/deploy** (07-01): deploy-target=`github` RESOLVED. "
            "→ project/foo.md")
 
@@ -296,9 +441,7 @@ class TestHomingGuard:
         # home file exists but does NOT contain the bullet's signature → KEEP
         mem = tmp_path / "MEMORY.md"
         mem.write_text(_doc(self.CID))
-        (tmp_path / "project").mkdir()
-        (tmp_path / "project" / "foo.md").write_text(
-            "# Foo\n\nUnrelated notes about storage volumes and PVC provisioning.\n")
+        _write_unrelated_home(tmp_path, "project/foo.md")
         res = roll_recent_state(mem, tmp_path / "archive", max_age_days=7, verify_homing=True)
         assert res["evicted"] == []
         assert "**CI/deploy**" in mem.read_text()          # bullet stays put
@@ -308,7 +451,7 @@ class TestHomingGuard:
         # same bullet, but the home file DOES contain the signature → EVICT
         mem = tmp_path / "MEMORY.md"
         mem.write_text(_doc(self.CID))
-        (tmp_path / "project").mkdir()
+        (tmp_path / "project").mkdir(exist_ok=True)
         (tmp_path / "project" / "foo.md").write_text(
             "# Foo\n\nThe ci/deploy pipeline: deploy-target is `github` now.\n")
         res = roll_recent_state(mem, tmp_path / "archive", max_age_days=7, verify_homing=True)

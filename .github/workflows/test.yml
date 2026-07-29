@@ -92,12 +92,15 @@ jobs:
           allow=$(printf '%s\n' "$out" | grep -F 'leak-scan:allow' || true)
           hits=$(printf '%s\n' "$out" | grep -Fv 'leak-scan:allow' | grep -v '^$' || true)
           if [ -n "$allow" ]; then
-            echo "ALLOWLISTED (marker present -- re-review each):"
-            printf '%s\n' "$allow"
+            echo "ALLOWLISTED (marker present -- re-review each; file:line only):"
+            # Never print matched text — public Actions logs are world-readable ~90d.
+            printf '%s\n' "$allow" | sed -E 's/^([^:]+:[0-9]+):.*/\1/' | sort | uniq -c
           fi
           if [ -n "$hits" ]; then
-            printf '%s\n' "$hits"
-            echo "FAIL: internal references found in the published tree"
+            echo "INTERNAL REFS (file:line only — content withheld):"
+            printf '%s\n' "$hits" | sed -E 's/^([^:]+:[0-9]+):.*/\1/' | sort | uniq -c
+            n=$(printf '%s\n' "$hits" | grep -c . || true)
+            echo "FAIL: $n internal reference hit(s) found in the published tree"
             exit 1
           fi
           echo "OK: no internal references found"

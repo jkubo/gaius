@@ -70,16 +70,26 @@ jobs:
             exit 1
           fi
           echo "scanning $n extracted file(s) from ${#sdists[@]} sdist(s) + ${#wheels[@]} wheel(s)"
-          hits=$(grep -rIaEn 'kub0\.(net|io)|k8s-(aus|hnd|lax|toa)-|10\.(250|42|43)\.|100\.(64|67)\.|/home/[a-z]+/|(~|\$HOME)/(ansible|\.ssh)|Projects/(agent-memory|Brain)|kub0-ai|sync-council' "$work" || true)  # leak-scan:allow -- this IS the pattern
+          set +e
+          out=$(grep -rIaEn 'kub0\.(net|io)|k8s-(aus|hnd|lax|toa)-|10\.(250|42|43)\.|100\.(64|67)\.|/home/[a-z]+/|(~|\$HOME)/(ansible|\.ssh)|Projects/(agent-memory|Brain)|kub0-ai|sync-council' "$work")  # leak-scan:allow -- this IS the pattern
+          rc=$?
+          set -e
+          if [ "$rc" -eq 2 ]; then
+            echo "::error::artifact leak scan errored (rc=2) — refusing to publish unscanned"
+            exit 1
+          fi
           # One narrow exception: the Apache copyright line names the owning entity
           # and cannot carry an allow marker, because LICENSE ships verbatim as legal
           # text. Exempt that ONE line only -- matched by position and shape, not by
           # the name on it, so it keeps working if the holder ever changes. Any other
           # line of LICENSE, and every other file, still fails the job.
-          hits=$(printf '%s\n' "$hits" | grep -Fv 'leak-scan:allow' | grep -vE '/LICENSE:[0-9]+:[[:space:]]*Copyright [0-9]{4} ' | grep -v '^$' || true)
+          hits=$(printf '%s\n' "$out" | grep -Fv 'leak-scan:allow' | grep -vE '/LICENSE:[0-9]+:[[:space:]]*Copyright [0-9]{4} ' | grep -v '^$' || true)
           if [ -n "$hits" ]; then
-            printf '%s\n' "$hits"
-            echo "::error::internal reference found in build artifacts; scrub failed, refusing to publish"
+            # file:line + count only — never matched text (public Actions logs).
+            echo "INTERNAL REFS (file:line only — content withheld):"
+            printf '%s\n' "$hits" | sed -E 's/^([^:]+:[0-9]+):.*/\1/' | sort | uniq -c
+            n=$(printf '%s\n' "$hits" | grep -c . || true)
+            echo "::error::$n internal reference hit(s) in build artifacts; scrub failed, refusing to publish"
             exit 1
           fi
           echo "artifact leak scan: clean"

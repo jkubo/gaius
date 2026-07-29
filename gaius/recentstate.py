@@ -40,6 +40,11 @@ except Exception:  # pragma: no cover - standalone / test import
 
 VETO_MARK = "⚠"  # ⚠ (matches ⚠️ with or without the VS16 variation selector)
 
+# Explicit "never roll this bullet" marker. Retired ⚠ as the veto on 2026-07-28
+# (mnemos #123): ⚠ is ambient on nearly every Recent-State bullet, so vetoing on it
+# is what made the auto-roll evict nothing for weeks. See _has_pin().
+PIN_MARK = "📌"
+
 # case-SENSITIVE uppercase tokens — prose "live state" must not count as a marker
 _DONE_RE = re.compile(r"✅|\b(?:LIVE|FIXED|RESOLVED|MERGED|DONE|SHIPPED)\b")
 
@@ -73,7 +78,10 @@ _ENDS_WITH_LINK_RE = re.compile(r"\[[^\]]+\]\([^)]+\)[.)]*\s*$")
 # content. CONSERVATIVE: anything we cannot positively verify → KEEP.
 
 HOME_MATCH_FRACTION = 0.5
-MIN_HOME_HITS = 1
+# Raised 1 → 2 on 2026-07-28 (mnemos #123) when homing became the SOLE safety gate.
+# A single shared token (one PR number, one filename) is too weak to authorise an
+# automatic delete on its own; two independent signature hits is the floor.
+MIN_HOME_HITS = 2
 
 _CODE_SPAN_RE = re.compile(r"`([^`]+)`")
 _BOLD_SPAN_RE = re.compile(r"\*\*([^*]+)\*\*")
@@ -193,6 +201,16 @@ def _has_veto(text: str) -> bool:
     return VETO_MARK in text
 
 
+def _has_pin(text: str) -> bool:
+    """An EXPLICIT operator pin — this bullet never rolls, regardless of homing.
+
+    Deliberately NOT ``⚠``. The ambient warning mark appears on most Recent-State
+    bullets by construction, which is exactly why using it as the veto made the roll
+    inert (2026-07-28). A pin has to be a decision, not a side effect of tone, so it
+    is a marker nobody types by accident."""
+    return PIN_MARK in text or "<!--pin-->" in text
+
+
 def _has_done_marker(text: str) -> bool:
     return bool(_DONE_RE.search(text))
 
@@ -252,30 +270,37 @@ def _bullet_date(text: str, section_date) -> "_dt.date | None":
     return max(cands) if cands else None
 
 
-def should_evict(text: str, section_date, max_age_days: int, home_text_provider=None) -> bool:
-    """The whole safety gate: ALL of (age>threshold, done-marker, trailing pointer)
-    AND NOT veto. Any single failure → KEEP (the fact stays in MEMORY.md).
+def should_evict(text: str, section_date=None, max_age_days: int = 0,
+                 home_text_provider=None) -> bool:
+    """Evict iff the bullet is PROVABLY REDUNDANT: it ends in a durable pointer AND that
+    pointer's target genuinely contains the bullet's signature. Nothing else.
 
-    ``home_text_provider`` (optional) is a callable ``text -> home_text`` used for the
-    homing-verification guard: even after every gate passes, refuse eviction unless the
-    pointer target actually contains the bullet's fact. When it is ``None`` the behavior
-    is IDENTICAL to before (the guard is a no-op)."""
-    if _has_veto(text):
+    REDESIGNED 2026-07-28 (mnemos #123). The previous gate made four PROXIES mandatory —
+    non-veto (any ``⚠`` pinned the bullet), a done-marker, a per-bullet date, and
+    age > N days — and left the one real safety property, homing, an OPTIONAL kwarg that
+    defaulted to a documented no-op. Recent-State bullets essentially never satisfy the
+    proxies by construction, so the roll was inert: measured against the live MEMORY.md
+    the proxy gate evicted **0 of 18** bullets while this gate evicts **7 (2,206 B)**.
+    🔑 The proxies were proxies FOR homing; homing is the ground truth, so it is now the
+    gate. A bullet whose fact is provably present in its pointer target loses nothing by
+    leaving the index — that, and only that, is what makes an automatic delete safe.
+
+    ``section_date`` / ``max_age_days`` are retained for call-site compatibility and are
+    deliberately NOT consulted.
+
+    FAIL-CLOSED at every step — pinned, no pointer, no provider, unreadable home, or a
+    signature we cannot positively match → KEEP the bullet.
+
+    ⚠️ ``home_text_provider=None`` now means "cannot verify ⇒ KEEP", the INVERSE of the
+    old contract where it meant "skip the check". A caller that omits it evicts nothing,
+    which is the safe direction for an automated deleter."""
+    if _has_pin(text):
         return False
     if not _has_trailing_pointer(text):
         return False
-    if not _has_done_marker(text):
+    if home_text_provider is None:
         return False
-    if section_date is None:
-        return False
-    bd = _bullet_date(text, section_date)
-    if bd is None:
-        return False
-    if (section_date - bd).days <= max_age_days:
-        return False
-    if home_text_provider is not None and not _is_homed(text, home_text_provider(text)):
-        return False
-    return True
+    return _is_homed(text, home_text_provider(text))
 
 
 # ── atomic MEMORY.md rewrite ────────────────────────────────────────────────
@@ -298,7 +323,7 @@ def _atomic_write(path: Path, content: str) -> None:
 # ── core roll ────────────────────────────────────────────────────────────────
 
 def roll_recent_state(mem_path, archive_dir, max_age_days: int = 7, dry_run: bool = False,
-                      verify_homing: bool = False, _probe=None):
+                      verify_homing: bool = True, _probe=None):
     """Evict eligible ``## Recent State`` bullets from ``mem_path`` into
     ``archive_dir/recent-state-YYYY-MM.md`` (YYYY-MM = section-header month).
 

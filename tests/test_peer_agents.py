@@ -23,6 +23,8 @@ from gaius._core import (  # noqa: E402
     _discover_grok_sessions,
     _discover_codex_sessions,
     _content_blocks_to_text,
+    _grok_operator_query,
+    agent_to_principal,
 )
 
 
@@ -47,6 +49,30 @@ class TestContentBlocks:
 
     def test_none(self):
         assert _content_blocks_to_text(None) == ""
+
+
+class TestGrokOperatorQuery:
+    def test_extracts_inner_user_query(self):
+        text = "<user_query>\nhello\n</user_query>\n<skill_information>BIG</skill_information>"
+        assert _grok_operator_query(text) == "hello"
+
+    def test_harness_noise_returns_none(self):
+        assert _grok_operator_query("<system-reminder>\nMCP servers connected\n</system-reminder>") is None
+        assert _grok_operator_query("<user_info>\nOS Version: linux\n</user_info>") is None
+        assert _grok_operator_query("MCP servers currently connecting…") is None
+        assert _grok_operator_query(
+            "This session is being continued from a previous conversation that ran out of context."
+        ) is None
+
+    def test_plain_text_kept(self):
+        assert _grok_operator_query("what is the flannel MTU on cross-site paths?") is not None
+
+
+class TestPeerPrincipalDefaults:
+    def test_grok_and_codex_are_self_principals(self):
+        # Built-in defaults (GAIUS_CONFIG=/dev/null in this module) — Gap 48
+        assert agent_to_principal("grok") == "grok"
+        assert agent_to_principal("codex") == "codex"
 
 
 class TestGrokParser:
@@ -92,6 +118,43 @@ class TestGrokParser:
         assert len(events) == 1
         assert "<user_query>" not in events[0]["subject"]
         assert events[0]["subject"].startswith("check the latest malware threats")
+
+    def test_user_query_extracts_inner_drops_skill_information(self, tmp_path):
+        # Live Grok shape: <user_query> + trailing <skill_information> dump in one user msg
+        rows = [
+            {"type": "user", "content": [{"type": "text", "text": (
+                "<user_query>\n/mnemos any gaps in gaius for grok?\n</user_query>\n"
+                "<skill_information>\n<skill name=\"mnemos\"># Session Mode: Surgeon\n"
+                + ("x" * 500) + "\n</skill_information>"
+            )}]},
+            {"type": "assistant",
+             "content": "Gap 48: principal collapse and subject pollution on Grok mining."},
+        ]
+        sess = self._session(tmp_path, rows)
+        events = parse_grok_events(sess)
+        assert len(events) == 1
+        assert events[0]["subject"] == "/mnemos any gaps in gaius for grok?"
+        assert "skill_information" not in events[0]["subject"]
+        assert "Session Mode" not in events[0]["subject"]
+
+    def test_system_reminder_does_not_overwrite_last_user(self, tmp_path):
+        rows = [
+            {"type": "user", "content": [{"type": "text",
+             "text": "<user_query>\nwhat is flannel MTU?\n</user_query>"}]},
+            # harness inject between operator turn and terminal answer
+            {"type": "user", "content": [{"type": "text",
+             "text": "<system-reminder>\nMCP servers connected:\n- gaius (16 tools)\n</system-reminder>"}]},
+            {"type": "user", "content": [{"type": "text",
+             "text": "\n\n<system-reminder>\nAs you answer the user's questions...\n</system-reminder>"}]},
+            {"type": "assistant",
+             "content": "Flannel MTU is 1050 on cross-site Tailscale paths (VXLAN overhead)."},
+        ]
+        sess = self._session(tmp_path, rows)
+        events = parse_grok_events(sess)
+        assert len(events) == 1
+        assert events[0]["subject"] == "what is flannel MTU?"
+        assert "system-reminder" not in events[0]["subject"]
+        assert "MCP" not in events[0]["subject"]
 
     def test_toolcall_narration_skipped(self, tmp_path):
         # Assistant messages WITH tool_calls are mid-turn narration, not answers.

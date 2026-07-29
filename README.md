@@ -222,7 +222,8 @@ sidecar (`~/.gaius/concord.db` — one SQLite file, no services) that gives para
   loop (`open → reviewing → confirmed/refuted`).
 - **Task pool** — an incident commander seeds divided work once; each new session takes
   the next task atomically.
-- **Roster** — live sessions read from Claude Code's own session registry, joined with
+- **Roster** — live sessions merged from Claude (`~/.claude/sessions/`) + Grok
+  (`~/.grok/active_sessions.json`) registries, joined with
   the claims they hold.
 
 ```bash

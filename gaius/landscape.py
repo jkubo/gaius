@@ -180,7 +180,7 @@ def cmd_inject(args):
     parser.add_argument("--sop", type=str, default=None, help="Explicit SOP name to inject")
     parser.add_argument("--scopes", type=str, default=None, help="Comma-separated scope labels for SOP matching")
     parser.add_argument("--landscape", type=str, default=None, help="Domain name to hydrate live state for (runs landscape: commands from domain file)")
-    parser.add_argument("--task", type=str, default=None, help="Task description for BM25 relevance ranking (e.g. 'fix DRBD split-brain on toa-fwd')")
+    parser.add_argument("--task", type=str, default=None, help="Task description for BM25 relevance ranking (e.g. 'fix storage split-brain on node-01')")
     parser.add_argument("--no-semantic", action="store_true", help="Disable semantic (embedding) scoring even if available")
     parser.add_argument("--no-always-skills", action="store_true", help="Skip gate:always skills (use when session-start already injected them)")
     parser.add_argument("--format", type=str, default="claude", choices=["claude", "gemini", "plain"],

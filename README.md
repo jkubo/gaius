@@ -3,7 +3,8 @@
 **Ops memory lifecycle manager for AI coding agents.**
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![GitHub](https://img.shields.io/badge/install-git%2Bhttps-black)](https://github.com/jkubo/gaius)
+[![PyPI](https://img.shields.io/pypi/v/gaius-memory)](https://pypi.org/project/gaius-memory/)
+[![GitHub](https://img.shields.io/badge/source-github-black)](https://github.com/jkubo/gaius)
 
 Not another RAG chatbot memory — a production-grade system that extracts facts from Claude Code, Gemini CLI, Grok, and Codex sessions, ranks them into an inject-ready corpus, enforces behavioral gates, and prevents you from breaking prod at 3am.
 
@@ -12,14 +13,15 @@ Not another RAG chatbot memory — a production-grade system that extracts facts
 > - **Prevents actions, not just recalls them** — hard gates `exit:2` on force-push, unconfirmed live-trade, prod-delete.
 > - **Fully offline** — BM25 + sqlite-vec in one SQLite file. No API keys, no cloud.
 
-> **Install from git** — the `gaius-memory` name on PyPI is not published yet. Do not `pip install gaius-memory` from PyPI.
-
 ```bash
 # CLI (offline core). Extras: [semantic], [mcp], [http]
-pip install "gaius-memory @ git+https://github.com/jkubo/gaius"
+pip install gaius-memory
 
 # Or with uv / Claude Code MCP (see .mcp.json):
-# uvx --from "gaius-memory[mcp] @ git+https://github.com/jkubo/gaius" gaius-mcp
+# uvx --from "gaius-memory[mcp]" gaius-mcp
+#
+# Tip: for unreleased mainline, pin git:
+# pip install "gaius-memory @ git+https://github.com/jkubo/gaius"
 ```
 
 ```

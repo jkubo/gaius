@@ -27,7 +27,7 @@ Commands:
   retire      Scan JSONL files and stage new compact summaries
   s3-retire   Scan session JSONLs from S3/rclone remote for a given agent
   harvest     Scan cold Gemini CLI sessions (.json), stage events for review
-  inject      Inject ranked corpus entries into context (--budget N tokens, --skills-budget N, --landscape DOMAIN)
+  inject      Inject ranked corpus entries into context (--budget N tokens, default 2000, --skills-budget N, --landscape DOMAIN)
   landscape   Run live landscape commands for a domain (cached by TTL)
   skills      List all skills with domain/trigger/gate/line-count
   index       Parse JSONL, build domain index, write deltas and corpus
@@ -582,6 +582,25 @@ def save_staged(entry: dict):
         raise ValueError(f"staged filename escapes STAGING_DIR: {fname!r}")
     with open(dest, "w") as f:
         json.dump(entry, f, indent=2)
+
+
+def display_uid(uuid) -> str:
+    """Shortest operator-facing summary id that is actually discriminating.
+
+    Mined summaries carry a synthetic ``mined-<session-uuid>`` uuid, so a bare
+    ``uuid[:8]`` spends six of its eight characters on the tag and leaves TWO
+    of session id — measured 246 ambiguous labels across 3167 staged entries
+    (12-way at worst). `gaius done` then hard-errors on exactly the entries
+    `gaius batch` just displayed, and the operator cannot build a longer prefix
+    because batch prints nothing else to disambiguate with. Keep the tag (it
+    says where the summary came from) but budget the 8 chars against the
+    session uuid rather than the tag.
+    """
+    uuid = str(uuid or "?")
+    for tag in ("mined-extra-", "mined-"):
+        if uuid.startswith(tag):
+            return tag + uuid[len(tag):][:8]
+    return uuid[:8]
 
 
 def has_signal(entry: dict) -> bool:
@@ -3915,7 +3934,7 @@ def cmd_show(args):
         for e in unreviewed:
             ts  = e.get("timestamp", "")[:10]
             sid = e.get("session_id", "?")[:8]
-            uid = e.get("uuid", "?")[:8]
+            uid = display_uid(e.get("uuid"))
             sig = "★" if has_signal(e) else " "
             sections_present = [k.split("_")[0][0].upper()
                                  for k in SIGNAL_SECTIONS if e["sections"].get(k)]
@@ -3930,7 +3949,7 @@ def cmd_show(args):
               "──────────────────────────────────────────────")
         for e in reviewed[-5:]:
             ts  = e.get("timestamp", "")[:10]
-            uid = e.get("uuid", "?")[:8]
+            uid = display_uid(e.get("uuid"))
             print(f"    {uid}  {ts}  ✓")
         if len(reviewed) > 5:
             print(f"    ... and {len(reviewed)-5} more")
@@ -4292,8 +4311,8 @@ def cmd_next(args):
             print(text)
 
     print(f"\n{'=' * 68}")
-    print(f"Mark done:  gaius done {e['uuid'][:8]}")
-    print(f"Skip:       gaius next  (after gaius done {e['uuid'][:8]})")
+    print(f"Mark done:  gaius done {display_uid(e['uuid'])}")
+    print(f"Skip:       gaius next  (after gaius done {display_uid(e['uuid'])})")
 
 
 def cmd_done(args):
@@ -4781,7 +4800,7 @@ def cmd_batch(args):
         source_tag = " [mined]" if e.get("source") == "mined" else ""
         sc_tag = " ⚡STATE-CHANGE — verify project files reflect this" if e.get("state_change") else ""
         print("=" * 68)
-        print(f"[{i}/{len(unreviewed)}]  {e['uuid'][:8]}  {e.get('timestamp','')[:10]}{source_tag}{sc_tag}")
+        print(f"[{i}/{len(unreviewed)}]  {display_uid(e['uuid'])}  {e.get('timestamp','')[:10]}{source_tag}{sc_tag}")
         print("=" * 68)
 
         for key, header in SECTION_HEADERS:
@@ -5299,6 +5318,25 @@ def cmd_init(args):
     """Guided first-run setup: create ~/.gaius/config.yaml and memory directories."""
     import shutil
 
+    parser = argparse.ArgumentParser(prog="gaius init")
+    parser.add_argument("--backend", type=str, default=None,
+                        choices=["claude", "gemini", "vllm"],
+                        help="Agent backend to configure (skips the interactive backend prompt)")
+    parser.add_argument("--yes", action="store_true",
+                        help="Accept the default answer for every prompt (non-interactive setup)")
+    parsed = parser.parse_args(args)
+
+    def ask(prompt, default=""):
+        """input() wrapper: --yes takes the default; closed stdin exits cleanly."""
+        if parsed.yes:
+            return default
+        try:
+            return input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\ngaius init: no interactive input available — "
+                  "use `gaius init --backend <name> --yes` for non-interactive setup.")
+            sys.exit(1)
+
     gaius_dir = Path.home() / ".gaius"
     config_path = gaius_dir / "config.yaml"
 
@@ -5307,26 +5345,31 @@ def cmd_init(args):
 
     # Check for existing config
     if config_path.exists():
-        ans = input(f"\nConfig already exists at {config_path}\nOverwrite? [y/N] ").strip().lower()
+        ans = ask(f"\nConfig already exists at {config_path}\nOverwrite? [y/N] ").lower()
         if ans != "y":
             print("Aborted.")
             return
 
     # Choose backend
-    print("\nChoose your AI coding agent backend:")
-    print("  1) claude   — Claude Code (JSONL sessions in ~/.claude/projects/)")
-    print("  2) gemini   — Gemini CLI (JSON sessions in ~/.gemini/tmp/)")
-    print("  3) vllm     — vLLM-served models (Gemma, Nemotron, etc. — requires chat TUI that writes JSONL)")
-    backend_choice = input("\nBackend [1]: ").strip() or "1"
-    backend_map = {"1": "claude", "2": "gemini", "3": "vllm",
-                   "claude": "claude", "gemini": "gemini", "vllm": "vllm"}
-    backend = backend_map.get(backend_choice, "claude")
+    if parsed.backend:
+        backend = parsed.backend
+    else:
+        if not parsed.yes:
+            print("\nChoose your AI coding agent backend:")
+            print("  1) claude   — Claude Code (JSONL sessions in ~/.claude/projects/)")
+            print("  2) gemini   — Gemini CLI (JSON sessions in ~/.gemini/tmp/)")
+            print("  3) vllm     — vLLM-served models (Gemma, Nemotron, etc. — requires chat TUI that writes JSONL)")
+        backend_choice = ask("\nBackend [1]: ") or "1"
+        backend_map = {"1": "claude", "2": "gemini", "3": "vllm",
+                       "claude": "claude", "gemini": "gemini", "vllm": "vllm"}
+        backend = backend_map.get(backend_choice, "claude")
 
     # Choose preset
-    print("\nChoose a starting preset:")
-    print("  1) default  — minimal, any software project (no K8s patterns)")
-    print("  2) k8s      — Kubernetes cluster ops (includes service/namespace/incident patterns)")
-    preset_choice = input("\nPreset [1]: ").strip() or "1"
+    if not parsed.yes:
+        print("\nChoose a starting preset:")
+        print("  1) default  — minimal, any software project (no K8s patterns)")
+        print("  2) k8s      — Kubernetes cluster ops (includes service/namespace/incident patterns)")
+    preset_choice = ask("\nPreset [1]: ") or "1"
     preset_name = "k8s" if preset_choice == "2" else "default"
 
     # Find preset file
@@ -5347,12 +5390,12 @@ def cmd_init(args):
         "vllm":   str(Path.home() / ".gaius" / "sessions"),
     }
     default_sessions = sessions_defaults[backend]
-    sessions_input = input(f"\nSessions directory [{default_sessions}]: ").strip()
+    sessions_input = ask(f"\nSessions directory [{default_sessions}]: ")
     sessions_dir = sessions_input or default_sessions
 
     # Memory directory
     default_memory = str(Path.home() / ".gaius" / "memory")
-    memory_input = input(f"Memory directory (domain/*.md files) [{default_memory}]: ").strip()
+    memory_input = ask(f"Memory directory (domain/*.md files) [{default_memory}]: ")
     memory_dir = memory_input or default_memory
 
     # Create dirs
@@ -6645,8 +6688,28 @@ from gaius.reconcile import (  # noqa: E402,F401  re-export (reconcile split 202
 )
 
 from gaius.landscape import (  # noqa: E402,F401  re-export (landscape split 2026-07-01)
-    cmd_inject, cmd_landscape,
+    cmd_landscape,
 )
+from gaius.landscape import cmd_inject as _landscape_cmd_inject  # noqa: E402
+
+# Default --budget for `gaius inject` when the flag is omitted: the documented
+# per-session corpus budget ("2000 corpus + 1500 skills", README) — also the
+# session-start hook default (hooks/session-start.sh, GAIUS_INJECT_BUDGET).
+DEFAULT_INJECT_BUDGET = 2000
+
+
+def cmd_inject(args):
+    """Inject ranked corpus entries into context (gaius.landscape.cmd_inject).
+
+    Thin wrapper supplying the standard --budget default so plain
+    `gaius inject --task ...` works without an explicit budget. The default is
+    PREPENDED, so an explicit --budget anywhere in args still wins (argparse
+    keeps the last value for a repeated flag).
+    """
+    args = list(args)
+    if not any(a == "--budget" or a.startswith("--budget=") for a in args):
+        args = ["--budget", str(DEFAULT_INJECT_BUDGET)] + args
+    return _landscape_cmd_inject(args)
 
 from gaius.recentstate import (  # noqa: E402,F401  re-export (Recent State auto-roll 2026-07-21)
     cmd_recent_roll, roll_recent_state, should_evict,

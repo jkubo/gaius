@@ -4,7 +4,7 @@
       "command": "uvx",
       "args": [
         "--from",
-        "gaius-memory[mcp] @ git+https://github.com/jkubo/gaius",
+        "gaius-memory[mcp] @ git+https://github.com/jkubo/gaius@v0.1.1",
         "gaius-mcp"
       ]
     }

@@ -1,20 +1,25 @@
 """gaius telemetry — lightweight event logging for injection quality monitoring.
 
-Three event types:
+Event types:
   - prompt_events: every UserPromptSubmit hook invocation
   - enforcement_events: every PreToolUse hard-enforce check
   - session_summaries: aggregated at session stop
+  - tool_events: every tool call (gaius-observe PreToolUse hook + MCP tool
+    decorator) — args stored only as sha256 hash + redacted compact summary
 
 DB lives at ~/.gaius/telemetry.db (separate from facts.db — no schema coupling).
+GAIUS_TELEMETRY_DB env var overrides the path (tests / sandboxes).
 """
 
 import hashlib
 import json
+import os
+import re
 import sqlite3
 import time
 from pathlib import Path
 
-_DB_PATH = Path.home() / ".gaius" / "telemetry.db"
+_DB_PATH = Path(os.environ.get("GAIUS_TELEMETRY_DB") or (Path.home() / ".gaius" / "telemetry.db"))
 _conn = None
 
 
@@ -82,6 +87,18 @@ def _init_schema(conn: sqlite3.Connection):
             score REAL                            -- per-token score at injection time (nullable)
         );
 
+        CREATE TABLE IF NOT EXISTS tool_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,                     -- unix timestamp
+            session_id TEXT,
+            tool_name TEXT,                       -- Bash, Edit, gaius_search, ...
+            args_sha256 TEXT,                     -- sha256 of full canonical-JSON tool_input (pre-redaction)
+            args_redacted TEXT,                   -- compact redacted summary of tool_input
+            source TEXT DEFAULT 'hook',           -- 'hook' (gaius-observe) | 'mcp' (mcp_server decorator)
+            event TEXT DEFAULT 'pre',             -- 'pre','post'
+            project TEXT                          -- project hash (sha256(git remote)[:12], from gaius-observe)
+        );
+
         CREATE TABLE IF NOT EXISTS coaching_tips (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             tip_key TEXT UNIQUE NOT NULL,         -- e.g. 'short_prompt', 'no_domain_terms'
@@ -98,6 +115,8 @@ def _init_schema(conn: sqlite3.Connection):
         CREATE INDEX IF NOT EXISTS idx_injfact_prompt ON injection_facts(prompt_hash);
         CREATE INDEX IF NOT EXISTS idx_skillinj_ts ON skill_injections(ts);
         CREATE INDEX IF NOT EXISTS idx_skillinj_skill ON skill_injections(skill);
+        CREATE INDEX IF NOT EXISTS idx_toolev_ts ON tool_events(ts);
+        CREATE INDEX IF NOT EXISTS idx_toolev_session ON tool_events(session_id);
     """)
     # Seed coaching tips if empty
     count = conn.execute("SELECT COUNT(*) FROM coaching_tips").fetchone()[0]
@@ -316,6 +335,138 @@ def log_skill_injection(session_id: str, skills: list):
         pass  # telemetry must never break injection
 
 
+# ── Tool-event capture (args hashing + redaction) ────────────────────────────
+# Raw tool_input is NEVER stored: only a sha256 of the canonical JSON (for
+# dedup/correlation) plus a compact redacted summary. Redaction runs known
+# token/credential patterns AND sensitive-key-name masking BEFORE storage —
+# when in doubt, redact.
+
+_REDACT_MAX = 600          # chars of redacted summary kept
+_REDACTED = "[REDACTED]"
+
+_SENSITIVE_KEY_RE = re.compile(
+    r"(?i)(token|secret|passwd|password|credential|api[_-]?key|apikey|"
+    r"private[_-]?key|access[_-]?key|session[_-]?key|client[_-]?secret|"
+    r"authorization|vault[_-]?pass|cookie)"
+)
+
+_REDACT_PATTERNS = [re.compile(p) for p in (
+    # private key blocks (redact even if unterminated)
+    r"-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END[A-Z ]*PRIVATE KEY-----|\Z)",
+    r"\bgh[pousr]_[A-Za-z0-9]{8,}\b",                # GitHub classic tokens (ghp_/gho_/ghu_/ghs_/ghr_)
+    r"\bgithub_pat_[A-Za-z0-9_]{20,}\b",             # GitHub fine-grained PAT
+    r"\bsk-ant-[A-Za-z0-9_-]{16,}\b",                # Anthropic API keys
+    r"\bsk-[A-Za-z0-9_-]{20,}\b",                    # OpenAI-style keys
+    r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b",             # Slack tokens
+    r"\bAKIA[0-9A-Z]{16}\b",                         # AWS access key id
+    r"\btskey-[A-Za-z0-9-]{12,}\b",                  # Tailscale keys
+    r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}\b",  # JWT
+    r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{16,}",       # Authorization: Bearer …
+    # key=value / key: value assignments — keep the key name, drop the value
+    # (lookahead skips values already masked by the key-name pass)
+    r"(?i)\b(api[_-]?key|apikey|token|secret|passwd|password|client[_-]?secret|auth)\b"
+    r"['\"]?\s*[:=]\s*['\"]?(?!\[REDACTED\])[^\s'\",;&]{6,}",
+)]
+
+
+def _canonical_json(obj) -> str:
+    """Deterministic compact JSON of a tool_input payload (sorted keys)."""
+    try:
+        return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False, default=str)
+    except Exception:
+        return str(obj)
+
+
+def hash_args(tool_input) -> str:
+    """sha256 hex digest of the full canonical-JSON tool_input (pre-redaction)."""
+    return hashlib.sha256(
+        _canonical_json(tool_input).encode("utf-8", "replace")
+    ).hexdigest()
+
+
+def _redact_obj(obj):
+    """Recursively mask values whose key name looks credential-bearing."""
+    if isinstance(obj, dict):
+        return {
+            k: (_REDACTED if isinstance(k, str) and _SENSITIVE_KEY_RE.search(k)
+                else _redact_obj(v))
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [_redact_obj(v) for v in obj]
+    return obj
+
+
+def redact_args(tool_input) -> str:
+    """Compact redacted summary of tool_input — safe to store/display."""
+    text = _canonical_json(_redact_obj(tool_input))
+    for pat in _REDACT_PATTERNS:
+        text = pat.sub(
+            lambda m: (m.group(1) + "=" + _REDACTED) if (m.lastindex or 0) >= 1
+            else _REDACTED,
+            text,
+        )
+    if len(text) > _REDACT_MAX:
+        text = text[:_REDACT_MAX] + f"…[+{len(text) - _REDACT_MAX} chars]"
+    return text
+
+
+def log_tool_event(
+    session_id: str,
+    tool_name: str,
+    tool_input=None,
+    source: str = "hook",
+    event: str = "pre",
+    project: str = "",
+):
+    """Best-effort: one row per tool call (hook or MCP path).
+
+    Stores hash + redacted summary only — never the raw args. Mirrors the
+    try/except pattern of log_skill_injection: a telemetry failure must never
+    block or fail the tool call.
+    """
+    try:
+        args_sha256 = hash_args(tool_input)
+        args_redacted = redact_args(tool_input)
+        conn = _get_conn()
+        conn.execute(
+            """INSERT INTO tool_events
+               (ts, session_id, tool_name, args_sha256, args_redacted, source, event, project)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (time.time(), session_id, tool_name, args_sha256, args_redacted,
+             source, event, project),
+        )
+        conn.commit()
+    except Exception:
+        pass  # telemetry must never break a tool call
+
+
+def _cli_tool_event(argv: list) -> int:
+    """`python3 -m gaius.telemetry tool-event <event> [project]` — reads the
+    PreToolUse hook JSON (Claude snake_case or Grok camelCase envelope) on
+    stdin and logs one tool_events row. Always exits 0, prints nothing —
+    called from gaius-observe, which must stay fail-open."""
+    import sys
+    try:
+        event = argv[0] if argv else "pre"
+        project = argv[1] if len(argv) > 1 else ""
+        payload = json.load(sys.stdin)
+        if not isinstance(payload, dict):
+            return 0
+        session_id = (payload.get("session_id") or payload.get("sessionId")
+                      or os.environ.get("CLAUDE_SESSION_ID")
+                      or os.environ.get("GROK_SESSION_ID") or "unknown")
+        tool_name = payload.get("tool_name") or payload.get("toolName") or "unknown"
+        tool_input = payload.get("tool_input") if "tool_input" in payload \
+            else payload.get("toolInput")
+        log_tool_event(session_id, tool_name, tool_input,
+                       source="hook", event=event, project=project)
+    except Exception:
+        pass  # never fail the hook
+    return 0
+
+
 def get_summary(hours: int = 24) -> dict:
     """Aggregate telemetry for dashboard display."""
     conn = _get_conn()
@@ -416,3 +567,11 @@ def get_violations(limit: int = 50) -> list[dict]:
         (limit,)
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+if __name__ == "__main__":
+    import sys
+    _args = sys.argv[1:]
+    if _args and _args[0] == "tool-event":
+        sys.exit(_cli_tool_event(_args[1:]))
+    sys.exit(0)

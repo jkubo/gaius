@@ -71,6 +71,51 @@ Use gaius_fact_add to record new facts discovered during this session.
 """)
 
 
+# ── Tool-call telemetry (source='mcp') ───────────────────────────────────────
+# MCP tool calls never pass through the settings.json PreToolUse hooks that
+# feed gaius-observe, so this decorator is the only per-call capture surface
+# for these tools. Same event shape as the hook path: one tool_events row in
+# ~/.gaius/telemetry.db with args_sha256 + args_redacted (redaction happens in
+# gaius.telemetry before storage). Best-effort — telemetry failure must never
+# fail an MCP tool call.
+
+import functools  # noqa: E402
+
+_plain_tool = mcp.tool
+
+
+def _observed_tool(*t_args, **t_kwargs):
+    """Drop-in replacement for FastMCP.tool() that logs each call to telemetry."""
+    register = _plain_tool(*t_args, **t_kwargs)
+
+    def _register(fn):
+        @functools.wraps(fn)
+        def wrapped(*args, **kwargs):
+            try:
+                from gaius import telemetry as _telemetry
+                tool_input = dict(kwargs)
+                if args:
+                    tool_input["_args"] = list(args)
+                _telemetry.log_tool_event(
+                    session_id=(os.getenv("GAIUS_SESSION_UUID")
+                                or os.getenv("CLAUDE_SESSION_ID") or "mcp"),
+                    tool_name=fn.__name__,
+                    tool_input=tool_input,
+                    source="mcp",
+                    event="pre",
+                )
+            except Exception:
+                pass  # telemetry must never break an MCP tool call
+            return fn(*args, **kwargs)
+
+        return register(wrapped)
+
+    return _register
+
+
+mcp.tool = _observed_tool
+
+
 @mcp.tool()
 def gaius_search(query: str, domain: str = "", limit: int = 10) -> str:
     """Search facts.db using hybrid keyword + semantic scoring.

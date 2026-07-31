@@ -1,7 +1,7 @@
 {
   "name": "gaius",
   "description": "Self-hosted memory for AI coding agents. Extracts facts from your past Claude Code / Gemini CLI / Codex sessions, ranks them, and injects only the relevant ones into new sessions. Hybrid BM25 + vector search over a local SQLite corpus, MCP tools for mid-session recall, fully offline.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": {
     "name": "Jay Kubo",
     "url": "https://github.com/jkubo"

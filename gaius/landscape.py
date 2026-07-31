@@ -30,7 +30,7 @@ from gaius._core import (
     extract_quoted_phrases, quoted_phrase_boost, infra_entity_boost, decay_factor,
     SECTION_HEADERS, _EMBED_DIM, BOOTSTRAP_THRESHOLD, INJECT_MIN_PRIORITY,
     CROSS_AGENT_MULTIPLIER, HAS_SQLITE_VEC, SOP_DIR, MEMORY_DIR, DOMAIN_DIR,
-    REVIEW_STATE_WEIGHT,
+    REVIEW_STATE_WEIGHT, display_uid,
 )
 
 
@@ -947,7 +947,7 @@ def cmd_inject(args):
         print()
 
     for se in injected:
-        uuid = se["entry"].get("uuid", "?")[:8]
+        uuid = display_uid(se["entry"].get("uuid"))
         ts = se["entry"].get("timestamp", "")[:10]
         prov = se["entry"].get("provenance", "?")
         print(f"---\n<!-- {uuid} | {ts} | score={se['score']:.3f} | priority={se['priority']:.4f} | src={prov} -->")

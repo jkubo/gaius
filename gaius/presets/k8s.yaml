@@ -4,8 +4,9 @@
 # Copy relevant sections into ~/.gaius/config.yaml and customize.
 #
 # Usage:
-#   cp presets/k8s.yaml ~/.gaius/config.yaml
+#   gaius init --backend k8s --yes   # writes this packaged preset to ~/.gaius/config.yaml
 #   # then edit for your cluster
+#   # (manual alternative: copy gaius/presets/k8s.yaml from a checkout)
 
 operator:
   name: operator          # your name/handle (shown in stats output)

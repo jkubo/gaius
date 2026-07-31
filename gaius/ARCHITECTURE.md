@@ -17,11 +17,14 @@ when extracting more.
 | `mcp_server.py` | MCP server exposing gaius over the Model Context Protocol. | Imports from `gaius._core`. |
 | `raft.py` | Blog-post → RAFT training-sidecar YAML. Owns `_parse_frontmatter` and the failure-class / domain keyword maps. | `cmd_raft`. |
 | `maturity.py` | Fact-maturity / training-readiness scoring + `maturity`/`readiness`/`snapshot`/`governor`/`route`. Owns the scoring weight tables (`PROVENANCE_WEIGHT`, `OUTCOME_MODIFIER`, …). | `cmd_decay`/`cmd_rescore` stay in `_core` but consume these tables via the re-export. |
-| `sync.py` | Council-log + recurring-alerts sync into domain files. | `cmd_sync_council`, `cmd_sync_alerts`. |
 | `outcomes.py` | Orchestrator task-outcome ingestion (`task_outcomes` table, win-rates). | `cmd_ingest_outcomes`. |
 | `corpus_audit.py` | Read-only corpus integrity (repetition/prune, self-poison audit) + `route_suggest`. | `cmd_corpus_audit`, `cmd_route_suggest`. |
 | `reconcile.py` | Source-of-truth reconciler: registry, dev↔mirror fingerprint divergence, remote HEAD divergence, curated-fact promotion. | `cmd_reconcile`. `_remote_head` lives here — monkeypatch `gaius.reconcile._remote_head`, not `_core`. |
 | `landscape.py` | The Landscape Protocol + context-injection engine: live-state probes with TTL cache (`_run_landscape`, `cmd_landscape`) and `cmd_inject` (BM25 + semantic + decay ranking within a token budget). | Reads no runtime globals; the retire/index family it sat next to stays in `_core`. |
+| `concord.py` | Local, offline-first cross-session coordination: advisory claims (TTL + holder-pid liveness), findings with an adversarial review loop (open → reviewing → confirmed/refuted), claimable task pool, live roster — sidecar SQLite at `~/.gaius/concord.db`. | `cmd_concord`. Advisory by design: surfaced by hooks, never auto-enforced. |
+| `degradation.py` | Intra-session degradation detection over Claude Code transcripts: raw `turn_fuel` + `degradation_events` tables in `~/.gaius/telemetry.db`; the report joins them into an event rate per fuel band. | `cmd_degradation`. Bands are derived at read, never stored. |
+| `recentstate.py` | `gaius recent-roll` — evicts aged, done, pointered `## Recent State` bullets from the always-injected MEMORY.md into a non-injected archive changelog. | `cmd_recent_roll`. Conservative: warning-marked or pointer-less bullets are never evicted. |
+
 
 ## The facade convention (read before extracting a new module)
 
@@ -44,7 +47,7 @@ The goal: move code out of `_core.py` **without changing a single importer**. Ev
    `from gaius._core import …` resolves.
 
 3. **Re-export every moved symbol that is either** (a) in the public contract
-   (imported by `__init__.py`, `http_adapter.py`, `mcp_server.py`, or any test),
+   (imported by `__init__.py`, `mcp_server.py`, or any test),
    **or** (b) referenced by the `COMMANDS` dict (all `cmd_*`), **or** (c) read by
    any function that stays in `_core`. Miss one and you get an import-time
    `NameError` when `COMMANDS` is built.

@@ -34,7 +34,7 @@ if command -v gaius >/dev/null 2>&1; then
 elif [[ -x "$HOME/.local/bin/gaius" ]]; then
     GAIUS=("$HOME/.local/bin/gaius")
 elif command -v uvx >/dev/null 2>&1; then
-    GAIUS=(uvx --from "gaius-memory @ git+https://github.com/jkubo/gaius" gaius)
+    GAIUS=(uvx --from "gaius-memory @ git+https://github.com/jkubo/gaius@v0.1.1" gaius)
 else
     exit 0
 fi

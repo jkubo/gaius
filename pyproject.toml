@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gaius-memory"
-version = "0.1.0"
+version = "0.1.1"
 description = "Ops memory lifecycle manager for AI coding agents"
 readme = "README.md"
 license = "Apache-2.0"
@@ -31,7 +31,7 @@ semantic = [
     "sqlite-vec>=0.1",
 ]
 mcp = [
-    "mcp>=1.0",
+    "mcp>=1.28.1,<2",
 ]
 all = [
     "gaius-memory[semantic,mcp]",

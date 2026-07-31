@@ -43,6 +43,7 @@ gaius concord release subsystem:db # or --all
 (a specific machine), `svc:<name>` (a service/namespace), `incident:IC` (incident
 commander — first session to claim it runs coordination).
 
+
 ### 2. Findings — shared discoveries with adversarial review
 
 ```bash

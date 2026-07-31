@@ -300,11 +300,20 @@ class TestFailureClassMap:
         cfg_file.write_text(yaml.dump(cfg))
         old_env = os.environ.get("GAIUS_CONFIG")
         os.environ["GAIUS_CONFIG"] = str(cfg_file)
+        _mods = ("gaius._core", "gaius.raft", "gaius")
+        # Snapshot the ORIGINAL module objects. Leaving them merely popped made a
+        # later `from gaius import _core` build a SECOND _core, while modules that
+        # had already bound names out of the first (http_adapter's `init_db`) kept
+        # reading the first one's globals — so patching DB_PATH on the new module
+        # left init_db pointed at the live ~/.gaius/facts.db and tripped the
+        # pytest guard. Order-dependent: test_http_marathon passed alone, failed
+        # in-suite. Restore, don't just clear.
+        _saved = {m: _sys.modules.get(m) for m in _mods}
         try:
             # Reimport to pick up new config env. _FAILURE_CLASS_MAP is built at
             # import time in gaius.raft (split 2026-07-01) from _gaius_cfg, so the
             # raft submodule must also be cleared or its cached (old-config) map is reused.
-            for _m in ("gaius._core", "gaius.raft", "gaius"):
+            for _m in _mods:
                 _sys.modules.pop(_m, None)
             from gaius._core import _FAILURE_CLASS_MAP as fcm
             assert "mytunnel" in fcm["networking"]
@@ -315,8 +324,10 @@ class TestFailureClassMap:
                 os.environ.pop("GAIUS_CONFIG", None)
             else:
                 os.environ["GAIUS_CONFIG"] = old_env
-            for _m in ("gaius._core", "gaius.raft", "gaius"):
+            for _m in _mods:
                 _sys.modules.pop(_m, None)
+                if _saved[_m] is not None:
+                    _sys.modules[_m] = _saved[_m]
 
 
 class TestDomainMap:
@@ -566,6 +577,102 @@ class TestGaiusInit:
 
         assert "Aborted" in buf.getvalue()
 
+    def test_init_backend_yes_completes_without_prompts(self, tmp_path, monkeypatch):
+        """`gaius init --backend <name> --yes` must finish with ZERO input() calls."""
+        from gaius import _core
+
+        if not (_PRESETS / "default.yaml").exists():
+            pytest.skip("presets/default.yaml not found — run from repo root")
+
+        def forbidden_input(_prompt=""):
+            raise AssertionError("input() must not be called with --backend/--yes")
+        monkeypatch.setattr("builtins.input", forbidden_input)
+
+        with patch("gaius._core.Path.home", return_value=tmp_path):
+            _core.cmd_init(["--backend", "claude", "--yes"])
+
+        written_config = tmp_path / ".gaius" / "config.yaml"
+        assert written_config.exists(), "config.yaml should be written"
+        content = written_config.read_text()
+        assert "backend: claude" in content
+        assert "sessions_dir:" in content
+
+    def test_init_eof_exits_nonzero_with_hint(self, tmp_path, monkeypatch, capsys):
+        """Closed stdin (EOFError) must exit nonzero with a one-line hint, not a traceback."""
+        from gaius import _core
+
+        def eof_input(_prompt=""):
+            raise EOFError
+        monkeypatch.setattr("builtins.input", eof_input)
+
+        with patch("gaius._core.Path.home", return_value=tmp_path):
+            with pytest.raises(SystemExit) as exc:
+                _core.cmd_init([])
+
+        assert exc.value.code not in (0, None)
+        assert "--backend" in capsys.readouterr().out  # points at the non-interactive path
+
+    def test_init_stdin_devnull_subprocess_no_traceback(self, tmp_path):
+        """End-to-end: `gaius init < /dev/null` exits nonzero WITHOUT a traceback."""
+        import subprocess
+        env = dict(os.environ, HOME=str(tmp_path), GAIUS_CONFIG="/dev/null",
+                   PYTHONPATH=str(_REPO))
+        # A real user run has no pytest markers; inheriting this trips the
+        # init_db() test-isolation guard before cmd_init even dispatches.
+        env.pop("PYTEST_CURRENT_TEST", None)
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; from gaius._core import main; sys.argv = ['gaius', 'init']; main()"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            env=env, cwd=str(_REPO), timeout=120)
+        assert result.returncode != 0
+        assert "Traceback" not in result.stderr
+        assert "Traceback" not in result.stdout
+        assert "--backend" in result.stdout + result.stderr
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# gaius inject — default budget
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestInjectDefaultBudget:
+    """`gaius inject --task ...` must work without an explicit --budget.
+
+    cmd_inject in _core is a thin wrapper that prepends the standard default
+    budget before delegating; these tests capture the delegated argv instead of
+    running a real injection (which would need a live corpus).
+    """
+
+    def _capture(self, monkeypatch):
+        from gaius import _core
+        captured = {}
+        monkeypatch.setattr(_core, "_landscape_cmd_inject",
+                            lambda argv: captured.setdefault("argv", list(argv)))
+        return _core, captured
+
+    def test_task_without_budget_gets_default(self, monkeypatch):
+        _core, captured = self._capture(monkeypatch)
+        _core.cmd_inject(["--task", "test"])
+        argv = captured["argv"]
+        assert "--budget" in argv
+        assert argv[argv.index("--budget") + 1] == str(_core.DEFAULT_INJECT_BUDGET)
+        assert argv[-2:] == ["--task", "test"]  # original args preserved
+
+    def test_explicit_budget_passed_through_unchanged(self, monkeypatch):
+        _core, captured = self._capture(monkeypatch)
+        _core.cmd_inject(["--task", "test", "--budget", "500"])
+        assert captured["argv"] == ["--task", "test", "--budget", "500"]
+
+    def test_equals_form_budget_passed_through_unchanged(self, monkeypatch):
+        _core, captured = self._capture(monkeypatch)
+        _core.cmd_inject(["--budget=750", "--task", "test"])
+        assert captured["argv"] == ["--budget=750", "--task", "test"]
+
+    def test_default_budget_is_documented_standard(self):
+        """2000 = the hooks' session-start default and the README per-session budget."""
+        from gaius._core import DEFAULT_INJECT_BUDGET
+        assert DEFAULT_INJECT_BUDGET == 2000
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Presets
@@ -658,6 +765,57 @@ class TestCmdDoneDisambiguation:
         _core.cmd_done(["cd34"])
         assert "Marked reviewed" in capsys.readouterr().out
         assert _core.load_staged()["cd34eeee-3333"]["reviewed"] is True
+
+
+class TestDisplayUid:
+    """The id `gaius batch`/`show`/`next` print must be one you can pass to `done`.
+
+    Mined summaries get a synthetic `mined-<session-uuid>` uuid, so the old bare
+    `uuid[:8]` spent six chars on the tag and showed TWO of session id — 246
+    ambiguous labels across 3167 live staged entries. `done` then hard-errors on
+    exactly the entries `batch` just listed, with nothing else printed to build a
+    longer prefix from.
+    """
+
+    def test_mined_label_keeps_eight_session_chars(self):
+        from gaius._core import display_uid
+        assert display_uid("mined-f2eaf5ab-214b-41bf-9f0c-971e54a24082") == "mined-f2eaf5ab"
+
+    def test_mined_extra_tag_handled(self):
+        from gaius._core import display_uid
+        assert display_uid("mined-extra-9f2f2369-1d14-4c15") == "mined-extra-9f2f2369"
+
+    def test_plain_uuid_unchanged(self):
+        from gaius._core import display_uid
+        assert display_uid("7596e1e3-58e0-46a3-a9df-777e589b83f4") == "7596e1e3"
+
+    def test_missing_uuid_does_not_raise(self):
+        from gaius._core import display_uid
+        assert display_uid(None) == "?"
+
+    def test_disambiguates_sessions_the_old_label_collided(self):
+        """Canary: the two live 2026-07-30/31 mined summaries that collided."""
+        from gaius._core import display_uid
+        a = "mined-f2eaf5ab-214b-41bf-9f0c-971e54a24082"
+        b = "mined-f2dad324-89b8-45cc-939d-8e5237b90220"
+        assert a[:8] == b[:8]                        # the defect
+        assert display_uid(a) != display_uid(b)      # the fix
+
+    def test_batch_prints_a_label_done_can_resolve(self, tmp_path, monkeypatch, capsys):
+        """End-to-end: the label batch prints must round-trip through `done`."""
+        from gaius import _core
+        monkeypatch.setattr(_core, "STAGING_DIR", tmp_path)
+        for uid, ts in (("mined-f2eaf5ab-214b-41bf", "2026-07-30T13:11:11"),
+                        ("mined-f2dad324-89b8-45cc", "2026-07-31T02:51:57")):
+            _core.save_staged({"uuid": uid, "timestamp": ts, "reviewed": False,
+                               "sections": {"key_concepts": "x"}})
+        _core.cmd_batch([])
+        out = capsys.readouterr().out
+        assert "mined-f2eaf5ab" in out and "mined-f2dad324" in out
+        _core.cmd_done(["mined-f2eaf5ab"])
+        staged = _core.load_staged()
+        assert staged["mined-f2eaf5ab-214b-41bf"]["reviewed"] is True
+        assert staged["mined-f2dad324-89b8-45cc"]["reviewed"] is False
 
 
 class TestDriftLive:

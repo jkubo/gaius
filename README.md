@@ -14,7 +14,7 @@ Not another RAG chatbot memory — a production-grade system that extracts facts
 > - **Fully offline** — BM25 + sqlite-vec in one SQLite file. No API keys, no cloud.
 
 ```bash
-# CLI (offline core). Extras: [semantic], [mcp], [http]
+# CLI (offline core). Extras: [semantic], [mcp]
 pip install gaius-memory
 
 # Or with uv / Claude Code MCP (see .mcp.json):
@@ -24,10 +24,16 @@ pip install gaius-memory
 # pip install "gaius-memory @ git+https://github.com/jkubo/gaius"
 ```
 
+> ⚠️ **Install name is `gaius-memory`, not bare `gaius`.** PyPI already has an unrelated
+> package named [`gaius`](https://pypi.org/project/gaius/) (ImmobilienScout24 deploy client
+> v145+). That package owns neither our import path nor our CLI forever, but
+> `pip install gaius` will **not** install this project. Always:
+> `pip install gaius-memory` → import `gaius`, console script `gaius`.
+
 ```
 gaius retire      # scan sessions → stage summaries
 gaius batch       # (optional) review + correct — facts inject by default
-gaius inject      # inject context into active session
+gaius inject --task "what you're working on"   # inject context into active session
 ```
 
 ---
@@ -159,12 +165,13 @@ your corpus.
 ### Initialize
 
 ```bash
-# Create config dir
-mkdir -p ~/.gaius
+# Interactive setup — locates the packaged presets (gaius/presets/) and writes
+# ~/.gaius/config.yaml. Works for pip installs; no repo checkout needed.
+gaius init
 
-# Copy example config
-cp presets/k8s.yaml ~/.gaius/config.yaml   # for K8s clusters
-# or: cp presets/default.yaml ~/.gaius/config.yaml
+# Non-interactive form:
+gaius init --backend k8s --yes       # for K8s clusters
+# or: gaius init --backend default --yes
 
 # Edit to set your sessions_dir and domain_dir
 $EDITOR ~/.gaius/config.yaml
@@ -257,12 +264,11 @@ gaius/
 │   ├── record.py         # session recorder (OpenAI-compatible endpoints)
 │   ├── telemetry.py      # prompt / injection event logging
 │   ├── mcp_server.py     # MCP server (7 tools)
+│   ├── presets/
+│   │   ├── k8s.yaml      # Entity patterns for Kubernetes clusters
+│   │   └── default.yaml  # Minimal defaults for any project
 │   ├── __init__.py       # Public API surface
 │   └── __main__.py       # python -m gaius
-├── http_adapter.py       # FastAPI REST adapter (optional, for remote access)
-├── presets/
-│   ├── k8s.yaml          # Entity patterns for Kubernetes clusters
-│   └── default.yaml      # Minimal defaults for any project
 ├── benchmarks/
 │   ├── bench_inject.py        # injection regression check (bundled demo corpus)
 │   ├── bench_longmemeval.py   # LongMemEval-S external retrieval eval (--matrix)
@@ -305,7 +311,7 @@ entities:
     namespace: '\b(?:prod|staging|dev)\b'
 ```
 
-See `presets/k8s.yaml` for a full annotated example.
+See `gaius/presets/k8s.yaml` for a full annotated example (installed with the package; `gaius init` copies it for you).
 
 ---
 
@@ -346,6 +352,20 @@ See `presets/k8s.yaml` for a full annotated example.
 
 ---
 
+## Documentation
+
+| Doc | Covers |
+|-----|--------|
+| [docs/getting-started.md](docs/getting-started.md) | Install → init → first retire/inject walkthrough |
+| [docs/hard-gates.md](docs/hard-gates.md) | Hard enforcement gates — the `exit:2` action blocks |
+| [docs/inject.md](docs/inject.md) | Injection ranking, token budgets, session priming |
+| [docs/review-lifecycle.md](docs/review-lifecycle.md) | Fact review + correction loop (confirm / reject / defer, decay) |
+| [docs/kg.md](docs/kg.md) | Temporal knowledge graph — entities, triples, timelines |
+| [docs/concord.md](docs/concord.md) | Cross-session coordination — claims, findings, task pool, hook wiring |
+| [docs/session-jsonl-schema.md](docs/session-jsonl-schema.md) | Session JSONL format reference for parser authors |
+
+---
+
 ## Dependencies
 
 **Core** (no extras): `pyyaml>=6.0` — pure Python, no binary deps.
@@ -356,9 +376,6 @@ See `presets/k8s.yaml` for a full annotated example.
 
 **MCP server** (`pip install "gaius-memory[mcp] @ git+https://github.com/jkubo/gaius"`):
 - `mcp[server]>=1.0`
-
-**HTTP adapter** (`pip install "gaius-memory[http] @ git+https://github.com/jkubo/gaius"`):
-- `fastapi>=0.100`, `uvicorn[standard]>=0.23`
 
 Without `[semantic]`, gaius falls back to keyword-only BM25 search (no embeddings required).
 

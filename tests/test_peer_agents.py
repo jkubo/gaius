@@ -161,7 +161,7 @@ class TestGrokParser:
         rows = [
             {"type": "user", "content": [{"type": "text", "text": "check threats"}]},
             {"type": "assistant",
-             "content": "I'll pull current threat intel from your MALINT stack.",
+             "content": "I'll pull current threat intel from your malware-analysis stack.",
              "tool_calls": [{"id": "call_1"}]},
         ]
         sess = self._session(tmp_path, rows)

@@ -343,11 +343,11 @@ def _registry_live(j):
 
 
 def _live_sessions(harness=None):
-    """Live sessions from the multi-harness registry (shared by roster + baton/marathon).
+    """Live sessions from the multi-harness registry (shared by roster + the baton watcher).
 
     harness: None (all), "claude", or "grok". Returns registry rows where pid is
     not *provably* dead — same rule as roster/status/brief. Hooks that still only
-    understand one harness's transcript layout (baton/marathon → Claude) pass
+    understand one harness's transcript layout (the baton spawns Claude) pass
     harness="claude" rather than re-implementing ~/.claude/sessions/*.json.
     """
     out = []
@@ -979,8 +979,9 @@ def _concord_brief(ns):
             # before 2026-07-27: the full roster renders only at --scope session-start, and
             # this delta carried findings + steals but never new peer claims. Net effect —
             # a sibling claims subsystem:X while I am mid-task on X and I am never told.
-            # (Observed 2026-07-27: a /mythos session audited subsystem:mythos-audit-ansible
-            # for ~1h while a peer held the claim; nothing surfaced until the operator asked.)
+            # (Observed live: two sessions worked the same subsystem lane for about an
+            # hour, one of them holding the claim, and neither was told until the
+            # operator noticed.)
             # Keyed on first_claimed_at, NOT created_at, so sliding-TTL claim renewals
             # do not re-announce a lane every cycle.
             claimed_raw = conn.execute(

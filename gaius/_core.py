@@ -517,13 +517,11 @@ _DOMAIN_KEYWORDS_DEFAULT = {
                       "node-exporter", "grafana", "prometheus", "loki"],
     "gitops":        ["flux", "helmrelease", "kustomization", "gitops", "reconcile", "deploy"],
     "quality":       ["test", "lint", "ci", "pipeline", "review", "coverage"],
-    "finint":        ["polymarket", "trading", "executor", "portfolio", "equity", "philosopher",
-                      "kelly", "odds", "autotrade", "alpaca", "schwab", "ibkr", "finint",
-                      "updown", "maker", "taker", "adverse selection", "fill rate"],
-    "malint":        ["malware", "detonate", "sandbox", "vigiles", "yara", "tetragon",
-                      "tracingpolicy", "sigkill", "ebpf", "bpf_lsm", "malint", "assay",
-                      "bazaar", "mwdb", "triage", "corpus", "verdict", "sample"],
 }
+# Domains named after a deployment's own products are not shipped defaults —
+# they are exactly what `domain_keywords` in ~/.gaius/config.yaml is for, and
+# baking them in both mis-classifies everyone else's sessions and publishes an
+# internal product roster.
 DOMAIN_KEYWORDS: dict = {
     **_DOMAIN_KEYWORDS_DEFAULT,
     **_gaius_cfg.get("domain_keywords", {}),
@@ -553,8 +551,8 @@ def load_staged() -> dict:
 
 
 # Operational state transitions only exist in session history — dismissing
-# them at review as "derivable from code" is the failure mode that rotted the
-# JDT project files twice (2026-05-18, 05-20). Keyword list is the agreed spec
+# them at review as "derivable from code" is the failure mode that rotted one
+# project's files twice in three days. Keyword list is the agreed spec
 # from project_gaius_promotion_gap.md; false positives just surface earlier.
 _STATE_CHANGE_RE = re.compile(
     r'\b(deleted|decommissioned|migrated|completed|shipped|torn down|removed|'
@@ -6338,11 +6336,15 @@ def _drift_live(parsed):
         cfg_council = _gaius_cfg.get("council", {})
         base_url = cfg_council.get("base_url", "").rstrip("/")
         api_key = cfg_council.get("api_key", "")
+        # Poster identity is deployment-specific: config it, never bake one in.
+        # A hardcoded default both mis-attributes every other deployment's posts
+        # and ships the author's internal agent roster in the source.
+        poster = cfg_council.get("agent", "gaius")
         if base_url and api_key:
             items = [f"{cid}: {fil} asserts {a!r} but live is {l!r}"
                      for cid, fil, _, a, l, _ in stale]
             payload = json.dumps({
-                "type": "alert", "channel": "alerts", "agents": ["ops-watchdog"],
+                "type": "alert", "channel": "alerts", "agents": [poster],
                 "content": {
                     "title": "gaius live-claim drift (memory vs cluster)",
                     "stale_count": len(stale), "items": items,
@@ -6571,6 +6573,7 @@ def cmd_drift(args):
         cfg_council = _gaius_cfg.get("council", {})
         base_url = cfg_council.get("base_url", "").rstrip("/")
         api_key = cfg_council.get("api_key", "")
+        poster = cfg_council.get("agent", "gaius")  # see the note on the other post site
         if base_url and api_key:
             drift_items = [
                 f"{r['key']}: expected {r.get('expected')} — "
@@ -6583,7 +6586,7 @@ def cmd_drift(args):
             payload = json.dumps({
                 "type": "alert",
                 "channel": "alerts",
-                "agents": ["ops-watchdog"],
+                "agents": [poster],
                 "content": {
                     "title": "gaius drift detected",
                     "drift_count": drift_count,

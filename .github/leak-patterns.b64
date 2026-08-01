@@ -8,11 +8,16 @@
 # the maintainer-side scan in the Makefile, which is publish-excluded and never
 # ships; this copy exists so the public CI gate keeps the same coverage.
 #
-#   core     : shared by the repo scan (test.yml) and the maintainer publish scan
-#   artifact : extra terms scanned only in built sdist/wheel artifacts (publish.yml)
+#   core        : shared by the repo scan (test.yml) and the maintainer publish scan
+#   artifact    : extra terms scanned only in built sdist/wheel artifacts (publish.yml)
+#   identifiers : internal agent/seat names, pipe-separated (not a regex). Used by
+#                 the unit-test guards that assert no internal name reached a
+#                 shipped default -- those tests ship, so spelling the roster in
+#                 them made the guard the disclosure.
 #
 # Decode:  sed -n 's/^core=//p' .github/leak-patterns.b64 | base64 -d
 # Consumers MUST fail closed on a missing file or an empty decode -- an empty
 # ERE matches every line, which reads as "everything is a hit", not "clean".
 core=a3ViMFwuKG5ldHxpbyl8azhzLShhdXN8aG5kfGxheHx0b2EpLXwxMFwuKDI1MHw0Mnw0MylcLnwxMDBcLig2NHw2NylcLnwvaG9tZS9bYS16XSsvfCh+fFwkSE9NRSkvKGFuc2libGV8XC5zc2gpfFByb2plY3RzLyhhZ2VudC1tZW1vcnl8QnJhaW4pfGt1YjAtYWk=
 artifact=c3luYy1jb3VuY2ls
+identifiers=Y2xhdWRldXN8Z2VtaW5pdXN8b3JyYW1hdXN8Z3Jva3VzfHF3ZW51c3xqdWxlaXN8cHJhZWZlY3R1c3xwcmFldG9yfHByaW5jZXBzfHZpZ2lsZXN8aGVybWVzfG9wcy13YXRjaGRvZw==

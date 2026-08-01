@@ -118,7 +118,7 @@ def _run_landscape(domain: str) -> str | None:
 def cmd_landscape(args):
     """Hydrate live state for a domain and print the landscape block."""
     parser = argparse.ArgumentParser(prog="gaius landscape")
-    parser.add_argument("domain", nargs="?", default=None, help="Domain name (e.g. finint, networking)")
+    parser.add_argument("domain", nargs="?", default=None, help="Domain name (e.g. security, networking)")
     parser.add_argument("--invalidate", action="store_true", help="Force re-run even if cache is fresh")
     parsed = parser.parse_args(args)
 
@@ -620,10 +620,7 @@ def cmd_inject(args):
         # Map skill keywords to domains for boosting
         _SKILL_DOMAIN_MAP = {
             "ops": {"operational", "general"},
-            "quant": {"finint", "operational"},
-            "finint": {"finint"},
             "malware": {"security"},
-            "malint": {"malint", "security"},
             "audit": {"security"},
             "gaius": {"general", "operational"},
             "maint": {"general", "operational"},
@@ -633,8 +630,9 @@ def cmd_inject(args):
             "cctv": {"cctv", "operational"},
             "adsb": {"adsb", "operational"},
             "console": {"services", "frontend"},
-            "jdt": {"services"},
         }
+        # Deployment-specific skill and domain names belong to whoever runs the
+        # tool, not to the tool: they stay out of the shipped default map.
         _task_lower = parsed.task.lower()
         for skill_kw, domains in _SKILL_DOMAIN_MAP.items():
             if skill_kw in _task_lower:

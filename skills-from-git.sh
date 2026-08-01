@@ -98,7 +98,7 @@ cat <<'EOF'
 name: <short name>
 description: <one-liner>
 type: feedback
-domain: <networking|storage|etcd|security|finint|development|cluster-ops|council>
+domain: <networking|storage|etcd|security|development|cluster-ops|general>
 trigger: "when doing X"
 confidence: 0.8
 gate: soft  # or hard if painful lesson

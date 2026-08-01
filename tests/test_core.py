@@ -7,9 +7,11 @@ Run:
     pytest tests/ -v
     pytest tests/ -v --tb=short   # compact tracebacks
 """
+import base64
 import io
 import json
 import os
+import re
 import sys
 import sqlite3
 import tempfile
@@ -31,6 +33,42 @@ sys.path.insert(0, str(_REPO))
 _PRESETS = _REPO / "gaius" / "presets"
 if not _PRESETS.is_dir():
     _PRESETS = _REPO / "presets"
+
+# ── Internal-identifier guards ───────────────────────────────────────────────
+# Several tests below assert that no internal agent/deployment name reached a
+# shipped default. The roster they check against is deliberately NOT written
+# here: this file is published, and spelling the names inline made the guard
+# itself the disclosure -- the same defect that put the CI leak denylist in the
+# open. It lives base64-encoded in .github/leak-patterns.b64 under
+# `identifiers`. That is obfuscation, not secrecy; it just stops the file
+# answering a code search.
+#
+# Both loaders FAIL or SKIP, never return empty: an empty roster intersects
+# nothing and an empty pattern matches nothing, so either would read as a green
+# guard while checking exactly zero things.
+_PATFILE = _REPO / ".github" / "leak-patterns.b64"
+
+
+def _b64_key(key: str) -> str:
+    if not _PATFILE.is_file():
+        pytest.skip(f"{_PATFILE.name} absent (installed tree) -- guard needs the repo checkout")
+    for line in _PATFILE.read_text().splitlines():
+        if line.startswith(f"{key}="):
+            val = base64.b64decode(line.split("=", 1)[1]).decode().strip()
+            if not val:
+                pytest.fail(f"'{key}' decoded empty -- not the same as a clean guard")
+            return val
+    pytest.fail(f"no '{key}' key in {_PATFILE.name} -- guard has nothing to check against")
+
+
+def _internal_identifiers() -> set:
+    """Internal agent/seat names that must never appear in a shipped default."""
+    return {n for n in _b64_key("identifiers").split("|") if n}
+
+
+def _leak_pattern():
+    """The same hard-scan denylist the CI gate and the publish scan use."""
+    return re.compile(_b64_key("core"))
 
 from gaius._core import (
     _load_gaius_config,
@@ -162,9 +200,9 @@ class TestSessionThresholds:
         t = get_session_threshold("cluster", "mystery-agent-xyz")
         assert t == DEFAULT_THRESHOLD
 
-    def test_no_kub0_specific_defaults(self):
+    def test_no_deployment_specific_defaults(self):
         """Built-in thresholds must not contain internal project agent names."""
-        internal = {"geminius", "vigiles", "orramaus", "claudeus", "juleis"}
+        internal = _internal_identifiers()
         assert not internal.intersection(set(AGENT_THRESHOLDS.keys()))
 
 
@@ -205,13 +243,13 @@ class TestEntityPatternLoading:
         assert "custom" in patterns     # added by user
 
     def test_no_internal_names_in_builtin_service_pattern(self):
-        """vllm-[w]+ and similar kub0-specific deployment names must not be in defaults."""
+        """vllm-[w]+ and similar deployment-specific names must not be in defaults."""
         patterns = _load_entity_patterns()
         if "service" in patterns:
             svc_pattern = patterns["service"].pattern
             assert "vllm" not in svc_pattern
-            assert "orramaus" not in svc_pattern
-            assert "vigiles" not in svc_pattern
+            for name in _internal_identifiers():
+                assert name not in svc_pattern
 
     def test_patterns_are_compiled_regexes(self):
         import re
@@ -229,9 +267,9 @@ class TestFormatByAgent:
         assert _DEFAULT_FORMAT_BY_AGENT.get("pentagi") == "pentagi"
 
     def test_no_internal_defaults(self):
-        """No kub0-specific agent names in shipped FORMAT_BY_AGENT."""
-        internal = {"geminius", "vigiles", "orramaus", "claudeus", "juleis",
-                    "geminius-agent", "vigiles-agent", "orramaus-agent"}
+        """No deployment-specific agent names in shipped FORMAT_BY_AGENT."""
+        internal = _internal_identifiers()
+        internal |= {f"{n}-agent" for n in internal}
         assert not internal.intersection(set(_DEFAULT_FORMAT_BY_AGENT.keys()))
 
     def test_unknown_agent_not_in_map(self):
@@ -257,13 +295,12 @@ class TestDomainKeywords:
             assert domain in DOMAIN_KEYWORDS
 
     def test_no_internal_domain_names(self):
-        internal = {"geminius", "vigiles", "orramaus", "claudeus", "google-stack"}
+        internal = _internal_identifiers() | {"google-stack"}
         assert not internal.intersection(set(DOMAIN_KEYWORDS.keys()))
 
     def test_ollama_domain_has_no_internal_keywords(self):
         if "ollama" in DOMAIN_KEYWORDS:
-            internal_kw = {"geminius", "orramaus", "vigiles", "claudeus"}
-            assert not internal_kw.intersection(set(DOMAIN_KEYWORDS["ollama"]))
+            assert not _internal_identifiers().intersection(set(DOMAIN_KEYWORDS["ollama"]))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config-driven maps (failure classes + blog domain tags)
@@ -700,16 +737,21 @@ class TestPresets:
         assert isinstance(doc, dict)
 
     def test_presets_have_no_hardcoded_internal_paths(self):
+        # Checked with the SAME denylist the CI gate and the publish scan use,
+        # rather than a hand-copied literal here. The old version spelled the
+        # internal domain inline and split the string to dodge the leak
+        # scanner -- a guard that documents its own evasion is worse than no
+        # guard, because it teaches the bypass to everyone reading it.
+        leak = _leak_pattern()
         for preset_name in ["k8s.yaml", "default.yaml"]:
             content = (_PRESETS / preset_name).read_text()
-            assert "/home/jkubo" not in content
-            assert "kub0" ".net" not in content  # split literal so this guard doesn't trip leak scanners
-            # the public product domain IS acceptable in examples -- only the internal one is not
+            assert not re.search(r"/home/\w+/", content), f"absolute home path in {preset_name}"
+            assert not leak.search(content), f"internal reference in {preset_name}"
 
     def test_k8s_preset_has_no_internal_agent_names(self):
         content = (_PRESETS / "k8s.yaml").read_text()
-        for name in ["geminius", "vigiles", "orramaus", "claudeus", "juleis"]:
-            assert name not in content, f"internal name '{name}' found in k8s.yaml"
+        for name in _internal_identifiers():
+            assert name not in content, f"internal name found in k8s.yaml"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

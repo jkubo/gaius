@@ -196,8 +196,8 @@ class TestIndexGlossAccretion:
     one whose links carry paragraph glosses must flag. (This is the failure the
     2000-char runaway check + total-byte budget both miss.)"""
 
-    TERSE = "- **JDT**: " + " | ".join(f"[f{i}](project/p{i}.md)" for i in range(22))
-    ACCRETED = ("- **JDT**: [master](project/p.md) — "
+    TERSE = "- **Widgets**: " + " | ".join(f"[f{i}](project/p{i}.md)" for i in range(22))
+    ACCRETED = ("- **Widgets**: [master](project/p.md) — "
                 + "verbose resolved status detail from a session note " * 12)
 
     def _doc(self, *index_lines, recent=None):

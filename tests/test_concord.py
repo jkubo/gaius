@@ -458,8 +458,8 @@ def test_handoff_without_spawn_flag_never_launches(tmp_path, monkeypatch):
 # ── prompt-delta: peer CLAIM acquisition (2026-07-27 gap) ───────────────────────────
 # Before this, the delta carried findings + steals but never a peer ACQUIRING a lane.
 # The full roster renders only at --scope session-start, so a claim created after a
-# session started was invisible to it forever. Observed live: a /mythos session audited
-# subsystem:mythos-audit-ansible for ~1h while a peer held the claim; nothing surfaced.
+# session started was invisible to it forever. Observed live: one session worked a
+# subsystem lane for ~1h while a peer held the claim; nothing surfaced.
 
 def test_peer_claim_surfaces_in_prompt_delta(tmp_path, capsys):
     """The load-bearing case: peer claims a lane AFTER my session started."""
@@ -468,10 +468,10 @@ def test_peer_claim_surfaces_in_prompt_delta(tmp_path, capsys):
     cc.init_concord(db).close()
     assert _brief(db, "prompt", "viewer", capsys) == ""  # cursor init
     conn = cc.init_concord(db)
-    cc._try_claim(conn, "subsystem:mythos-audit-ansible", "peer", os.getpid(), "ansible-6c", "", 3600)
+    cc._try_claim(conn, "subsystem:payments-audit", "peer", os.getpid(), "ansible-6c", "", 3600)
     conn.close()
     out = _brief(db, "prompt", "viewer", capsys)
-    assert "peer claimed subsystem:mythos-audit-ansible" in out
+    assert "peer claimed subsystem:payments-audit" in out
     assert "ansible-6c" in out
     assert _brief(db, "prompt", "viewer", capsys) == ""  # delivered exactly once
 
@@ -665,7 +665,7 @@ def test_registry_live_keeps_unknown_liveness():
 
 
 def test_live_sessions_filters_dead_and_harness(tmp_path, monkeypatch):
-    """DRY helper: live-only, optional harness filter (baton/marathon use harness=claude)."""
+    """DRY helper: live-only, optional harness filter (the baton uses harness=claude)."""
     import json
     import os
     claude_dir = tmp_path / "claude"

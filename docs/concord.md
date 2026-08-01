@@ -90,9 +90,9 @@ pid-ancestry match against `active_sessions` (tool shells often lack the env var
 else `shell-<ppid>`. Roster lines are tagged `[claude]` / `[grok]`.
 
 **Shared helper (do not re-copy the registry):** `gaius.concord._live_sessions(harness=None)`
-is the single reader used by roster/status/brief and by the baton/marathon watchers.
+is the single reader used by roster/status/brief and by the baton watcher.
 Pass `harness="claude"` (or `"grok"`) when a consumer only understands one harness's
-transcript layout — baton/marathon still spawn Claude successors today, so they filter
+transcript layout — the baton still spawns Claude successors today, so it filters
 to Claude rather than forking a second `~/.claude/sessions/*.json` scanner.
 
 ### 5. Baton pass — hand a saturated session to a fresh successor
@@ -172,9 +172,9 @@ a finding published the same second as a prompt cannot be skipped:
 > `--scope session-start`, so a claim acquired *after* a session started used to be invisible
 > to it for the session's entire life — the delta carried findings and steals but never a peer
 > acquiring a lane. That is the one event most likely to mean "you are about to duplicate
-> someone's work". It cost a real collision: a `/mythos` session audited
-> `subsystem:mythos-audit-ansible` for about an hour while a sibling held the claim, and
-> nothing surfaced until the operator asked. The delta keys on `claims.first_claimed_at`, not
+> someone's work". It cost a real collision: one session audited a subsystem for about
+> an hour while a sibling held the claim on it, and nothing surfaced until the operator
+> asked. The delta keys on `claims.first_claimed_at`, not
 > `created_at` — `created_at` is reset by every same-session re-claim, and
 > claim-renewal hooks re-touch `created_at` on a sliding TTL, so a `created_at`-keyed
 > delta would re-announce the same lane forever. Dead/expired holders are filtered so a ghost

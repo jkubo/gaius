@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gaius-memory"
-version = "0.1.1"
+version = "0.1.2"
 description = "Ops memory lifecycle manager for AI coding agents"
 readme = "README.md"
 license = "Apache-2.0"

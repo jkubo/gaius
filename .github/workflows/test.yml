@@ -67,14 +67,34 @@ jobs:
           # A green run here never meant "safe to push". Keep this pattern, the --include
           # set, and the leak-scan:allow handling in sync with that scan.
           #
-          # NOTE: describe additions in the abstract, never by quoting the literal string
-          # -- a comment naming what the pattern hunts makes this file self-match, which is
-          # why the pattern line below carries an allow marker.
+          # NOTE: describe additions in the abstract, never by quoting the literal
+          # string -- a comment naming what the pattern hunts makes this file
+          # self-match, and on a public repo that turns the gate into the leak.
+          #
+          # THE PATTERN IS NOT STORED HERE. It used to be, inline and self-exempted
+          # with an allow marker, which meant this file published the entire internal
+          # naming scheme the gate exists to keep out -- one code search on the repo
+          # returned the whole set. The terms now live base64-encoded in
+          # .github/leak-patterns.b64 (see the header in that file). That is
+          # OBFUSCATION, NOT SECRECY -- it is one command to decode -- but the file no
+          # longer *answers* a grep or a GitHub code search, and the authoritative
+          # denylist remains the maintainer-side publish scan, which never ships.
+          # Fail closed on a missing file or an empty decode: an empty ERE matches
+          # every line, which would read as "everything is a hit", not as "clean".
           #
           # Scan the whole checkout, not just gaius/: this repo IS the published tree, and
           # the configs most likely to carry an internal endpoint (*.json, *.yml) live at
           # the root. tests/ is deliberately INCLUDED -- fixtures ship.
-          INTERNAL='kub0\.(net|io)|k8s-(aus|hnd|lax|toa)-|10\.(250|42|43)\.|100\.(64|67)\.|/home/[a-z]+/|(~|\$HOME)/(ansible|\.ssh)|Projects/(agent-memory|Brain)|kub0-ai'  # leak-scan:allow -- this IS the pattern
+          PATFILE=.github/leak-patterns.b64
+          if [ ! -s "$PATFILE" ]; then
+            echo "FAIL: $PATFILE missing or empty — refusing to scan with no denylist"
+            exit 1
+          fi
+          INTERNAL=$(sed -n 's/^core=//p' "$PATFILE" | base64 -d)
+          if [ -z "$INTERNAL" ]; then
+            echo "FAIL: could not decode a core pattern from $PATFILE — not the same as clean"
+            exit 1
+          fi
           set +e
           out=$(grep -rInE "$INTERNAL" . \
                   --include='*.py' --include='*.md' --include='*.yaml' --include='*.yml' \
@@ -87,9 +107,12 @@ jobs:
             echo "FAIL: scan errored (rc=2) — could not read a path. Not the same as clean."
             exit 1
           fi
-          # A line may carry a `leak-scan:allow` marker (publish.yml holds the pattern
-          # itself, so it self-matches). Allowlisted lines are PRINTED, never silently
-          # dropped -- a marker slapped on a real leak must stay visible every run.
+          # A line may carry an allow marker (one shipped CLI default is a generic
+          # home-relative repo root and legitimately matches). Allowlisted lines are
+          # PRINTED, never silently dropped -- a marker slapped on a real leak must
+          # stay visible every run. Describe such exceptions in the abstract: naming
+          # the matching text here would make this comment self-match, which is the
+          # bug that put the whole denylist in a public file in the first place.
           allow=$(printf '%s\n' "$out" | grep -F 'leak-scan:allow' || true)
           hits=$(printf '%s\n' "$out" | grep -Fv 'leak-scan:allow' | grep -v '^$' || true)
           if [ -n "$allow" ]; then

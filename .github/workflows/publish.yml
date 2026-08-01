@@ -35,12 +35,12 @@ jobs:
           python -m pip install --upgrade build
           python -m build
       - name: Guard -- refuse to publish if internal refs leaked into artifacts
-        # Mirrors the Makefile's HARD leak scan: domains, cluster hostnames,
-        # private IPs, home paths, private repo roots, and the internal-only
-        # council-sync command. Keep the two patterns in sync -- this one is the
+        # Mirrors the maintainer-side HARD leak scan: it loads the SAME encoded
+        # denylist (.github/leak-patterns.b64, `core`) plus the artifact-only
+        # extras (`artifact`), so the two cannot drift apart -- this one is the
         # last gate before a PERMANENT PyPI artifact, so it must not be the weaker.
-        # Soft identifiers are accepted public vocabulary -- the drift webhook
-        # command is a real gaius feature.
+        # Soft identifiers are accepted public vocabulary and are deliberately not
+        # in this gate; they are surfaced for review at publish time instead.
         #
         # Scans BOTH artifacts. The sdist is built by setuptools' default file
         # discovery, which sweeps in tests/ even with no MANIFEST.in and
@@ -71,8 +71,25 @@ jobs:
             exit 1
           fi
           echo "scanning $n extracted file(s) from ${#sdists[@]} sdist(s) + ${#wheels[@]} wheel(s)"
+          # THE PATTERN IS NOT STORED HERE. Inline and self-exempted, it made this
+          # public file publish the internal naming scheme the gate exists to keep
+          # out. Terms are base64-encoded in .github/leak-patterns.b64 -- obfuscation,
+          # not secrecy, but a code search no longer answers with the list. Fail
+          # closed on missing/undecodable: an empty ERE matches every line.
+          PATFILE=.github/leak-patterns.b64
+          if [ ! -s "$PATFILE" ]; then
+            echo "::error::$PATFILE missing or empty -- refusing to publish with no denylist"
+            exit 1
+          fi
+          PAT_CORE=$(sed -n 's/^core=//p' "$PATFILE" | base64 -d)
+          PAT_EXTRA=$(sed -n 's/^artifact=//p' "$PATFILE" | base64 -d)
+          if [ -z "$PAT_CORE" ]; then
+            echo "::error::could not decode a core pattern from $PATFILE -- refusing to publish unscanned"
+            exit 1
+          fi
+          PAT="$PAT_CORE${PAT_EXTRA:+|$PAT_EXTRA}"
           set +e
-          out=$(grep -rIaEn 'kub0\.(net|io)|k8s-(aus|hnd|lax|toa)-|10\.(250|42|43)\.|100\.(64|67)\.|/home/[a-z]+/|(~|\$HOME)/(ansible|\.ssh)|Projects/(agent-memory|Brain)|kub0-ai|sync-council' "$work")  # leak-scan:allow -- this IS the pattern
+          out=$(grep -rIaEn "$PAT" "$work")
           rc=$?
           set -e
           if [ "$rc" -eq 2 ]; then

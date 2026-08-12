@@ -1,17 +1,23 @@
 """gaius recent-roll — evict aged, done, pointered ``## Recent State`` bullets from
 the always-injected MEMORY.md into a non-injected archive changelog.
 
-CONSERVATIVE by design. A bullet is evicted ONLY when ALL THREE hold:
+The gate is REDUNDANCY, not age. A bullet is evicted iff ALL of:
 
-  (1) its newest date-stamp is older than ``--max-age-days`` (measured relative
-      to the ``## Recent State (YYYY-MM-DD)`` section-header date, with the
-      Dec→Jan year boundary handled),
-  (2) it carries a done-marker (``✅`` or a whole-word
-      ``LIVE|FIXED|RESOLVED|MERGED|DONE|SHIPPED``), and
-  (3) it already ends in a pointer (``→ <file>`` or a ``[label](path)`` link) —
-      i.e. the content has a durable home elsewhere.
+  (1) it is not explicitly pinned with ``📌`` (``PIN_MARK``),
+  (2) it ends in a trailing pointer (``→ <file>`` or a ``[label](path)`` link), and
+  (3) that pointer's target PROVABLY contains the bullet's signature tokens.
 
-A bullet containing ``⚠️`` (U+26A0) is NEVER evicted (veto), even if 1-3 pass.
+🔴 **``⚠️`` is NOT a veto and has not been one since 2026-07-28 (mnemos #123).** It was
+retired precisely because it is ambient on nearly every Recent-State bullet, which made
+the roll inert. The ONLY veto is ``📌``. Do not assume a ⚠️/🔴 bullet is protected.
+
+🔴 **Age and done-markers are NOT consulted.** ``--max-age-days`` and ``section_date``
+are retained for call-site compatibility only (see ``should_evict``). A bullet describing
+work that is OPEN, unmerged, or operator-gated is fully eligible the day it is written —
+being *homed* is the whole test, and "homed" says nothing about "finished". If an open
+item must stay in the injected index, pin it with ``📌`` or keep it in ``## Standing
+Gates``; do not rely on its wording, its date, or its warning glyph.
+
 A bullet with no trailing pointer is NEVER evicted (no home = losing the fact).
 Evicted lines land VERBATIM (appended) in ``archive/recent-state-YYYY-MM.md``.
 

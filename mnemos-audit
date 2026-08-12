@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # mnemos-audit — weekly deterministic memory-drift backstop.
-# Runs mnemosyne health (size, joined-line, index-gloss, feedback/INDEX completeness).
+# Runs mnemosyne health (size, joined-line, index-gloss, INDEX completeness for every
+# indexed tree: feedback/, project/, troubleshooting/).
 # On drift, writes a dated report the next /mnemos session picks up. The SEMANTIC
 # audit (stale-but-well-formed claims) needs an LLM session — run `/mnemos` weekly
 # for that; this cron only catches STRUCTURAL debt automatically.
@@ -9,11 +10,22 @@ MEM="$HOME/path/to/memory"
 MN="$HOME/.local/bin/mnemosyne"
 [[ -x "$MN" ]] || exit 0
 OUT="$("$MN" health 2>&1 || true)"
-if echo "$OUT" | grep -qE 'over limit|over the [0-9]+KB|joined-line defect|approaching limit|runaway line|INDEX drift|index line\(s\) >|pointer\(s\) do not resolve|cite the SAME event'; then
+# 🔴 ALLOWLIST — this cron is BLIND to any mnemosyne banner not listed here, and it fails
+# SILENT-CLEAN (a scanner can fire while this prints "clean"). Two banners were missing from
+# 2026-07-26 until 2026-08-07: scan_recent_state_bullets and scan_pointer_content — i.e. two
+# shipped scanners were invisible to the weekly backstop for ~12 days with nothing reporting it.
+# 🔑 Single-sourced deliberately: this pattern used to be duplicated in the grep below, so the
+# two copies could drift and the report would omit what the trigger had matched.
+# WHEN YOU ADD A SCANNER TO cmd_health, ADD ITS BANNER SUBSTRING HERE — nothing enforces this.
+DRIFT_PAT='over limit|over the [0-9]+KB|joined-line defect|approaching limit|runaway line'
+DRIFT_PAT="$DRIFT_PAT"'|INDEX drift|index line\(s\) >|pointer\(s\) do not resolve'
+DRIFT_PAT="$DRIFT_PAT"'|pointer\(s\) RESOLVE but the target|Recent State bullet\(s\) >'
+DRIFT_PAT="$DRIFT_PAT"'|cite the SAME event|ungated file\(s\) over the'
+if echo "$OUT" | grep -qE "$DRIFT_PAT"; then
   TS="$(date +%Y-%m-%d)"
   REP="$MEM/drafts/mnemos-drift-$TS.md"
   mkdir -p "$MEM/drafts"
-  { echo "# mnemos deterministic drift — $TS (auto)"; echo; echo '```'; echo "$OUT" | grep -E 'over limit|over the [0-9]+KB|joined-line defect|approaching limit|runaway line|INDEX drift|index line\(s\) >|pointer\(s\) do not resolve|cite the SAME event|missing:|ghost:'; echo '```'; echo; echo "Run \`/mnemos\` to reconcile + do the semantic audit."; } > "$REP"
+  { echo "# mnemos deterministic drift — $TS (auto)"; echo; echo '```'; echo "$OUT" | grep -E "$DRIFT_PAT|missing:|ghost:"; echo '```'; echo; echo "Run \`/mnemos\` to reconcile + do the semantic audit."; } > "$REP"
   echo "mnemos-audit: drift found → $REP"
 else
   echo "mnemos-audit: clean ($(date +%F))"

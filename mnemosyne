@@ -9,7 +9,9 @@ Options:
                     (env: MNEMOSYNE_MEMORY_DIR, default: ~/.gaius/memory)
 
 Commands:
-  health           Line counts, byte budget, and threshold status for all memory files.
+  health           Line counts, byte sizes and threshold status for all memory files.
+                   Line and byte thresholds are BOTH applied (worse verdict wins) —
+                   the line cap alone is satisfiable by reflow.
                    Also lints MEMORY.md for index-line gloss accretion (Gap-32),
                    pointers that no longer resolve (Gap-42), changelog bullets that
                    duplicate an event already recorded (Gap-43), and, when over byte
@@ -55,6 +57,84 @@ THRESHOLDS = {
     "other":      (400, 600),   # host-layer topic files (narrative/deep-ref, OK to be long)
 }
 
+# Byte thresholds — (warn, error) BYTES per file category, evaluated ALONGSIDE the
+# line thresholds above. A file reports the WORSE of the two verdicts; lines stay as
+# a readability proxy (a 200-line file is hard to scan whatever it weighs).
+#
+# Why bytes are needed at all: the injection cost is BYTES, lines are only a proxy,
+# and the two decoupled. domain/services.md sat at exactly 149 lines — GREEN, one
+# line under the warn — from 2026-07-14 to 2026-07-31 while growing 18,484 → 31,814 B.
+# The line gate is satisfiable by REFLOW: join two bullets, the count drops, the cost
+# does not. Four domain files are pinned at 149; five exceeded MEMORY.md's own 20KB
+# ERROR ceiling while every one of them read GREEN.
+#
+# Calibration is from the INJECTION BUDGET, not from the current distribution —
+# numbers chosen to fit today's files would just re-bless the drift:
+#   MEMORY.md loads EVERY session          → 16KB warn / 20KB error (below).
+#   domain/*.md load ON DEMAND (1-3 per session, not every session) → may be looser:
+#     warn = 20KB — MEMORY.md's hard ERROR ceiling. A demand-loaded file may reach the
+#                   size that is already a failure for the always-on index, but it does
+#                   not get past that unremarked.
+#     err  = 28KB — 1.4× the warn, ≈7k tokens. Ceiling on a 3-domain-file load (~84KB)
+#                   and on one-pass readability for the surgeon who has to split it.
+# Categories absent from this map are line-gated only (skills/other are narrative
+# deep-reference by design; MEMORY.md has its own dedicated byte block in cmd_health).
+BYTE_THRESHOLDS = {
+    "domain":     (20 * 1024, 28 * 1024),
+}
+
+# ── Gap 58: the trees NOTHING gates ──────────────────────────────────────────
+# cmd_health _add()s exactly four sets: MEMORY.md/common.md, root *.md, domain/,
+# skills/. project/ and troubleshooting/ are never added AT ALL — no line gate, no
+# byte gate, never in the table, cannot go YELLOW or RED. Measured 2026-08-07:
+# gated domain/ 244KB (18 files) + skills/ 306KB (39) = 550KB; ungated project/
+# 1,763KB (123 files) + troubleshooting/ 577KB (43) = 2,340KB — 81% of the corpus
+# by bytes was unmeasured. Largest single file: 145KB / 989 lines, 5x the domain
+# ERROR ceiling.  Gap 51's byte gate was built for ONE tree and never extended.
+#
+# Advisory ceiling, derived the same way the domain numbers were — from the
+# injection budget, NOT from today's distribution (fitting the current spread
+# would just re-bless the drift, per the note above):
+#   MEMORY.md   every session          → 16KB warn
+#   domain/*.md on demand, 1-3/session → 20KB warn (= MEMORY.md's hard ERR), 28KB err
+#   project/, troubleshooting/*.md     → 28KB (= the domain tree's ERR ceiling).
+# A file loaded even less often than a domain file may reach the size that is
+# already a failure for domain, but it does not get past it unremarked.
+#
+# 🔴 REPORTED, NOT RANKED — deliberately. These files get NO verdict row and can
+# never go RED, because RED is not advisory: .git/hooks/pre-commit in BOTH the
+# memory repo and Brain greps for the RED token and exit 1s. The principled
+# 28KB/40KB pair (1.4x, exactly domain's ratio) would put 11 files over the error
+# ceiling on the day it shipped and BLOCK EVERY COMMIT in both repos, including
+# the nightly auto-commit, until 11 large files were hand-split. Visibility is
+# separable from enforcement; this ships the half that cannot break the tree.
+UNGATED_TREES = ("project", "troubleshooting")
+UNGATED_ADVISORY_BYTES = 28 * 1024
+
+# Gap 55/59 — every tree that carries an index must be a BIJECTION with it.
+# (tree, index filename, match mode, key prefix). The scanner was built for
+# feedback/ in 2026-07-03 and never extended, so `project/` drifted to 29 unlisted
+# files before a session counted by hand (closed 2026-08-07); `troubleshooting/`
+# was never measured at all.
+#
+# 🔑 Two match modes, because the two index STYLES differ and precision beats
+# uniformity. feedback/INDEX.md lists bare rule keys in prose ("finint_exit,
+# analysis_node") ⇒ 'key' mode, word-boundary token match. project/ and
+# troubleshooting/ INDEX.md list relative markdown links ⇒ 'link' mode, exact
+# filename match. Applying 'link' mode to feedback would report all 171 rules
+# missing on the first run; applying 'key' mode to project/ would score a file
+# listed because a gloss happened to use its noun. Zero false POSITIVES is the
+# bar (same as scan_pointer_content) — both modes fail toward silence.
+#
+# ⚠️ Glob is `*.md`, NOT `<prefix>_*.md`: 4 feedback rules and 2 project files
+# carry no prefix and were invisible to the prefix glob. Measured 0 new findings
+# when widened (2026-08-07), so the blind spot cost nothing to close.
+INDEX_TREES = (
+    ("feedback",        "INDEX.md", "key",  "feedback_"),
+    ("project",         "INDEX.md", "link", ""),
+    ("troubleshooting", "INDEX.md", "link", ""),
+)
+
 # Domain keyword map — used by `audit` to flag common.md entries.
 # key = domain file stem, value = keywords that signal domain-specific content.
 # Loaded from ~/.gaius/config.yaml [mnemosyne.audit_keywords] if present;
@@ -94,18 +174,38 @@ BOLD   = "\033[1m"
 RESET  = "\033[0m"
 
 
+# Severity ranks — ordered so max() picks the WORSE of two verdicts.
+GREEN_RANK, YELLOW_RANK, RED_RANK = 0, 1, 2
+RANK_LABEL = {
+    GREEN_RANK:  f"{GREEN}GREEN{RESET}",
+    YELLOW_RANK: f"{YELLOW}YELLOW{RESET}",
+    RED_RANK:    f"{RED}{BOLD}RED{RESET}",   # exact token the pre-commit hook greps to block
+}
+
+
+def rank_status(value: int, warn: int, error: int) -> int:
+    """Severity rank of `value` against a (warn, error) pair. Works for lines or bytes."""
+    if value >= error:
+        return RED_RANK
+    elif value >= warn:
+        return YELLOW_RANK
+    return GREEN_RANK
+
+
 def color_status(lines: int, warn: int, error: int) -> str:
-    if lines >= error:
-        return f"{RED}{BOLD}RED{RESET}"
-    elif lines >= warn:
-        return f"{YELLOW}YELLOW{RESET}"
-    else:
-        return f"{GREEN}GREEN{RESET}"
+    return RANK_LABEL[rank_status(lines, warn, error)]
 
 
 def count_lines(path: Path) -> int:
     try:
         return sum(1 for _ in path.open())
+    except Exception:
+        return -1
+
+
+def count_bytes(path: Path) -> int:
+    try:
+        return path.stat().st_size
     except Exception:
         return -1
 
@@ -444,6 +544,21 @@ def _resolve_pointer(raw: str, root: Path):
     return ("unqualified", hits)
 
 
+def _names_an_unread_md(raw: str) -> bool:
+    """True for a target the resolver SKIPPED that is nonetheless plainly a
+    destination: a whitespace-free `.md` path in another tree (`archive/x.md`,
+    `oms/README.md`) or an absolute path outside the memory root.
+
+    'skip' is overloaded — it is also every backticked shell token and k8s verb
+    on the line — so only scan_pointer_content's abstain rule uses this, and it
+    reads the raw text rather than the resolver's verdict.
+    """
+    t = raw.strip()
+    return (len(t) > 3 and t.endswith(".md")
+            and not any(c.isspace() for c in t)
+            and not _SCHEME.match(t))
+
+
 def _anchor_tokens(anchor: str):
     out = []
     for t in re.split(r"[\s/_-]+", anchor.strip().lower()):
@@ -614,6 +729,17 @@ def scan_pointer_content(memory_dir: Path):
     understanding; a fact homed under different wording is NOT flagged (accepted
     false-negative — the bar here is zero false POSITIVES, same as its sibling).
 
+    Absence is only evidence when every destination on the line was READ (mnemos
+    #168). Idents are gathered line-wide but targets are not: a multi-topic bullet
+    can name a directory (`troubleshooting/`), an out-of-root tree (`archive/x.md`
+    — archive/ is not in POINTER_ROOTS) or a dangling path, none of which this
+    scanner opens, and then the ONE target it did read is held answerable for the
+    whole line's idents. That fired on the real MEMORY.md roll-off line, and its
+    implied remedy was the wrong one: a reader deletes the second pointer (which
+    re-strands the fact) instead of splitting the bullet. So any unread destination
+    on the line abstains — trading coverage for the zero-FP bar, as everywhere else
+    in this family.
+
     Returns [(relfile, lineno, idents, targets, preview)]. WARN-mode (advisory).
     Kill switch: ~/.gaius/pointer-check-disabled (shared with scan_pointer_resolution).
     """
@@ -639,15 +765,21 @@ def scan_pointer_content(memory_dir: Path):
             idents = _distinctive_idents(line)
             if len(idents) < 2:                       # too fragile to judge on one
                 continue
-            targets = []
+            targets, unread = [], False
             for _s, _e, raw in _extract_pointers(line):
                 kind, payload = _resolve_pointer(raw, root)
                 if kind == "ok" and payload is not None:
-                    targets.append(payload)
+                    if payload.is_file():
+                        targets.append(payload)
+                    else:
+                        unread = True                 # `troubleshooting/` — a dir, no file read
                 elif kind == "unqualified" and payload:
-                    targets.append(payload[0])
-            targets = [t for t in targets if t is not None and t.is_file()]
-            if not targets:                           # dangling is the sibling's job
+                    targets.append(payload[0])        # unique hit — readable
+                elif kind in ("dangling", "ambiguous"):
+                    unread = True                     # sibling scan owns the repair
+                elif kind == "skip" and _names_an_unread_md(raw):
+                    unread = True                     # real destination, out of scope
+            if unread or not targets:                 # dangling is the sibling's job
                 continue
 
             blob = ""
@@ -675,13 +807,20 @@ def scan_pointer_content(memory_dir: Path):
 
 
 def heaviest_lines(path: Path, n: int = 5):
-    """The n longest lines in a file (targeting aid when over byte budget):
-    [(lineno, length, preview)] heaviest-first."""
+    """The n heaviest lines in a file (targeting aid when over byte budget):
+    [(lineno, nbytes, preview)] heaviest-first.
+
+    Weight is UTF-8 BYTES, not characters. This was `len(line)` until 2026-08-09 while the
+    caller printed the figure with a `B` suffix — an undercount on exactly the lines the
+    queue exists to surface, because Recent-State bullets are emoji-dense (📌 🔴 🔑 ⚠️ cost
+    3-6 bytes each and 1 char). Measured drift on the live index: 470 reported vs 493 actual.
+    The budget it serves (`BYTE_THRESHOLDS`, `wc -c`) was always bytes, so this is the axis
+    the figure was always claiming to be on."""
     rows = []
     try:
         for i, raw in enumerate(path.open(), 1):
             line = raw.rstrip("\n")
-            rows.append((i, len(line), line.lstrip()[:50]))
+            rows.append((i, len(line.encode("utf-8")), line.lstrip()[:50]))
     except Exception:
         return []
     rows.sort(key=lambda t: -t[1])
@@ -690,75 +829,189 @@ def heaviest_lines(path: Path, n: int = 5):
 
 # ── Commands ─────────────────────────────────────────────────────────────────
 
-def scan_index_completeness(memory_dir: Path):
-    """Every active feedback rule must be catalogued in feedback/INDEX.md, and no
-    retired (.archive/) rule should still be listed. Catches the catalog-drift class
-    that let 64 rules — incl HARD gates — go invisible in the always-injected
-    awareness layer (cured 2026-07-03). Feedback-scoped: keys are deterministic
-    (filename stem minus 'feedback_'), so this is zero-false-positive.
-    Returns [(key, kind)] where kind is 'missing' | 'ghost'. WARN-mode (advisory).
+# Left boundary for "is this name listed in the index". Deliberately NOT `\b` — see
+# the 🔴 note in scan_index_completeness. Only a genuine identifier character before
+# the name means "this is a different, longer name"; `_`, `.` and `-` are markdown
+# emphasis and filename punctuation, and rejecting them reported listed files missing.
+_LISTED_LEFT = r"(?<![A-Za-z0-9])"
+
+_FENCE_RE = re.compile(r"```.*?```|~~~.*?~~~|<!--.*?-->|`[^`\n]*`", re.S)
+
+
+def _strip_noncontent(text: str) -> str:
+    """Code fences, inline code spans and HTML comments blanked (length-preserving is
+    not needed — nothing here reports offsets). Link-shaped text inside them is an
+    EXAMPLE, not a link, and treating it as one is a false positive."""
+    return _FENCE_RE.sub(" ", text)
+
+
+def scan_index_completeness(memory_dir: Path, trees=INDEX_TREES):
+    """Every indexed tree must be a BIJECTION with its index: no active file
+    unlisted, nothing listed that no longer exists.
+
+    Catches the catalog-drift class that let 64 feedback rules — incl HARD gates —
+    go invisible in the always-injected awareness layer (cured 2026-07-03), and the
+    same class in `project/` (29 unlisted before a hand count found it, cured
+    2026-08-07). An index that is not a bijection lies by omission: a session that
+    reads only the index cannot know the file exists, and the file's own outbound
+    links cannot fix that — an auto-linker writes outbound edges only, so a file can
+    look well-connected when opened and still be unreachable.
+
+    Match mode per tree (see INDEX_TREES): 'key' = the stem minus its prefix, for
+    prose indexes that list bare keys; 'link' = the exact filename, for indexes that
+    list relative markdown links. Ghosts likewise: 'key' trees are checked against
+    `.archive/`, 'link' trees against their own dangling link targets.
+
+    🔴 Both modes use `_LISTED_LEFT` and NOT `\\b` for the left boundary, because `\\b`
+    treats `_` as a word character and that inverts the failure direction. In key mode
+    the stripped prefix is itself the character before the key, so a rule listed by its
+    full filename — `[no git stash](feedback_no_git_stash.md)`, the strictly MORE
+    informative listing, and the house style of the other two trees — failed `\\b` and
+    was reported MISSING. Restyling feedback/INDEX.md to the link form reported 165 of
+    171 rules missing against an index that named every one of them. Same defect in
+    link mode via markdown emphasis (`_project_foo.md_`). Zero false POSITIVES is the
+    bar, so the boundary may only reject a genuine identifier character: `bar_foo.md`
+    now counts as listing `foo.md` (a false NEGATIVE, which this design accepts —
+    fail toward silence) while `xfoo.md` still does not.
+
+    Returns [(tree, key, kind)], kind 'missing' | 'ghost'. WARN-mode (advisory).
     """
-    fb = memory_dir / "feedback"
-    idxp = fb / "INDEX.md"
-    if not fb.is_dir() or not idxp.exists():
-        return []
-    idx = idxp.read_text(errors="ignore")
-    findings, active_keys = [], set()
-    for p in fb.glob("feedback_*.md"):
-        key = p.stem[len("feedback_"):]
-        active_keys.add(key)
-        if not re.search(r"\b" + re.escape(key) + r"\b", idx):
-            findings.append((key, "missing"))
-    arch = fb / ".archive"
-    if arch.is_dir():
-        for p in arch.glob("feedback_*.md"):
-            key = p.stem[len("feedback_"):]
-            if key not in active_keys and re.search(r"\b" + re.escape(key) + r"\b", idx):
-                findings.append((key, "ghost"))
+    findings = []
+    for tree, index_name, mode, prefix in trees:
+        d = memory_dir / tree
+        idxp = d / index_name
+        if not d.is_dir() or not idxp.exists():
+            continue
+        try:
+            idx = idxp.read_text(errors="ignore")
+        except OSError:
+            # 🔴 FAIL TOWARD SILENCE, NEVER TOWARD SILENT-CLEAN. errors="ignore" covers
+            # decode errors only; a PermissionError here used to propagate out of
+            # cmd_health BEFORE any banner printed, so one unreadable index blanked the
+            # whole health run — and all three consumers read that as healthy: the
+            # pre-commit hook greps output for RED and finds none, mnemos-audit runs
+            # `|| true` and greps an allowlist that matches nothing. Skipping one tree
+            # loses one scanner; raising loses every gate in the process.
+            continue
+        active = sorted(p for p in d.glob("*.md") if p.name != index_name)
+        if mode == "link":
+            present = {p.name for p in active}
+            for p in active:
+                # Trailing `)` / `#anchor` is left free so an anchored link counts.
+                if not re.search(_LISTED_LEFT + re.escape(p.name), idx):
+                    findings.append((tree, p.name, "missing"))
+            # A bare in-tree link target that does not exist. Cross-tree and
+            # parent-relative links carry a `/` and are deliberately not our business.
+            # Anchors are allowed here so the two halves agree on what a link IS — the
+            # missing-check counts `](gone.md#why)` as a listing, so the ghost-check
+            # must be able to call the same entry dangling once its target goes.
+            # Code fences and HTML comments are stripped first: link-shaped text quoted
+            # as an EXAMPLE names no real file, and reporting it is a false positive.
+            for target in sorted(set(re.findall(r"\]\(([A-Za-z0-9._-]+\.md)[)#]",
+                                                _strip_noncontent(idx)))):
+                if target != index_name and target not in present:
+                    findings.append((tree, target, "ghost"))
+        else:
+            active_keys = set()
+            for p in active:
+                key = p.stem[len(prefix):] if prefix and p.stem.startswith(prefix) else p.stem
+                active_keys.add(key)
+                if not re.search(_LISTED_LEFT + re.escape(key) + r"\b", idx):
+                    findings.append((tree, key, "missing"))
+            arch = d / ".archive"
+            if arch.is_dir():
+                for p in sorted(arch.glob("*.md")):
+                    if p.name == index_name:
+                        continue
+                    key = p.stem[len(prefix):] if prefix and p.stem.startswith(prefix) else p.stem
+                    if key not in active_keys and re.search(
+                            _LISTED_LEFT + re.escape(key) + r"\b", idx):
+                        findings.append((tree, key, "ghost"))
     return findings
 
 
+def scan_ungated_trees(memory_dir: Path, ceiling: int = UNGATED_ADVISORY_BYTES):
+    """Gap 58: byte weight of the trees cmd_health never measures.
+
+    Returns (over, totals) where `over` is [(rel, size)] above the advisory ceiling,
+    heaviest first, and `totals` is [(tree, file_count, total_bytes)] for every
+    ungated tree that exists.  Advisory ONLY — the caller must not turn these into
+    verdict rows; see UNGATED_TREES for why RED is off the table here."""
+    over, totals = [], []
+    for tree in UNGATED_TREES:
+        d = memory_dir / tree
+        if not d.is_dir():
+            continue
+        n = total = 0
+        for p in sorted(d.glob("*.md")):
+            sz = count_bytes(p)
+            if sz < 0:
+                continue
+            n += 1
+            total += sz
+            if sz >= ceiling:
+                over.append((f"{tree}/{p.name}", sz))
+        totals.append((tree, n, total))
+    over.sort(key=lambda t: -t[1])
+    return over, totals
+
+
 def cmd_health(memory_dir: Path, args: list):
-    """Print line counts and health status for all memory files."""
-    files = []
+    """Print line counts, byte sizes and health status for all memory files."""
+    files = []   # (name, lines, line_warn, line_err, size, byte_warn|None, byte_err|None)
+
+    def _add(name: str, path: Path, category: str):
+        lwarn, lerr = THRESHOLDS[category]
+        bwarn, berr = BYTE_THRESHOLDS.get(category, (None, None))
+        files.append((name, count_lines(path), lwarn, lerr, count_bytes(path), bwarn, berr))
 
     # Named files in root
     for name in ["MEMORY.md", "common.md"]:
         p = memory_dir / name
         if p.exists():
-            warn, error = THRESHOLDS[name]
-            files.append((str(p.relative_to(memory_dir)), count_lines(p), warn, error))
+            _add(str(p.relative_to(memory_dir)), p, name)
 
     # Other root-level .md files (not MEMORY.md/common.md/RULES.md)
     skip_root = {"MEMORY.md", "common.md", "RULES.md"}
     for p in sorted(memory_dir.glob("*.md")):
         if p.name not in skip_root:
-            warn, error = THRESHOLDS["other"]
-            files.append((p.name, count_lines(p), warn, error))
+            _add(p.name, p, "other")
 
     # Domain files
     domain_dir = memory_dir / "domain"
     if domain_dir.is_dir():
         for p in sorted(domain_dir.glob("*.md")):
-            warn, error = THRESHOLDS["domain"]
-            files.append((f"domain/{p.name}", count_lines(p), warn, error))
+            _add(f"domain/{p.name}", p, "domain")
 
     # Skills files
     skills_dir = memory_dir / "skills"
     if skills_dir.is_dir():
         for p in sorted(skills_dir.glob("*.md")):
-            warn, error = THRESHOLDS["skills"]
-            files.append((f"skills/{p.name}", count_lines(p), warn, error))
+            _add(f"skills/{p.name}", p, "skills")
+
+    # ── Verdict per file: the WORSE of the line and byte checks ──
+    # Lines are a readability proxy, bytes are the injection cost; a file that is
+    # fine on one and blown on the other is not fine. `why` names which check drove
+    # the verdict so the summary banner says lines / bytes / both.
+    verdicts = []   # (name, rank, why)
+    for fname, lines, lwarn, lerr, size, bwarn, berr in files:
+        lrank = rank_status(lines, lwarn, lerr)
+        brank = rank_status(size, bwarn, berr) if bwarn is not None else GREEN_RANK
+        rank = max(lrank, brank)
+        why = "+".join(w for w, r in (("lines", lrank), ("bytes", brank)) if r == rank)
+        verdicts.append((fname, rank, why if rank else ""))
 
     # Print table
     col_file  = max(len(r[0]) for r in files) + 2
     col_lines = 7
-    print(f"\n{'File':<{col_file}} {'Lines':>{col_lines}}  Threshold   Status")
-    print("─" * (col_file + col_lines + 22))
-    for fname, lines, warn, error in files:
-        status = color_status(lines, warn, error)
-        thresh = f"warn={warn}/err={error}"
-        print(f"{fname:<{col_file}} {lines:>{col_lines}}  {thresh:<14} {status}")
+    print(f"\n{'File':<{col_file}} {'Lines':>{col_lines}} {'Size':>8}  {'Threshold':<28} Status")
+    print("─" * (col_file + col_lines + 41))
+    for (fname, lines, lwarn, lerr, size, bwarn, berr), (_, rank, _why) in zip(files, verdicts):
+        thresh = f"warn={lwarn}/err={lerr}L"
+        if bwarn is not None:
+            thresh += f" +{bwarn / 1024:.0f}/{berr / 1024:.0f}KB"
+        print(f"{fname:<{col_file}} {lines:>{col_lines}} {size / 1024:>7.1f}K  "
+              f"{thresh:<28} {RANK_LABEL[rank]}")
 
     print()
 
@@ -800,17 +1053,18 @@ def cmd_health(memory_dir: Path, args: list):
             (joined if kind == "joined-line" else longish).append((rel, lineno, detail))
 
     # Summary
-    reds    = [r for r in files if r[1] >= r[3]]
-    yellows = [r for r in files if r[2] <= r[1] < r[3]]
+    reds    = [v for v in verdicts if v[1] == RED_RANK]
+    yellows = [v for v in verdicts if v[1] == YELLOW_RANK]
     mem_gloss = scan_index_gloss(_mem) if _mem.exists() else []
     rs_gloss = scan_recent_state_bullets(_mem) if _mem.exists() else []
     rs_dupes = scan_recent_state_duplicates(_mem) if _mem.exists() else []
     idx_incomplete = scan_index_completeness(memory_dir)
     ptr_rot = scan_pointer_resolution(memory_dir)
     ptr_empty = scan_pointer_content(memory_dir)
+    ungated_over, ungated_totals = scan_ungated_trees(memory_dir)
     if reds:
         print(f"{RED}{BOLD}⚠  {len(reds)} file(s) over limit:{RESET} "
-              + ", ".join(r[0] for r in reds))
+              + ", ".join(f"{n} ({why})" for n, _, why in reds))
     if joined:
         red = f"{RED}{BOLD}RED{RESET}"   # exact token the pre-commit hook greps to block
         print(f"{RED}{BOLD}⚠  {len(joined)} joined-line defect(s){RESET} [{red}] — "
@@ -819,7 +1073,7 @@ def cmd_health(memory_dir: Path, args: list):
             print(f"   {rel}:{lineno}  {detail}")
     if yellows:
         print(f"{YELLOW}⚡  {len(yellows)} file(s) approaching limit:{RESET} "
-              + ", ".join(r[0] for r in yellows))
+              + ", ".join(f"{n} ({why})" for n, _, why in yellows))
     if longish:
         print(f"{YELLOW}⚡  {len(longish)} runaway line(s) >{LONG_LINE_CHARS} chars "
               f"(accretion — compress to a pointer):{RESET}")
@@ -864,14 +1118,32 @@ def cmd_health(memory_dir: Path, args: list):
             print(f"   {relfile}:{lineno}  none of {shown}{more} in {rels}")
             print(f"                 {preview}…")
     if idx_incomplete:
-        miss = [k for k, knd in idx_incomplete if knd == "missing"]
-        ghost = [k for k, knd in idx_incomplete if knd == "ghost"]
-        print(f"{YELLOW}⚡  feedback/INDEX drift: {len(miss)} rule(s) unlisted, "
-              f"{len(ghost)} retired-but-still-listed (awareness gap — reconcile INDEX):{RESET}")
-        if miss:
-            print(f"   missing: {', '.join(miss[:15])}{' …' if len(miss) > 15 else ''}")
-        if ghost:
-            print(f"   ghost:   {', '.join(ghost)}")
+        by_tree: dict[str, dict[str, list]] = {}
+        for tree, key, knd in idx_incomplete:
+            by_tree.setdefault(tree, {"missing": [], "ghost": []})[knd].append(key)
+        n_miss = sum(len(v["missing"]) for v in by_tree.values())
+        n_ghost = sum(len(v["ghost"]) for v in by_tree.values())
+        print(f"{YELLOW}⚡  INDEX drift in {len(by_tree)} tree(s): {n_miss} file(s) unlisted, "
+              f"{n_ghost} listed-but-gone (an index that is not a bijection with its tree "
+              f"hides files from every session that reads only the index — reconcile):{RESET}")
+        for tree in sorted(by_tree):
+            miss, ghost = by_tree[tree]["missing"], by_tree[tree]["ghost"]
+            if miss:
+                print(f"   {tree}/ missing: {', '.join(miss[:15])}"
+                      f"{f' … +{len(miss) - 15}' if len(miss) > 15 else ''}")
+            if ghost:
+                print(f"   {tree}/ ghost:   {', '.join(ghost[:15])}"
+                      f"{f' … +{len(ghost) - 15}' if len(ghost) > 15 else ''}")
+    if ungated_over:
+        tsum = ", ".join(f"{t}/ {n} files {b / 1024:.0f}KB" for t, n, b in ungated_totals)
+        print(f"{YELLOW}⚡  {len(ungated_over)} ungated file(s) over the "
+              f"{UNGATED_ADVISORY_BYTES // 1024}KB advisory ceiling (Gap-58 — these trees are "
+              f"byte-gated NOWHERE; reported, never ranked, so a split is a judgement "
+              f"call and not a commit blocker). Weight: {tsum}:{RESET}")
+        for rel, sz in ungated_over[:5]:
+            print(f"   {rel}  {sz / 1024:.0f}KB")
+        if len(ungated_over) > 5:
+            print(f"   … +{len(ungated_over) - 5} more over {UNGATED_ADVISORY_BYTES // 1024}KB")
     if byte_yellow:
         print(f"{YELLOW}⚡  MEMORY.md over the 16KB injection-budget warn — compress.{RESET}")
     if byte_red:
@@ -884,7 +1156,7 @@ def cmd_health(memory_dir: Path, args: list):
     if (not reds and not yellows and not joined and not longish
             and not byte_red and not byte_yellow and not mem_gloss
             and not rs_gloss and not rs_dupes and not idx_incomplete and not ptr_rot
-            and not ptr_empty):
+            and not ptr_empty and not ungated_over):
         print(f"{GREEN}✓  All files within threshold.{RESET}")
     print()
 

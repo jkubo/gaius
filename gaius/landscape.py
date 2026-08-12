@@ -14,6 +14,7 @@ imports _parse_frontmatter, which raft owns and _core re-exports).
 """
 import argparse
 import hashlib
+import json
 import math
 import os
 import re
@@ -36,6 +37,79 @@ from gaius._core import (
 
 LANDSCAPE_CACHE_DIR = Path.home() / ".gaius" / "landscape_cache"
 LANDSCAPE_CMD_TIMEOUT = 10  # seconds per command
+
+
+# ---------------------------------------------------------------------------
+# Session-scoped injection dedup (2026-08-06)
+#
+# The per-prompt hook fires on EVERY user prompt, and each injected block stays
+# in conversation history for the rest of the session. Re-injecting an entry the
+# model has already been shown therefore buys nothing — the text is still right
+# there — while costing full price again. Measured on one long session: ~14.8K
+# tokens of injection, of which `gaius invariants` alone was billed 4x.
+#
+# The hook already had a dedup sentinel (`/tmp/gaius-prompt-<hash>`), but it keys
+# on the PROMPT hash — it suppresses a re-sent prompt, not a repeated entry. So
+# the same fact bills on 40 distinct prompts untouched. This closes that gap.
+#
+# Why a TTL and not "never twice": a compaction can summarize earlier injection
+# blocks away. Suppressing for the whole session would mean a hard gate silently
+# stops being present after a compact — trading a token problem for a safety one.
+# A turn-scoped window bounds the cost while guaranteeing entries resurface.
+# Hard gates get a much shorter window because they are the ones that must not
+# go missing.
+# ---------------------------------------------------------------------------
+_DEDUP_TTL_TURNS = 30            # ordinary entries: memory files, corpus facts
+_DEDUP_TTL_TURNS_HARD_GATE = 8   # safety rules resurface ~4x more often
+
+
+def _dedup_path(session_id: str) -> Path:
+    """Session state lives in /tmp, matching the hook's existing convention
+    (`/tmp/.gaius-skill-<id>`, `/tmp/gaius-concord-sync-<id>`). Session-scoped
+    ephemera SHOULD die with the boot — this is deliberately not ~/.gaius/."""
+    safe = re.sub(r'[^A-Za-z0-9_.-]', '', str(session_id))[:64]
+    return Path("/tmp") / f".gaius-injected-{safe}.json"
+
+
+def _dedup_load(session_id: str) -> dict:
+    """Best-effort: a corrupt or unreadable state file degrades to 'nothing seen
+    yet', which re-injects. Failing OPEN is correct here — the failure mode of a
+    lost state file is a wasted token, not a missing rule."""
+    if not session_id:
+        return {"seq": 0, "seen": {}}
+    try:
+        d = json.loads(_dedup_path(session_id).read_text())
+        if isinstance(d, dict) and isinstance(d.get("seen"), dict):
+            return {"seq": int(d.get("seq", 0)), "seen": d["seen"]}
+    except Exception:
+        pass
+    return {"seq": 0, "seen": {}}
+
+
+def _dedup_seen(state: dict, key: str, is_hard_gate: bool = False) -> bool:
+    """True if `key` was injected recently enough to skip."""
+    last = state["seen"].get(key)
+    if last is None:
+        return False
+    ttl = _DEDUP_TTL_TURNS_HARD_GATE if is_hard_gate else _DEDUP_TTL_TURNS
+    return (state["seq"] - int(last)) < ttl
+
+
+def _dedup_commit(session_id: str, state: dict, keys: list) -> None:
+    """Record this turn's injected keys. Never raises — dedup is an optimization,
+    and it must not be able to take down injection itself."""
+    if not session_id:
+        return
+    try:
+        for k in keys:
+            state["seen"][k] = state["seq"]
+        # Bound the file: drop entries older than the longest TTL, they can never
+        # suppress anything again.
+        cutoff = state["seq"] - _DEDUP_TTL_TURNS
+        state["seen"] = {k: v for k, v in state["seen"].items() if int(v) >= cutoff}
+        _dedup_path(session_id).write_text(json.dumps(state))
+    except Exception:
+        pass
 
 
 def _run_landscape(domain: str) -> str | None:
@@ -169,6 +243,128 @@ def apply_confirmation_boost_cap(score: float, rep_boost: float, cap) -> float:
     return score
 
 
+# ── Hot-baton pickup (SessionStart, no skill named) ───────────────────────────────────────────
+# `gaius baton pass` stamps `hot: true` into a handoff's frontmatter; the SessionStart hook
+# calls `gaius inject --handoff-hot` (no --task) so the newest hot handoff ≤_HOT_TTL_H old
+# injects into the brand-new session, then the marker is CONSUMED (hot: true → hot: consumed
+# <sid8> <ts>) so exactly one session receives it. The marker lives in frontmatter, never the
+# filename — prune_old_handoffs globs `*-{skill}.md` and a renamed file would escape pruning.
+# TTL bounds repeats even if the consume-rewrite fails. Handoffs are context, not authorization.
+_HOT_TTL_H = 2
+
+# The destructive flag lives in frontmatter, but only the BODY is injected — without this the
+# successor never sees it (review 08-11). Shared by the hot path AND the skill-keyed path so the
+# two banners cannot drift.
+_DESTRUCTIVE_BANNER = ("⛔ destructive_pending: true — this baton carries pending "
+                       "destructive/irreversible ops; operator confirmation REQUIRED "
+                       "before executing any of them.")
+
+
+def _hot_handoff_take(handoff_dir, sid="", cwd="", live_sids=None, max_tokens=3000):
+    """Return (skill, body, commit) for the single ELIGIBLE hot-stamped handoff ≤_HOT_TTL_H old;
+    (None, None, None) when there is none.
+
+    DEFERRED CONSUME (B3, 2026-08-12): this function no longer flips the marker itself. It returns
+    `commit`, a zero-arg closure that writes `hot: true → consumed` when called. The caller invokes
+    it ONLY after the handoff is actually emitted (see cmd_inject._emit_handoffs), so a caller that
+    early-returns on an empty/filtered corpus before emitting leaves the marker hot and the baton
+    re-delivers next session (fail-safe). `commit` is None for the none/ambiguous/oversized cases,
+    which must not consume anything.
+
+    SCOPING (2026-08-12): a hot baton is eligible only if (a) its recorded `cwd:` matches the
+    consumer's `cwd` — missing cwd is lenient so pre-scope handoffs still work — and (b) its
+    recorded `session:` is NOT in `live_sids`, i.e. the predecessor has actually gone away, never
+    a still-running sibling or the consumer itself. This kills the newest-wins clobber where N
+    concurrent sessions each hot-stamp skill=session (misdelivery observed live 2026-08-12).
+
+    FAIL-LOUD: if >1 handoff is eligible, NONE is consumed — returns ("__ambiguous__", menu, None) so the
+    operator adopts one by hand rather than the picker silently guessing which predecessor is the
+    real successor context. Oversized (> max_tokens) bodies are skipped and left un-consumed
+    (reachable via the skill-keyed path)."""
+    live_sids = live_sids or set()
+    self_cwd = os.path.realpath(cwd) if cwd else ""
+    try:
+        now_ts = datetime.now().timestamp()
+        candidates = []  # (path, skill, body, frontmatter, raw_tail)
+        for hp in sorted(Path(handoff_dir).glob("*.md"),
+                         key=lambda q: q.stat().st_mtime, reverse=True):
+            if (now_ts - hp.stat().st_mtime) / 3600 > _HOT_TTL_H:
+                continue
+            raw = hp.read_text()
+            if not raw.startswith("---"):
+                continue
+            parts = raw.split("---", 2)
+            # [ \t]* NOT \s*: \s would swallow the line's trailing newline and glue the
+            # replacement stamp onto the closing --- fence (caught live 2026-08-11).
+            if len(parts) < 3 or not re.search(r"(?im)^hot:[ \t]*true[ \t]*$", parts[1]):
+                continue
+            fm = parts[1]
+            # cwd scope: exclude a baton stamped for a DIFFERENT dir. Missing cwd = lenient.
+            m_cwd = re.search(r'(?im)^cwd:[ \t]*(.+?)[ \t]*$', fm)
+            if self_cwd and m_cwd and os.path.realpath(m_cwd.group(1).strip()) != self_cwd:
+                continue
+            # session scope: exclude a baton whose predecessor is still live (a running sibling,
+            # or the consumer itself). Missing session = lenient.
+            m_sess = re.search(r'(?im)^session:[ \t]*(\S+)', fm)
+            if m_sess and m_sess.group(1).strip() in live_sids:
+                continue
+            body = parts[2].strip()
+            if not body:
+                continue  # empty-body handoff (truncated/corrupt) — not a candidate; leave it
+                          # un-consumed like oversized, so a returned commit always has a body to
+                          # emit (keeps the commit⟺non-empty-injected_handoffs coupling true)
+            if estimate_tokens(body) > max_tokens:
+                continue
+            skill = "session"
+            for line in fm.strip().splitlines():
+                if line.startswith("skill:"):
+                    skill = line[6:].strip() or "session"
+            candidates.append((hp, skill, body, fm, parts[2]))
+
+        if not candidates:
+            return None, None, None
+
+        if len(candidates) > 1:
+            # Fail loud: don't guess. Surface all, consume none.
+            lines = [f"### ⚑ {len(candidates)} hot batons pending — none auto-loaded, adopt one",
+                     "_Concurrent sessions each `gaius baton pass`ed into this scope; auto-pickup "
+                     "refuses to pick silently. Read one and continue from it:_", ""]
+            for hp, sk, bd, fm, _tail in candidates:
+                first = next((ln.strip() for ln in bd.splitlines()
+                              if ln.strip() and not ln.startswith("#")
+                              and not ln.startswith(">")), "")
+                m_s = re.search(r'(?im)^session:[ \t]*(\S+)', fm)
+                who = m_s.group(1)[:8] if m_s else "?"
+                lines.append(f"- `{hp.name}` (skill: {sk}, from {who}): {first[:120]}")
+            # Ambiguous → consume NOTHING (commit=None); every baton stays hot to adopt.
+            return "__ambiguous__", "\n".join(lines), None
+
+        # Exactly one eligible → prepare a DEFERRED consume. B3 fix: do NOT flip the
+        # marker here. If we consumed now and the caller then hit an early return
+        # (empty/filtered corpus) before emitting, the baton would be lost forever.
+        # Instead return a commit closure the caller invokes only AFTER emitting the
+        # handoff — so a failure to emit leaves the marker `hot: true` and the baton
+        # re-delivers next session (fail-safe: re-deliver > silent loss).
+        hp, skill, body, fm, tail = candidates[0]
+        if re.search(r"(?im)^destructive_pending:\s*true\b", fm):
+            body = _DESTRUCTIVE_BANNER + "\n\n" + body
+        stamp = (f"hot: consumed {(sid or 'unknown')[:8]} "
+                 f"{datetime.now().isoformat(timespec='seconds')}")
+        new_fm = re.sub(r"(?im)^hot:[ \t]*true[ \t]*$", stamp, fm, count=1)
+        new_content = "---" + new_fm + "---" + tail
+
+        def _commit(_hp=hp, _content=new_content):
+            try:
+                _hp.write_text(_content)
+            except Exception:
+                pass  # TTL still bounds repeat injection
+
+        return skill, body, _commit
+    except Exception:
+        pass
+    return None, None, None
+
+
 def cmd_inject(args):
     """Inject ranked corpus entries into context, up to token budget."""
     parser = argparse.ArgumentParser(prog="gaius inject")
@@ -183,9 +379,24 @@ def cmd_inject(args):
     parser.add_argument("--task", type=str, default=None, help="Task description for BM25 relevance ranking (e.g. 'fix storage split-brain on node-01')")
     parser.add_argument("--no-semantic", action="store_true", help="Disable semantic (embedding) scoring even if available")
     parser.add_argument("--no-always-skills", action="store_true", help="Skip gate:always skills (use when session-start already injected them)")
+    parser.add_argument("--session-dedup", type=str, default=None, metavar="SESSION_ID",
+                        help="Suppress memory/corpus entries already injected into this session "
+                             "(turn-scoped TTL, hard gates resurface sooner). Off unless passed.")
+    parser.add_argument("--handoff-hot", action="store_true",
+                        help="With no --task: inject the newest hot-stamped handoff "
+                             "(`gaius baton pass`) and consume its marker — SessionStart "
+                             "baton pickup for a brand-new session")
     parser.add_argument("--format", type=str, default="claude", choices=["claude", "gemini", "plain"],
                         help="Output format: claude (hook JSON wrapper), gemini (plain markdown), plain (raw text)")
     parsed = parser.parse_args(args)
+
+    # Session dedup state. `seq` is a turn counter, bumped once per inject call,
+    # so TTLs are measured in turns rather than wall-clock (a 3-hour thinking
+    # pause is not 40 turns of context growth).
+    _dd_sid = parsed.session_dedup or ""
+    _dd_state = _dedup_load(_dd_sid)
+    _dd_state["seq"] += 1
+    _dd_injected_keys: list = []
 
     budget_remaining = parsed.budget
     injected_text = []
@@ -311,6 +522,7 @@ def cmd_inject(args):
     # name in the task string already matches without an alias.
     _SKILL_ALIASES = {}
     injected_handoffs = []
+    _hot_commit = None  # B3: deferred hot-baton consume; fired by _emit_handoffs after emit
     if parsed.task and _HANDOFF_DIR.is_dir():
         _ho_task_lower = parsed.task.lower()
         # Expand task string with canonical skill names from aliases
@@ -331,6 +543,7 @@ def cmd_inject(args):
             raw = hp.read_text()
             ho_skill = ""
             ho_severity = "normal"
+            ho_destructive = False
             if raw.startswith("---"):
                 parts = raw.split("---", 2)
                 if len(parts) >= 3:
@@ -339,6 +552,8 @@ def cmd_inject(args):
                             ho_skill = line[6:].strip()
                         elif line.startswith("severity:"):
                             ho_severity = line[9:].strip()
+                        elif line.startswith("destructive_pending:") and "true" in line.lower():
+                            ho_destructive = True
             # Match: skill name appears in task, task words overlap with skill, or alias resolved
             _ho_direct = ho_skill in _ho_task_lower
             _ho_split = any(w in _ho_task_lower for w in ho_skill.split("-"))
@@ -347,7 +562,13 @@ def cmd_inject(args):
                 ho_text = f"### Handoff: {ho_skill} ({hp.stem})"
                 if ho_severity != "normal":
                     ho_text = f"### ⚠ Handoff ({ho_severity}): {ho_skill}"
-                ho_text += f"\n{raw.split('---', 2)[-1].strip() if raw.startswith('---') else raw}"
+                ho_body = raw.split('---', 2)[-1].strip() if raw.startswith('---') else raw
+                # Surface the frontmatter destructive flag here too — the hot path already does,
+                # but a successor that gets this baton via the skill-keyed path would otherwise
+                # read the body's under-reported flag (desync observed 2026-08-12).
+                if ho_destructive:
+                    ho_body = _DESTRUCTIVE_BANNER + "\n\n" + ho_body
+                ho_text += f"\n{ho_body}"
                 ho_tokens = estimate_tokens(ho_text)
                 # Handoffs are exempt from corpus budget — they are the highest-priority
                 # context item (direct session continuity). Cap at 3000 tokens to prevent
@@ -356,6 +577,53 @@ def cmd_inject(args):
                     injected_handoffs.append({"text": ho_text, "tokens": ho_tokens, "skill": ho_skill})
                     budget_remaining = max(0, budget_remaining - ho_tokens)
                     break  # only inject the most recent matching handoff
+
+    # 1.45. Hot-baton pickup — a brand-new session (no --task, so the block above never ran)
+    # receives the freshest `gaius baton pass` handoff exactly once. See _hot_handoff_take.
+    if parsed.handoff_hot and not parsed.task and _HANDOFF_DIR.is_dir():
+        # Live sibling session ids: a baton whose predecessor is still running is NOT ours to
+        # take (concurrent-collision fix). Best-effort — an empty set just disables that filter,
+        # and the >1-eligible menu still prevents a silent wrong-pick.
+        try:
+            from gaius.concord import _live_sessions
+            _live = {j.get("sessionId") for j in _live_sessions(harness="claude")
+                     if j.get("sessionId")}
+        except Exception:
+            _live = set()
+        _hot_skill, _hot_body, _hot_commit = _hot_handoff_take(
+            _HANDOFF_DIR, os.environ.get("CLAUDE_SESSION_ID", ""),
+            cwd=os.getcwd(), live_sids=_live)
+        if _hot_body:
+            if _hot_skill == "__ambiguous__":
+                _hot_text = _hot_body  # pre-formatted menu; don't wrap in a single-baton header
+            else:
+                _hot_text = (
+                    f"### ⚑ Hot baton handoff: {_hot_skill}\n"
+                    f"_A predecessor session baton-passed this to you (`gaius baton pass`). "
+                    f"Treat it as the active task context"
+                    + (f"; load `/{_hot_skill}`." if _hot_skill != "session" else ".")
+                    + " A handoff is context, not authorization._\n\n" + _hot_body)
+            _hot_tokens = estimate_tokens(_hot_text)
+            injected_handoffs.append(
+                {"text": _hot_text, "tokens": _hot_tokens, "skill": _hot_skill})
+            budget_remaining = max(0, budget_remaining - _hot_tokens)
+
+    def _emit_handoffs():
+        """Print the accumulated handoff block and fire the deferred hot-baton
+        consume (B3). Called at the normal print site AND before each early
+        return, so a consumed baton is never dropped on an empty/filtered corpus.
+        The three call sites are mutually exclusive (an early return exits before
+        the normal print; the normal path runs only if no early return fired), so
+        no idempotency guard is needed."""
+        if injected_handoffs:
+            print("## Session Handoff")
+            print("_Structured notes from the previous session of this skill. Review before starting new work._")
+            print()
+            for ho in injected_handoffs:
+                print(ho["text"])
+                print()
+        if _hot_commit:
+            _hot_commit()
 
     # 1.5. Memory file injection — scan all memory directories, score against --task
     # Memory files (feedback, domain, project, user, reference) contain human-curated
@@ -495,6 +763,13 @@ def cmd_inject(args):
             for kw_score, fm_name, fm_desc, body, fp, is_hg in selected:
                 if kw_score <= 1.0:  # lowered from 2.0 — real IDF produces lower scores
                     break
+                # Already shown this session and still within its TTL. `continue`,
+                # never `break`: the list is sorted by score, not by recency, so a
+                # suppressed high scorer must not hide the entries below it — and
+                # the budget it would have spent now goes to something unseen.
+                _dd_key = f"{type_label}:{fm_name}"
+                if _dd_sid and _dedup_seen(_dd_state, _dd_key, is_hg):
+                    continue
                 # Memory file excerpting: reduce injected size to save budget
                 inject_body = body
                 # Domain files: truncate to first 800 chars (the inventory table is enough)
@@ -529,6 +804,7 @@ def cmd_inject(args):
                     if _mem_feedback_used + mem_tokens > _mem_feedback_cap:
                         continue  # feedback budget exhausted
                 if mem_tokens <= budget_remaining:
+                    _dd_injected_keys.append(_dd_key)
                     injected_feedback.append({
                         "text": mem_text, "tokens": mem_tokens,
                         "score": kw_score, "name": fm_name, "type": type_label,
@@ -577,6 +853,11 @@ def cmd_inject(args):
 
     if not entries:
         print("No corpus entries available.")
+        _emit_handoffs()  # B3: still deliver (and consume) a hot baton on an empty corpus
+        # Bump the turn counter with NO keys: this path returns before the memory
+        # block is printed, so no corpus entries were shown — but the turn still
+        # happened and TTLs must age, or a run of empty turns would freeze the window.
+        _dedup_commit(_dd_sid, _dd_state, [])
         return
 
     # Filter by domain if specified
@@ -590,6 +871,8 @@ def cmd_inject(args):
         ]
         if not entries:
             print(f"No entries matching domain '{parsed.domain}'.")
+            _emit_handoffs()  # B3: deliver (and consume) a hot baton even when the domain filter empties entries
+            _dedup_commit(_dd_sid, _dd_state, [])  # no corpus shown, but the turn counted
             return
 
     # Load domain stats for bootstrap check
@@ -816,6 +1099,7 @@ def cmd_inject(args):
     budget_remaining = max(0, parsed.budget - feedback_tokens_used - handoff_tokens_used)
     injected = []
     seen_content_hashes: set = set()
+    _dd_suppressed = 0  # session-deduped entries that still consumed a rank slot
     # Cap to avoid overwhelming context with low-signal tail.
     # 15 -> 8 (2026-07-26, Gap 40): measured across 6 real tasks, the tail past ~8 is
     # near-duplicate auto-mined prose. Score CANNOT trim (it is a >0.35 ranking boost,
@@ -836,16 +1120,35 @@ def cmd_inject(args):
         content_hash = hashlib.sha256(se["text"].encode()).hexdigest()[:16]
         if content_hash in seen_content_hashes:
             continue
+        # Same idea one scope up: `seen_content_hashes` dedups within THIS call
+        # (one fact surfacing under two domains); this dedups across the session.
+        # Keyed on content, not fact_key, so a re-mined duplicate of text already
+        # shown is also suppressed.
+        _dd_key = f"corpus:{content_hash}"
+        if _dd_sid and _dedup_seen(_dd_state, _dd_key):
+            # Consume the RANK SLOT instead of backfilling. Unlike memory files —
+            # which are curated, few, and gated by a score floor, so promoting the
+            # next one is a genuine upgrade — the corpus tail past
+            # _MAX_CORPUS_ENTRIES is documented right below as near-duplicate
+            # auto-mined prose. Pulling rank 9-16 forward to replace already-seen
+            # ranks 1-8 would swap a token saving for worse content at the same
+            # price. Suppression must shrink the block, not refill it.
+            _dd_suppressed += 1
+            if len(injected) + _dd_suppressed >= _MAX_CORPUS_ENTRIES:
+                break
+            continue
         seen_content_hashes.add(content_hash)
+        _dd_injected_keys.append(_dd_key)
         injected.append(se)
         budget_remaining -= se["tokens"]
         if budget_remaining <= 0 and not se["in_bootstrap"]:
             break
-        if len(injected) >= _MAX_CORPUS_ENTRIES:
+        if len(injected) + _dd_suppressed >= _MAX_CORPUS_ENTRIES:
             break
 
     if not injected and not injected_skills and not injected_text and not injected_feedback and not injected_handoffs:
         print("No entries meet scoring threshold for injection.")
+        _dedup_commit(_dd_sid, _dd_state, [])  # nothing shown, but the turn counted
         # Log telemetry: no-match event
         try:
             from gaius.telemetry import log_prompt_event
@@ -917,14 +1220,10 @@ def cmd_inject(args):
             print(fb["text"])
             print()
 
-    # Handoff block (between memory and SOPs — previous session continuity)
-    if injected_handoffs:
-        print("## Session Handoff")
-        print("_Structured notes from the previous session of this skill. Review before starting new work._")
-        print()
-        for ho in injected_handoffs:
-            print(ho["text"])
-            print()
+    # Handoff block (between memory and SOPs — previous session continuity).
+    # _emit_handoffs also fires the deferred hot-baton consume (B3); this is the
+    # normal path, mutually exclusive with the two early returns above.
+    _emit_handoffs()
 
     for sop_md in injected_text:
         print(sop_md)
@@ -1000,3 +1299,8 @@ def cmd_inject(args):
             )
     except Exception:
         pass  # telemetry must never break injection
+
+    # Record what was actually PRINTED this turn. Deliberately last: an entry that
+    # was selected but never reached stdout must not be marked as seen, or dedup
+    # would suppress a rule the model was never shown.
+    _dedup_commit(_dd_sid, _dd_state, _dd_injected_keys)

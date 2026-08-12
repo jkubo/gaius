@@ -3,15 +3,16 @@
 Read-only analytics over facts.db: the maturity score, the readiness commands
 (``maturity`` / ``readiness`` / ``snapshot`` / ``governor`` / ``route``), and the
 scoring weight tables (PROVENANCE_WEIGHT, OUTCOME_MODIFIER, SOURCE_RELIABILITY,
-CROSS_MODEL_MULTIPLIER, NO_DECAY_PROVENANCES, MATURITY_BOOTSTRAP_MIN). Those
-tables live here but are re-exported by gaius/_core.py because cmd_decay /
-cmd_rescore (resident in _core) consume them.
+CROSS_MODEL_MULTIPLIER, NO_DECAY_PROVENANCES, MATURITY_BOOTSTRAP_MIN). The decay/rescore
+commands moved home in the Phase-A split (2026-08-13): cmd_decay, cmd_rescore
+and volatility_recency now live here with the tables they consume.
 
 Facade convention (see ARCHITECTURE.md): shared helpers imported from gaius._core
 at top; _core re-imports this module's public symbols before the COMMANDS dict.
 """
 import argparse
 import glob
+import os
 import json
 import math
 import sys
@@ -497,3 +498,368 @@ def cmd_route(args):
     for i, r in enumerate(results):
         tag = " (primary)" if i == 0 else ""
         print(f"  {r['domain']:<16} score={r['score']:.3f}  budget={r['budget']}c{tag}")
+
+
+# ── Decay / rescore (moved from _core in the Phase-A split, 2026-08-13) ─────
+from gaius.kg import kg_index_fact, refresh_entity_domains  # noqa: E402  (kg precedes maturity in the facade order)
+from gaius.extract import _seeded_score  # noqa: E402
+
+
+def volatility_recency(prov_key: str, fact_type: str, age_days: float, rate: float) -> float:
+    """Recency factor honoring the fact_type volatility axis (2026-07-03).
+
+    Precedence: an explicit `live` rating wins over provenance — a fact a session
+    deliberately marked as volatile state MUST decay fast enough to force
+    re-verification (3x rate ≈ half-life ~12 days at the default 0.02/day).
+    `structural` facts are design-level and do not decay, same as the no-decay
+    provenances. Everything else keeps the standard rate.
+    """
+    if fact_type == "live":
+        return math.exp(-rate * 3.0 * age_days)
+    if prov_key in NO_DECAY_PROVENANCES or fact_type == "structural":
+        return 1.0
+    return math.exp(-rate * age_days)
+
+
+def cmd_decay(args):
+    """Apply time-based score decay to all facts.
+
+    Facts decay based on days since last_seen. High-confirmation and
+    recently-seen facts keep high scores. Old single-confirmation facts
+    decay toward a floor (never fully zero — historical value persists).
+
+    Designed to run nightly via gaius-nightly-sync.
+
+    Score formula:
+        base = max(provenance_weight × source_reliability × cross_model, content_seed) × outcome_modifier
+        recency = exp(-decay_rate × days_since_last_seen)
+        confirmation_boost = min(log2(confirmation_count + 1), 3.0) / 3.0
+        score = clamp(base × (0.3 + 0.7 × recency) × (0.5 + 0.5 × confirmation_boost), FLOOR, 1.0)
+
+    Floor = 0.1 (facts never fully disappear from inject results).
+    No-decay provenances (findings, procedures) get recency = 1.0.
+    """
+    import argparse as _ap
+    import math
+
+    parser = _ap.ArgumentParser(prog="gaius decay")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Show what would change without updating")
+    parser.add_argument("--rate", type=float, default=0.02,
+                        help="Decay rate per day (default: 0.02 ≈ half-life ~35 days)")
+    parser.add_argument("--floor", type=float, default=0.1,
+                        help="Minimum score floor (default: 0.1)")
+    parser.add_argument("--live-ttl-days", type=float, default=0.0,
+                        help="Soft-tombstone fact_type='live' facts whose last_seen is older "
+                             "than N days (0 = disabled; env: GAIUS_LIVE_TTL_DAYS). "
+                             "⚠ NO liveness re-check — retires on age alone, so use a "
+                             "conservative (large) value.")
+    parsed = parser.parse_args(args)
+
+    conn = init_db()
+    now = datetime.now(timezone.utc)
+    rate = parsed.rate
+    floor = parsed.floor
+    # Item 4 (flag-gated, DEFAULT-OFF): resolve the 'live' TTL. Explicit flag (>0) wins,
+    # else env GAIUS_LIVE_TTL_DAYS, else disabled. Disabled = the tombstone branch below
+    # never fires → decay is byte-identical to prior behavior.
+    live_ttl_days = parsed.live_ttl_days
+    if live_ttl_days <= 0:
+        try:
+            live_ttl_days = float(os.environ.get("GAIUS_LIVE_TTL_DAYS", "0") or "0")
+        except ValueError:
+            live_ttl_days = 0.0
+    live_ttl_enabled = live_ttl_days > 0
+    tombstones: list = []
+
+    facts = conn.execute(
+        "SELECT id, domain, fact_key, fact_text, score, confirmation_count, provenance, "
+        "outcome, first_seen, last_seen, model_families, source, fact_type "
+        "FROM facts WHERE tombstoned_at IS NULL"
+    ).fetchall()
+
+    updates = []
+    buckets = {"raised": 0, "decayed": 0, "unchanged": 0}
+
+    for fact in facts:
+        # Base weights (same as _maturity_score)
+        prov_key = fact["provenance"] if fact["provenance"] else "automated"
+        prov = PROVENANCE_WEIGHT.get(prov_key, 0.5)
+        out = OUTCOME_MODIFIER.get(fact["outcome"], 1.0)
+        source_mult = SOURCE_RELIABILITY.get(fact["source"] or "human", 1.0)
+
+        # Cross-model multiplier
+        try:
+            families = json.loads(fact["model_families"] or '["claude"]')
+            cross_mult = CROSS_MODEL_MULTIPLIER if len(set(families)) >= 2 else 1.0
+        except (TypeError, ValueError):
+            cross_mult = 1.0
+
+        # Content-seeded floor: an incident/postmortem fact must not score like
+        # boilerplate just because both are auto-mined. Deterministic (regex on
+        # fact_text), so nightly re-runs stay idempotent — no compounding.
+        seed = _seeded_score(fact["fact_text"] or "")
+        base = max(prov * source_mult * cross_mult, seed) * out
+
+        # Recency decay based on last_seen (not first_seen)
+        try:
+            last_seen = datetime.fromisoformat(fact["last_seen"])
+            if last_seen.tzinfo is None:
+                last_seen = last_seen.replace(tzinfo=timezone.utc)
+            age_days = (now - last_seen).total_seconds() / 86400
+        except (TypeError, ValueError):
+            age_days = 30.0  # unknown → assume moderately old
+
+        recency = volatility_recency(prov_key, fact["fact_type"], age_days, rate)
+
+        # Item 4 (flag-gated, DEFAULT-OFF): soft-tombstone stale 'live' facts.
+        # 'live' facts are volatile state snapshots (3x decay) that today only ever
+        # decay to the 0.1 floor and keep injecting FOREVER. When the TTL is enabled a
+        # 'live' fact older than it (by last_seen age) is soft-tombstoned below —
+        # tombstoned_at + tombstone_reason set, RESTORABLE, never DELETEd.
+        # ⚠ RISK: there is NO liveness RE-CHECK — a still-true 'live' guardrail can be
+        # retired mid-window purely on age. That is why this is DEFAULT-OFF, fires only
+        # when the flag is EXPLICITLY set, and should use a conservative (large) TTL.
+        if live_ttl_enabled and (fact["fact_type"] or "") == "live" and age_days > live_ttl_days:
+            tombstones.append(fact["id"])
+            continue  # retiring this fact — skip its score recompute
+
+        # Confirmation boost (log scale, capped at 3.0)
+        conf = max(1, fact["confirmation_count"])
+        conf_boost = min(math.log2(conf + 1), 3.0) / 3.0
+
+        # Final score
+        new_score = round(max(floor, min(1.0,
+            base * (0.3 + 0.7 * recency) * (0.5 + 0.5 * conf_boost)
+        )), 4)
+
+        old_score = round(fact["score"] or 0.5, 4)
+        if new_score != old_score:
+            updates.append((new_score, fact["id"]))
+            if new_score > old_score:
+                buckets["raised"] += 1
+            else:
+                buckets["decayed"] += 1
+        else:
+            buckets["unchanged"] += 1
+
+    if parsed.dry_run:
+        print(f"Dry run: {len(facts)} facts analyzed")
+        print(f"  Would raise:  {buckets['raised']}")
+        print(f"  Would decay:  {buckets['decayed']}")
+        print(f"  Unchanged:    {buckets['unchanged']}")
+        if live_ttl_enabled:
+            print(f"  Would tombstone (live, last_seen age > {live_ttl_days:g}d): {len(tombstones)}")
+        if updates:
+            # Show sample changes
+            sample = updates[:10]
+            for new_score, fid in sample:
+                f = next(r for r in facts if r["id"] == fid)
+                print(f"  [{f['domain']}] {f['score']:.4f} → {new_score:.4f}  "
+                      f"{(f['fact_key'] or '')[:40]}")
+        return
+
+    # Soft-tombstone stale 'live' facts (item 4). Empty unless the TTL flag is set.
+    if tombstones:
+        now_iso = now.isoformat()
+        tomb_reason = (f"live-ttl: last_seen age > {live_ttl_days:g}d "
+                       f"(gaius decay; no liveness re-check)")
+        conn.executemany(
+            "UPDATE facts SET tombstoned_at = ?, tombstone_reason = ? WHERE id = ?",
+            [(now_iso, tomb_reason, fid) for fid in tombstones])
+
+    if updates:
+        conn.executemany("UPDATE facts SET score = ? WHERE id = ?", updates)
+
+    if not updates and not tombstones:
+        print(f"All {len(facts)} facts unchanged.")
+        return
+
+    conn.commit()
+    msg = (f"Decayed {len(facts)} facts: "
+           f"↑{buckets['raised']} raised, ↓{buckets['decayed']} decayed, "
+           f"={buckets['unchanged']} unchanged")
+    if tombstones:
+        msg += f", ⚰{len(tombstones)} live-TTL tombstoned"
+    print(msg)
+
+
+def cmd_rescore(args):
+    """Recompute all fact scores using fact_type-based provenance mapping.
+
+    The original auto-mined provenance gives everything the same weight (0.5).
+    fact_types were reclassified in 2026-05-02 but scores were never recomputed.
+    This command fixes that by mapping fact_type → provenance, then applying
+    the decay formula with updated base scores.
+
+    Mapping:
+        finding    → provenance 'finding'              (weight 1.0)
+        procedure  → provenance 'procedure'            (weight 0.9)
+        security   → provenance 'structured_reasoning' (weight 0.8)
+        operational→ provenance 'automated'            (weight 0.7)
+        structural → provenance 'automated'            (weight 0.7)
+        observation→ default                           (weight 0.5)
+    """
+    import math
+
+    parser = argparse.ArgumentParser(prog="gaius rescore")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Show distribution change without updating")
+    parser.add_argument("--rate", type=float, default=0.02,
+                        help="Decay rate per day (default: 0.02)")
+    parser.add_argument("--floor", type=float, default=0.1,
+                        help="Minimum score floor (default: 0.1)")
+    parser.add_argument("--update-provenance", action="store_true",
+                        help="Also update provenance column based on fact_type")
+    parser.add_argument("--rebuild-kg", action="store_true",
+                        help="Rebuild knowledge graph from all facts (entity + relation extraction)")
+    parsed = parser.parse_args(args)
+
+    # fact_type → provenance mapping
+    FACT_TYPE_PROVENANCE = {
+        "finding":     "finding",
+        "procedure":   "procedure",
+        "security":    "structured_reasoning",
+        "operational": "automated",
+        "structural":  "automated",
+        "observation": "automated",
+        "live":        "automated",   # volatile state — base weight as operational; decay differentiates
+    }
+
+    conn = init_db()
+    now = datetime.now(timezone.utc)
+    rate = parsed.rate
+    floor = parsed.floor
+
+    facts = conn.execute(
+        "SELECT id, domain, fact_type, fact_key, fact_text, score, confirmation_count, provenance, "
+        "outcome, first_seen, last_seen, model_families, source "
+        "FROM facts WHERE tombstoned_at IS NULL"
+    ).fetchall()
+
+    updates = []
+    prov_updates = []
+    old_dist = {}
+    new_dist = {}
+
+    for fact in facts:
+        old_score = round(fact["score"] or 0.5, 4)
+        old_bucket = round(old_score, 1)
+        old_dist[old_bucket] = old_dist.get(old_bucket, 0) + 1
+
+        # Map fact_type to effective provenance
+        ft = fact["fact_type"] or "operational"
+        effective_prov = FACT_TYPE_PROVENANCE.get(ft, "automated")
+        prov_weight = PROVENANCE_WEIGHT.get(effective_prov, 0.5)
+
+        # Outcome modifier
+        out = OUTCOME_MODIFIER.get(fact["outcome"], 1.0)
+
+        # Source reliability
+        source_mult = SOURCE_RELIABILITY.get(fact["source"] or "human", 1.0)
+
+        # Cross-model multiplier
+        try:
+            families = json.loads(fact["model_families"] or '["claude"]')
+            cross_mult = CROSS_MODEL_MULTIPLIER if len(set(families)) >= 2 else 1.0
+        except (TypeError, ValueError):
+            cross_mult = 1.0
+
+        # Same content-seeded floor as cmd_decay — rescore and decay must agree,
+        # or a manual rescore clobbers seeded scores until the next nightly.
+        seed = _seeded_score(fact["fact_text"] or "")
+        base = max(prov_weight * source_mult * cross_mult, seed) * out
+
+        # Recency decay
+        try:
+            last_seen = datetime.fromisoformat(fact["last_seen"])
+            if last_seen.tzinfo is None:
+                last_seen = last_seen.replace(tzinfo=timezone.utc)
+            age_days = (now - last_seen).total_seconds() / 86400
+        except (TypeError, ValueError):
+            age_days = 30.0
+
+        recency = volatility_recency(effective_prov, fact["fact_type"], age_days, rate)
+
+        # Confirmation boost
+        conf = max(1, fact["confirmation_count"])
+        conf_boost = min(math.log2(conf + 1), 3.0) / 3.0
+
+        new_score = round(max(floor, min(1.0,
+            base * (0.3 + 0.7 * recency) * (0.5 + 0.5 * conf_boost)
+        )), 4)
+
+        new_bucket = round(new_score, 1)
+        new_dist[new_bucket] = new_dist.get(new_bucket, 0) + 1
+
+        if new_score != old_score:
+            updates.append((new_score, fact["id"]))
+
+        # Track provenance updates
+        if parsed.update_provenance and fact["provenance"] == "auto-mined":
+            prov_updates.append((effective_prov, fact["id"]))
+
+    # Report
+    print(f"Rescore analysis: {len(facts)} active facts")
+    print(f"  Would update: {len(updates)} scores")
+    if prov_updates:
+        print(f"  Would update: {len(prov_updates)} provenances")
+
+    print(f"\n  Score distribution (before → after):")
+    all_buckets = sorted(set(list(old_dist.keys()) + list(new_dist.keys())))
+    for b in all_buckets:
+        old_c = old_dist.get(b, 0)
+        new_c = new_dist.get(b, 0)
+        delta = new_c - old_c
+        bar = "█" * (new_c // 20) if new_c > 0 else ""
+        print(f"    {b:.1f}: {old_c:>5} → {new_c:>5} ({delta:+d}) {bar}")
+
+    if parsed.dry_run:
+        print("\n  --dry-run: no changes written")
+        return
+
+    # Apply updates
+    conn.executemany("UPDATE facts SET score = ? WHERE id = ?", updates)
+    if prov_updates:
+        conn.executemany("UPDATE facts SET provenance = ? WHERE id = ?", prov_updates)
+    conn.commit()
+
+    print(f"\n  ✓ Updated {len(updates)} scores" +
+          (f", {len(prov_updates)} provenances" if prov_updates else ""))
+
+    # Optional KG rebuild
+    if parsed.rebuild_kg:
+        print("\n  Rebuilding knowledge graph...")
+        # Clear existing KG (incl. fact links + the incremental-index watermark)
+        conn.execute("DELETE FROM entities")
+        conn.execute("DELETE FROM triples")
+        conn.execute("DELETE FROM fact_entities")
+        conn.execute("UPDATE facts SET kg_indexed_at = NULL")
+        conn.commit()
+
+        kg_count = 0
+        for fact in facts:
+            text = fact["fact_text"] or ""
+            if len(text) < 20:
+                continue
+            # SAVEPOINT: a partial kg_index_fact failure must roll back all its
+            # writes, or the fact stays un-stamped with triples half-written and
+            # the next incremental index double-counts co-occurrence weights.
+            try:
+                conn.execute("SAVEPOINT kg_rebuild")
+                kg_index_fact(conn, fact["id"], text, fact["domain"] or "general",
+                              timestamp=fact["first_seen"])
+                conn.execute("RELEASE SAVEPOINT kg_rebuild")
+                kg_count += 1
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK TO SAVEPOINT kg_rebuild")
+                    conn.execute("RELEASE SAVEPOINT kg_rebuild")
+                except Exception:
+                    pass
+
+        refresh_entity_domains(conn)
+        conn.commit()
+        ent_count = conn.execute("SELECT count(*) FROM entities").fetchone()[0]
+        tri_count = conn.execute("SELECT count(*) FROM triples").fetchone()[0]
+        print(f"  ✓ KG rebuilt: {ent_count} entities, {tri_count} triples (from {kg_count} facts)")

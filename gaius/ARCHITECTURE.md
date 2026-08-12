@@ -9,14 +9,23 @@ when extracting more.
 
 | Module | Concern | Notes |
 |--------|---------|-------|
-| `_core.py` | **Shared hub.** Config discovery, ANSI, agent-type thresholds, the SQLite facts index (`init_db`, `upsert_fact`), embeddings + embed daemon, semantic dedup, confidence scoring + contradiction checks, credential redaction patterns, TF-IDF / BM25 / decay scoring helpers, the retire/index/harvest command family, session mining, skill loading, the `COMMANDS` dispatch dict, and `main()`. | Everything that reads the runtime-mutable globals (`PROJECT_DIR`, `STAGING_DIR`, `EXTRA_SESSIONS_DIR`, rebound in `main()`) stays here. |
+| `_core.py` | **Shared hub + dispatch only** (post Phase-A split, 2026-08-13). Config cascade (`_gaius_cfg` + every path/threshold constant), ANSI, `_guard_write_path`, `route_domains`, `content_hash`, `cmd_init`/`cmd_migrate`/`cmd_sync_memory`, thin wrappers (`cmd_record`, `cmd_inject`, `cmd_completion`), the FACADE RE-EXPORTS block, `COMMANDS`, `main()`. | ALL runtime-rebindable (`PROJECT_DIR`/`STAGING_DIR`/`EXTRA_SESSIONS_DIR`, rebound in `main()`) and test-patched constants (`DB_PATH`, `MEMORY_DIR`, `SKILLS_DIR`, `CLAUDE_SKILLS_DIR`, `CLAUDE_COMMANDS_DIR`, `_gaius_cfg`, …) live HERE; split modules read them at call time as `_core.NAME`. |
+| `embed.py` | Embedding model + warm-daemon fast path, `_chunk_text`, `cmd_embed`. | `_EMBED_MODEL` module state is deliberately NOT re-exported. Phase-A split. |
+| `extract.py` | Classification vocabulary (DECISION/FINDING/PROCEDURE patterns, `SECTION_HEADERS`, `DOMAIN_KEYWORDS` + config merge), `classify_*`, `strip_bloat` family, noise/narration/reviewer-verdict filters (`_is_noise`), seeded scoring, clarified-intent parsing. | `parsers.py` resolves `_is_noise`/`CREDENTIAL_PATTERNS` through the facade — extract's re-export line must stay ahead of the parsers re-import. Phase-A split. |
+| `scoring.py` | TF-IDF, BM25, `decay_factor`, query/entity boosts, `estimate_tokens`, `domain_stats.json` trio. | Phase-A split. |
+| `facts.py` | The facts store: `init_db` (schema/vec0), `upsert_fact` + semantic dedup + contradiction checks, confidence scoring, `register_session`, distillation upserts. | Reads `_core.DB_PATH` at call time (monkeypatched by 8 test files). `kg_index_fact` is a call-site import inside its SAVEPOINT guard. Phase-A split. |
+| `review.py` | The human review queue: `load_staged`/`save_staged`, show/next/done/batch/rescan, verdict verbs (`confirm` HUMAN-ONLY), `cmd_stats`. | The v0.2 Leitner quiz (`gaius quiz`) lands here. Phase-A split. |
+| `retire.py` | Session mining (`MINE_*`, `_mine_session`), `cmd_retire`/`cmd_s3_retire`, the index pipeline (`cmd_index`, `process_session`, `write_*_deltas`, `archive_session`), `cmd_harvest`, event-based peer retires (pentagi/ollama/grok/codex). | Every index write path still calls `_core._guard_write_path`. Phase-A split. |
+| `skills.py` | Skill loading/scoring (`load_skills`, `compute_skill_score`), `cmd_skills`, Claude Code stub wiring (`cmd_commands`), `cmd_scaffold_skill`, suggest pipeline. | Phase-A split. |
+| `drift.py` | `cmd_drift` + `_drift_live` — registry drift, live-claims probes, council posting. | Phase-A split. |
+| `ingest.py` | Infrastructure source ingesters: `cmd_ansible`, `cmd_aliases`. | Phase-A split. |
 | `parsers.py` | Session-format adapters (claude / gemini / ollama / pentagi / grok / codex): `detect_format`, `parse_*_events`, session discovery. | |
 | `kg.py` | Knowledge graph: entity/relation patterns, `extract_entities`, triples, `kg_index_fact`, `cmd_kg`. | |
 | `record.py` | `gaius record` — capture AI chat sessions into gaius JSONL. | |
 | `telemetry.py` | Prompt/injection event logging (`log_prompt_event`, `log_injection_fact`). | Imported function-locally by hot paths to avoid import cost. |
 | `mcp_server.py` | MCP server exposing gaius over the Model Context Protocol. | Imports from `gaius._core`. |
 | `raft.py` | Blog-post → RAFT training-sidecar YAML. Owns `_parse_frontmatter` and the failure-class / domain keyword maps. | `cmd_raft`. |
-| `maturity.py` | Fact-maturity / training-readiness scoring + `maturity`/`readiness`/`snapshot`/`governor`/`route`. Owns the scoring weight tables (`PROVENANCE_WEIGHT`, `OUTCOME_MODIFIER`, …). | `cmd_decay`/`cmd_rescore` stay in `_core` but consume these tables via the re-export. |
+| `maturity.py` | Fact-maturity / training-readiness scoring + `maturity`/`readiness`/`snapshot`/`governor`/`route`. Owns the scoring weight tables (`PROVENANCE_WEIGHT`, `OUTCOME_MODIFIER`, …) **and, since the Phase-A split, `cmd_decay`/`cmd_rescore`/`volatility_recency`** — the commands moved home to the tables they consume. | |
 | `outcomes.py` | Orchestrator task-outcome ingestion (`task_outcomes` table, win-rates). | `cmd_ingest_outcomes`. |
 | `corpus_audit.py` | Read-only corpus integrity (repetition/prune, self-poison audit) + `route_suggest`. | `cmd_corpus_audit`, `cmd_route_suggest`. |
 | `reconcile.py` | Source-of-truth reconciler: registry, dev↔mirror fingerprint divergence, remote HEAD divergence, curated-fact promotion. | `cmd_reconcile`. `_remote_head` lives here — monkeypatch `gaius.reconcile._remote_head`, not `_core`. |
@@ -54,12 +63,23 @@ The goal: move code out of `_core.py` **without changing a single importer**. Ev
 
 4. **Ordering matters.** The re-export block runs top-to-bottom; a module that
    imports a symbol another extracted module owns must be re-imported *after* that
-   owner. Current invariant: **raft before landscape** (`_parse_frontmatter`).
+   owner. Current invariants: **the Phase-A zone (embed → extract → scoring →
+   facts → review → retire → skills → drift → ingest) runs FIRST** — the older
+   modules below it (parsers, kg, maturity, …) top-level `from gaius._core
+   import` symbols whose implementation moved into Phase-A modules — and
+   **raft before landscape** (`_parse_frontmatter`). Phase-A modules import
+   moved symbols from their new homes DIRECTLY (`from gaius.extract import …`),
+   never via `_core`; runtime-only deps use lazy in-body `from gaius._core
+   import` (resolved through the fully-built facade at command time).
 
-5. **Never move a function that reads a runtime-mutable global**
-   (`PROJECT_DIR` / `STAGING_DIR` / `EXTRA_SESSIONS_DIR`, rebound in `main()`)
-   unless it references it as `_core.NAME`. A bare imported name binds the stale
-   import-time value. When in doubt, leave it in `_core`.
+5. **Never move a function that reads a runtime-mutable OR test-patched global**
+   (`PROJECT_DIR` / `STAGING_DIR` / `EXTRA_SESSIONS_DIR`, rebound in `main()`;
+   `DB_PATH` / `MEMORY_DIR` / `SKILLS_DIR` / `CLAUDE_SKILLS_DIR` /
+   `CLAUDE_COMMANDS_DIR` / `_gaius_cfg`, monkeypatched on `gaius._core` by tests)
+   unless it references it as `_core.NAME` at call time. A bare imported name
+   binds the stale import-time value — a downstream consumer that imports a hub
+   global has to double-patch its own copy for exactly this reason. When in
+   doubt, leave it in `_core`.
 
 6. **New modules declare their own stdlib imports.** They do NOT inherit
    `_core`'s top-level `import` lines. Verify free names statically (`symtable`)

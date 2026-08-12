@@ -189,6 +189,103 @@ class TestMemoryByteBudget:
         assert "within threshold" in capsys.readouterr().out
 
 
+class TestRankStatus:
+    """rank_status — shared severity rank so a line verdict and a byte verdict are
+    comparable and max() can pick the worse one."""
+
+    def test_ranks_are_ordered(self):
+        assert mn.GREEN_RANK < mn.YELLOW_RANK < mn.RED_RANK
+
+    def test_green_below_warn(self):
+        assert mn.rank_status(50, 180, 200) == mn.GREEN_RANK
+
+    def test_yellow_at_warn_boundary(self):
+        assert mn.rank_status(180, 180, 200) == mn.YELLOW_RANK
+
+    def test_red_at_error_boundary(self):
+        assert mn.rank_status(200, 180, 200) == mn.RED_RANK
+
+    def test_red_label_is_the_precommit_token(self):
+        assert mn.RANK_LABEL[mn.RED_RANK] == "\033[31m\033[1mRED\033[0m"
+
+
+class TestDomainByteBudget:
+    """domain/*.md are gated on BYTES as well as lines, and report the WORSE of the
+    two verdicts.
+
+    The line cap alone is satisfiable by REFLOW — join two bullets and the count
+    drops while the injection cost does not. domain/services.md held exactly 149
+    lines (GREEN, one under the warn) from 2026-07-14 to 2026-07-31 while growing
+    18,484 → 31,814 B, and four domain files were pinned at 149. Five exceeded
+    MEMORY.md's own 20KB ERROR ceiling and every one of them read GREEN.
+
+    Bodies use short lines so bytes are isolated from the line-count and
+    runaway-line (>2000 char) checks."""
+
+    RED_TOKEN = "\033[31m\033[1mRED\033[0m"   # pre-commit greps this → blocks the commit
+
+    def _domain(self, d, name, total_bytes, line_len=100):
+        dom = d / "domain"
+        dom.mkdir(exist_ok=True)
+        line = "z" * (line_len - 1) + "\n"
+        (dom / name).write_text(line * (total_bytes // line_len))
+
+    def test_reflowed_file_green_on_lines_is_red_on_bytes(self, tmp_path, capsys):
+        # 106 lines (GREEN on lines) / 31.8KB — the exact services.md shape.
+        self._domain(tmp_path, "services.md", 31800, line_len=300)
+        mn.cmd_health(tmp_path, [])
+        out = capsys.readouterr().out
+        assert self.RED_TOKEN in out
+        assert "over limit" in out and "(bytes)" in out
+
+    def test_at_byte_warn_is_yellow(self, tmp_path, capsys):
+        # 103 lines (GREEN on lines) / 20.1KB — just past the 20KB warn.
+        self._domain(tmp_path, "storage.md", 20 * 1024 + 200, line_len=200)
+        mn.cmd_health(tmp_path, [])
+        out = capsys.readouterr().out
+        assert "YELLOW" in out and "approaching limit" in out and "(bytes)" in out
+        assert self.RED_TOKEN not in out
+
+    def test_just_under_byte_warn_is_green(self, tmp_path, capsys):
+        # 102 lines / 19.9KB — near-miss on bytes must pass, or the gate is noise.
+        self._domain(tmp_path, "recurring-alerts.md", 20 * 1024 - 100, line_len=200)
+        mn.cmd_health(tmp_path, [])
+        assert "within threshold" in capsys.readouterr().out
+
+    def test_line_red_survives_a_green_byte_count(self, tmp_path, capsys):
+        # 220 lines (RED on lines) / 4.4KB (GREEN on bytes) — lines are kept as a
+        # readability proxy; adding bytes must not weaken the existing gate.
+        self._domain(tmp_path, "cctv.md", 220 * 20, line_len=20)
+        mn.cmd_health(tmp_path, [])
+        out = capsys.readouterr().out
+        assert self.RED_TOKEN in out
+        assert "over limit" in out and "(lines)" in out
+
+    def test_over_on_both_reports_both(self, tmp_path, capsys):
+        # 290 lines / 29KB — over on each axis independently.
+        self._domain(tmp_path, "security.md", 29000, line_len=100)
+        mn.cmd_health(tmp_path, [])
+        assert "(lines+bytes)" in capsys.readouterr().out
+
+    def test_non_domain_categories_are_not_byte_gated(self, tmp_path, capsys):
+        # gotchas.md is 80KB+ by design (deep reference, read on demand, never
+        # injected whole). Byte gating is domain-only; a fat root file stays GREEN.
+        (tmp_path / "gotchas.md").write_text(("z" * 299 + "\n") * 300)   # 90KB, 300 lines
+        mn.cmd_health(tmp_path, [])
+        out = capsys.readouterr().out
+        assert self.RED_TOKEN not in out and "within threshold" in out
+
+    def test_domain_byte_threshold_is_configured_and_bounded(self):
+        # Calibration comes from the injection budget, not the current distribution.
+        # Locking presence + ordering + a ceiling leaves room to retune but not to
+        # relax the gate until it re-blesses the drift it exists to catch.
+        warn, err = mn.BYTE_THRESHOLDS["domain"]
+        assert warn < err
+        assert warn >= 20 * 1024                      # MEMORY.md's own error ceiling
+        assert err <= 32 * 1024                       # below today's fattest domain file
+        assert "skills" not in mn.BYTE_THRESHOLDS and "other" not in mn.BYTE_THRESHOLDS
+
+
 class TestIndexGlossAccretion:
     """scan_index_gloss — Gap-32 structural cure. Flags MEMORY.md '## Project
     Files' index lines carrying accreted prose, measured link-count-agnostically
@@ -543,6 +640,55 @@ class TestPointerContent:
                          "- `aaa-bbb.sh` and `ccc-ddd.sh` → [x](project/nope.md)")
         assert mn.scan_pointer_content(root) == []
 
+    # --- Unread destinations (mnemos #168). Idents are gathered line-wide but
+    # targets are not, so one readable pointer was being held answerable for a
+    # whole multi-topic bullet. Each case below is a REPRODUCED false positive. ---
+
+    def test_dir_pointer_on_the_line_silences(self, tmp_path):
+        """`troubleshooting/` names a directory — the fact may be in any file
+        under it and the scanner opens none of them. This is the shape of the
+        real MEMORY.md roll-off line that fired."""
+        root = self._doc(self._tree(tmp_path, "# T\nunrelated\n"),
+                         "- traps in `troubleshooting/`: `super_read_only`, "
+                         "`prometheus.io/scrape` → [x](project/t.md)")
+        (root / "troubleshooting").mkdir(exist_ok=True)
+        assert mn.scan_pointer_content(root) == []
+
+    def test_out_of_root_md_pointer_silences(self, tmp_path):
+        """`archive/x.md` is a real destination the resolver skips (archive/ is
+        not in POINTER_ROOTS), so project/t.md is not answerable for the line."""
+        root = self._doc(self._tree(tmp_path, "# T\nunrelated\n"),
+                         "- `aaa-bbb.sh` and `ccc-ddd.sh` rolled to "
+                         "[archive](archive/x.md) → [x](project/t.md)")
+        (root / "archive").mkdir(exist_ok=True)
+        (root / "archive" / "x.md").write_text("`aaa-bbb.sh` lives here\n")
+        assert mn.scan_pointer_content(root) == []
+
+    def test_dangling_beside_a_good_target_silences(self, tmp_path):
+        """One dangling pointer was survivable only when it was the ONLY one;
+        beside a resolvable target the line still fired."""
+        root = self._doc(self._tree(tmp_path, "# T\nunrelated\n"),
+                         "- `aaa-bbb.sh` and `ccc-ddd.sh` → [x](project/t.md) "
+                         "· [y](project/nope.md)")
+        assert mn.scan_pointer_content(root) == []
+
+    def test_still_fires_when_every_destination_was_read(self, tmp_path):
+        """Near-miss: the abstain rule must not silence the true positive it was
+        narrowed around. Two pointers, both read, neither holding an ident."""
+        root = self._tree(tmp_path, "# T\nunrelated\n")
+        (root / "project" / "u.md").write_text("# U\nalso unrelated\n")
+        self._doc(root, "- `aaa-bbb.sh` and `ccc-ddd.sh` → [x](project/t.md) "
+                        "· [y](project/u.md)")
+        assert len(mn.scan_pointer_content(root)) == 1
+
+    def test_prose_md_mention_does_not_silence(self, tmp_path):
+        """Near-miss: `the notes.md` is prose, not a destination. Abstaining on
+        any backticked string containing '.md' would mute the scanner wholesale."""
+        root = self._doc(self._tree(tmp_path, "# T\nunrelated\n"),
+                         "- `aaa-bbb.sh` and `ccc-ddd.sh`, see `the notes.md` "
+                         "→ [x](project/t.md)")
+        assert len(mn.scan_pointer_content(root)) == 1
+
     def test_kill_switch(self, tmp_path, monkeypatch):
         home = tmp_path / "home"
         (home / ".gaius").mkdir(parents=True)
@@ -569,6 +715,24 @@ class TestHeaviestLines:
         rows = mn.heaviest_lines(p, n=2)
         assert len(rows) == 2
         assert rows[0][1] == 500 and rows[1][1] == 200
+
+    def test_weight_is_utf8_bytes_not_characters(self, tmp_path):
+        """The canary the ASCII fixture above could never be: it passes identically whether
+        the weight is `len(line)` or `len(line.encode())`, so it certified the mislabel for
+        as long as it existed. Real Recent-State bullets are emoji-dense, and that is the
+        population the heaviest-lines queue ranks."""
+        p = tmp_path / "x.md"
+        p.write_text("📌" * 100 + "\n")                  # 100 chars, 400 UTF-8 bytes
+        assert mn.heaviest_lines(p, n=1)[0][1] == 400
+
+    def test_ranks_by_bytes_when_bytes_and_chars_disagree(self, tmp_path):
+        """Ordering, not just the printed figure — an emoji line SHORTER in characters is
+        HEAVIER in the budget that actually binds, so it must rank first. Under `len()` this
+        inverts, which is how the mislabel sent surgeons at the wrong line."""
+        p = tmp_path / "x.md"
+        p.write_text("📌" * 100 + "\n" + "a" * 300 + "\n")  # 400 B vs 300 B; 100 ch vs 300 ch
+        rows = mn.heaviest_lines(p, n=2)
+        assert rows[0][1] == 400 and rows[1][1] == 300
 
 
 class TestScanRecentStateDuplicates:
@@ -668,3 +832,383 @@ class TestScanRecentStateDuplicates:
 
     def test_missing_file_returns_empty(self, tmp_path):
         assert mn.scan_recent_state_duplicates(tmp_path / "ghost.md") == []
+
+
+class TestScanUngatedTrees:
+    """scan_ungated_trees — Gap 58. cmd_health measured MEMORY.md/common.md, root
+    *.md, domain/ and skills/ and nothing else, so project/ (123 files, 1.76MB) and
+    troubleshooting/ (43, 577KB) — 81% of the corpus by bytes — could not go YELLOW
+    or RED however large they grew. Gap 51's byte gate was built for one tree and
+    never extended.
+
+    The defining constraint is that this reports and does NOT rank: RED is not
+    advisory here, .git/hooks/pre-commit greps the RED token and exit 1s, so
+    ranking these trees on the principled 28KB/40KB pair would have blocked every
+    commit in two repos on day one. The tests below pin BOTH halves — that the
+    weight becomes visible, and that it can never reach the verdict path."""
+
+    def _tree(self, tmp_path, tree, name, size):
+        d = tmp_path / tree
+        d.mkdir(exist_ok=True)
+        (d / name).write_text("x" * size)
+
+    def test_file_over_ceiling_is_reported(self, tmp_path):
+        self._tree(tmp_path, "project", "fat.md", 40 * 1024)
+        over, _ = mn.scan_ungated_trees(tmp_path)
+        assert [r for r, _ in over] == ["project/fat.md"]
+
+    def test_file_under_ceiling_is_silent(self, tmp_path):
+        """Near-miss: one byte under must not fire, or the ceiling means nothing."""
+        self._tree(tmp_path, "project", "lean.md", mn.UNGATED_ADVISORY_BYTES - 1)
+        over, _ = mn.scan_ungated_trees(tmp_path)
+        assert over == []
+
+    def test_exactly_at_ceiling_fires(self, tmp_path):
+        self._tree(tmp_path, "project", "edge.md", mn.UNGATED_ADVISORY_BYTES)
+        over, _ = mn.scan_ungated_trees(tmp_path)
+        assert len(over) == 1
+
+    def test_troubleshooting_is_scanned_too(self, tmp_path):
+        """The gap WAS 'fixed for one tree and never extended' — so a scanner that
+        covers project/ alone reproduces the defect it exists to close."""
+        self._tree(tmp_path, "troubleshooting", "fat.md", 40 * 1024)
+        over, _ = mn.scan_ungated_trees(tmp_path)
+        assert [r for r, _ in over] == ["troubleshooting/fat.md"]
+
+    def test_gated_trees_are_NOT_double_reported(self, tmp_path):
+        """domain/ and skills/ already have verdict rows. Reporting them again here
+        would add noise to a banner whose whole value is naming the UNmeasured."""
+        self._tree(tmp_path, "domain", "big.md", 40 * 1024)
+        self._tree(tmp_path, "skills", "big.md", 40 * 1024)
+        over, totals = mn.scan_ungated_trees(tmp_path)
+        assert over == []
+        assert totals == []
+
+    def test_totals_count_every_file_not_just_the_heavy_ones(self, tmp_path):
+        """The headline number is tree WEIGHT — the thing nobody could see."""
+        self._tree(tmp_path, "project", "a.md", 100)
+        self._tree(tmp_path, "project", "b.md", 40 * 1024)
+        _, totals = mn.scan_ungated_trees(tmp_path)
+        assert totals == [("project", 2, 100 + 40 * 1024)]
+
+    def test_heaviest_first(self, tmp_path):
+        self._tree(tmp_path, "project", "mid.md", 40 * 1024)
+        self._tree(tmp_path, "project", "huge.md", 90 * 1024)
+        self._tree(tmp_path, "troubleshooting", "small.md", 30 * 1024)
+        over, _ = mn.scan_ungated_trees(tmp_path)
+        assert [r for r, _ in over] == [
+            "project/huge.md", "project/mid.md", "troubleshooting/small.md"]
+
+    def test_absent_trees_do_not_crash(self, tmp_path):
+        assert mn.scan_ungated_trees(tmp_path) == ([], [])
+
+    def test_health_reports_but_never_ranks(self, tmp_path):
+        """The commit-blocker guard, and the reason this ships reporting only:
+        a 90KB project file must show up in the banner and must NOT produce a RED
+        verdict — pre-commit greps that exact token and exit 1s."""
+        (tmp_path / "MEMORY.md").write_text("# index\n")
+        self._tree(tmp_path, "project", "huge.md", 90 * 1024)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            mn.cmd_health(tmp_path, [])
+        out = buf.getvalue()
+        assert "ungated file(s) over the 28KB advisory ceiling" in out
+        assert "project/huge.md" in out
+        assert "RED" not in out
+        assert "All files within threshold" not in out
+
+    def test_health_stays_clean_when_ungated_trees_are_lean(self, tmp_path):
+        """The all-clean guard must remain reachable — a banner that can never go
+        silent is one the next session learns to skim (the Gap 57 decay)."""
+        (tmp_path / "MEMORY.md").write_text("# index\n")
+        self._tree(tmp_path, "project", "lean.md", 500)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            mn.cmd_health(tmp_path, [])
+        assert "All files within threshold" in buf.getvalue()
+
+
+class TestScanIndexCompleteness:
+    """scan_index_completeness — Gap 55/59. Built for feedback/ in 2026-07-03 after
+    64 rules (incl HARD gates) went invisible in the always-injected awareness layer,
+    then never extended: `project/` drifted to 29 unlisted files before a session
+    counted by hand, and `troubleshooting/` was never measured at all. Same shape as
+    Gap 58 — 'fixed for one tree and never extended'.
+
+    The bar is zero false POSITIVES, so the two index STYLES get two match modes:
+    feedback/INDEX.md lists bare keys in prose, project/ and troubleshooting/ list
+    relative markdown links. Each mode has a canary that must fire and a near-miss
+    that must stay silent; applying either mode to the other tree's style is itself
+    a test, because that mistake reports the whole tree missing on day one."""
+
+    def _tree(self, tmp_path, tree, index_body, files, archived=()):
+        d = tmp_path / tree
+        d.mkdir(exist_ok=True)
+        (d / "INDEX.md").write_text(index_body)
+        for name in files:
+            (d / name).write_text("# x\n")
+        if archived:
+            a = d / ".archive"
+            a.mkdir(exist_ok=True)
+            for name in archived:
+                (a / name).write_text("# x\n")
+
+    # ── link mode (project/, troubleshooting/) ───────────────────────────────
+    def test_link_mode_unlisted_file_fires(self, tmp_path):
+        self._tree(tmp_path, "project",
+                   "- [a](project_a.md)\n", ["project_a.md", "project_b.md"])
+        assert mn.scan_index_completeness(tmp_path) == [
+            ("project", "project_b.md", "missing")]
+
+    def test_link_mode_listed_file_is_silent(self, tmp_path):
+        """Near-miss: the whole tree listed must produce nothing, or the scanner is
+        an alarm that is always on — the Gap 57 decay by another route."""
+        self._tree(tmp_path, "project",
+                   "- [a](project_a.md) | [b](project_b.md)\n",
+                   ["project_a.md", "project_b.md"])
+        assert mn.scan_index_completeness(tmp_path) == []
+
+    def test_link_mode_file_without_the_tree_prefix_is_still_checked(self, tmp_path):
+        """Two live project files carry no `project_` prefix; the old
+        `<prefix>_*.md` glob could not see them at all."""
+        self._tree(tmp_path, "project", "- [a](project_a.md)\n",
+                   ["project_a.md", "unprefixed.md"])
+        assert mn.scan_index_completeness(tmp_path) == [
+            ("project", "unprefixed.md", "missing")]
+
+    def test_link_mode_suffix_substring_does_not_count_as_listed(self, tmp_path):
+        """`foo.md` must not be scored listed because `xfoo.md` is — a bare
+        substring test silently under-reports, which is the failure this scanner
+        exists to catch."""
+        self._tree(tmp_path, "project", "- [x](xfoo.md)\n", ["xfoo.md", "foo.md"])
+        assert mn.scan_index_completeness(tmp_path) == [
+            ("project", "foo.md", "missing")]
+
+    def test_link_mode_emphasised_entry_is_listed(self, tmp_path):
+        """`_name_` is markdown emphasis, not a longer identifier. A `\\b` left
+        boundary treats the `_` as a word char and reports a listed file missing —
+        a false positive, the one direction this scanner may never fail in."""
+        self._tree(tmp_path, "project", "- _project_a.md_ — gloss\n", ["project_a.md"])
+        assert mn.scan_index_completeness(tmp_path) == []
+
+    def test_link_mode_anchored_link_still_counts_as_listed(self, tmp_path):
+        self._tree(tmp_path, "project",
+                   "- [a](project_a.md#section)\n", ["project_a.md"])
+        assert mn.scan_index_completeness(tmp_path) == []
+
+    def test_link_mode_dangling_target_is_a_ghost(self, tmp_path):
+        """An archived or deleted file leaves a link that resolves to nothing —
+        the reader follows it and gets silence, which is worse than absence."""
+        self._tree(tmp_path, "project",
+                   "- [a](project_a.md) | [gone](project_gone.md)\n", ["project_a.md"])
+        assert mn.scan_index_completeness(tmp_path) == [
+            ("project", "project_gone.md", "ghost")]
+
+    def test_link_mode_dangling_ANCHORED_target_is_also_a_ghost(self, tmp_path):
+        """The two halves must agree on what a link is. The missing-check counts
+        `](x.md#sec)` as a listing (test above), so the ghost-check has to be able
+        to call that same entry dangling once the target goes — otherwise an
+        anchored link is the one form that can rot invisibly."""
+        self._tree(tmp_path, "project",
+                   "- [a](project_a.md) | [gone](project_gone.md#why)\n",
+                   ["project_a.md"])
+        assert mn.scan_index_completeness(tmp_path) == [
+            ("project", "project_gone.md", "ghost")]
+
+    def test_link_mode_ghost_ignores_code_fences_and_comments(self, tmp_path):
+        """Link-shaped text quoted as an EXAMPLE names no real file. Both live
+        indexes already put filenames in inline code, so scraping raw text reports
+        a dangling link where nothing is linked at all."""
+        body = ("- [a](project_a.md)\n\n"
+                "```\n- [demo](project_example.md)\n```\n"
+                "`](project_inline.md)`\n"
+                "<!-- - [old](project_commented.md) -->\n")
+        self._tree(tmp_path, "project", body, ["project_a.md"])
+        assert mn.scan_index_completeness(tmp_path) == []
+
+    def test_link_mode_duplicate_dangling_link_reported_once(self, tmp_path):
+        """A hub link plus an inline mention is one dead file, not two — a doubled
+        count inflates the banner and the weekly report."""
+        self._tree(tmp_path, "project",
+                   "- [a](project_a.md)\n- [gone](project_gone.md) see [gone](project_gone.md)\n",
+                   ["project_a.md"])
+        assert mn.scan_index_completeness(tmp_path) == [
+            ("project", "project_gone.md", "ghost")]
+
+    def test_link_mode_index_self_link_is_not_a_ghost(self, tmp_path):
+        """`active` excludes INDEX.md, so an index that links to itself would
+        otherwise be reported as its own dangling target."""
+        self._tree(tmp_path, "project",
+                   "- [top](INDEX.md) | [a](project_a.md)\n", ["project_a.md"])
+        assert mn.scan_index_completeness(tmp_path) == []
+
+    def test_link_mode_ignores_cross_tree_links(self, tmp_path):
+        """`../domain/x.md` and `troubleshooting/y.md` are not this tree's business;
+        flagging them would be a false positive on the first live run."""
+        self._tree(tmp_path, "project",
+                   "- [a](project_a.md) [d](../domain/x.md) [t](troubleshooting/y.md)\n",
+                   ["project_a.md"])
+        assert mn.scan_index_completeness(tmp_path) == []
+
+    def test_index_never_reports_itself(self, tmp_path):
+        self._tree(tmp_path, "project", "- [a](project_a.md)\n", ["project_a.md"])
+        assert mn.scan_index_completeness(tmp_path) == []
+
+    # ── key mode (feedback/) ─────────────────────────────────────────────────
+    def test_key_mode_unlisted_rule_fires(self, tmp_path):
+        self._tree(tmp_path, "feedback", "**HARD**: alpha\n",
+                   ["feedback_alpha.md", "feedback_beta.md"])
+        assert mn.scan_index_completeness(tmp_path) == [
+            ("feedback", "beta", "missing")]
+
+    def test_key_mode_prose_listing_is_silent(self, tmp_path):
+        """feedback/INDEX.md lists bare keys, never links. Applying link mode here
+        would report every rule missing on the first run."""
+        self._tree(tmp_path, "feedback", "**HARD**: alpha, beta\n",
+                   ["feedback_alpha.md", "feedback_beta.md"])
+        assert mn.scan_index_completeness(tmp_path) == []
+
+    def test_key_mode_unprefixed_rule_is_still_checked(self, tmp_path):
+        """4 live feedback rules lack the `feedback_` prefix and the old glob
+        skipped them — an awareness gate cannot have a blind spot."""
+        self._tree(tmp_path, "feedback", "**HARD**: alpha\n",
+                   ["feedback_alpha.md", "unprefixed-rule.md"])
+        assert mn.scan_index_completeness(tmp_path) == [
+            ("feedback", "unprefixed-rule", "missing")]
+
+    def test_key_mode_rule_listed_by_full_filename_is_listed(self, tmp_path):
+        """🔴 The regression that made `_LISTED_LEFT` necessary. `\\b` counts `_` as a
+        word char, so the prefix the scanner just stripped becomes the character
+        before the key and the match fails — a rule listed by its FULL filename (the
+        more informative form, and the house style of the other two trees) was
+        reported missing. At live scale that was 165 of 171 rules against an index
+        naming every one of them."""
+        self._tree(tmp_path, "feedback",
+                   "- [no git stash](feedback_no_git_stash.md)\n",
+                   ["feedback_no_git_stash.md"])
+        assert mn.scan_index_completeness(tmp_path) == []
+
+    def test_key_mode_longer_key_does_not_list_the_shorter_one(self, tmp_path):
+        """The near-miss for the loosened boundary: `alert_fatigue_proactive` must
+        not be read as listing `alert_fatigue`. Live feedback/ has such pairs."""
+        self._tree(tmp_path, "feedback", "**HARD**: alert_fatigue_proactive\n",
+                   ["feedback_alert_fatigue.md", "feedback_alert_fatigue_proactive.md"])
+        assert mn.scan_index_completeness(tmp_path) == [
+            ("feedback", "alert_fatigue", "missing")]
+
+    def test_key_mode_retired_rule_still_listed_is_a_ghost(self, tmp_path):
+        self._tree(tmp_path, "feedback", "**HARD**: alpha, retired\n",
+                   ["feedback_alpha.md"], archived=["feedback_retired.md"])
+        assert mn.scan_index_completeness(tmp_path) == [
+            ("feedback", "retired", "ghost")]
+
+    def test_key_mode_retired_rule_NOT_listed_is_silent(self, tmp_path):
+        """The other half of the ghost conjunct: an archived rule the index
+        correctly never mentions is a clean retirement, not drift."""
+        self._tree(tmp_path, "feedback", "**HARD**: alpha\n",
+                   ["feedback_alpha.md"], archived=["feedback_retired.md"])
+        assert mn.scan_index_completeness(tmp_path) == []
+
+    def test_key_mode_readopted_rule_is_not_a_ghost(self, tmp_path):
+        """A rule present in BOTH the tree and .archive/ is live, not retired."""
+        self._tree(tmp_path, "feedback", "**HARD**: alpha\n",
+                   ["feedback_alpha.md"], archived=["feedback_alpha.md"])
+        assert mn.scan_index_completeness(tmp_path) == []
+
+    def test_key_mode_archived_index_is_not_a_ghost(self, tmp_path):
+        """The archive glob widened to `*.md` too, so a stale INDEX.md sitting in
+        `.archive/` yields key 'INDEX' — which word-matches an index's own prose
+        essentially always, and would fire on every run forever."""
+        self._tree(tmp_path, "feedback", "# INDEX\n\n**HARD**: alpha\n",
+                   ["feedback_alpha.md"], archived=["INDEX.md"])
+        assert mn.scan_index_completeness(tmp_path) == []
+
+    # ── shape / wiring ───────────────────────────────────────────────────────
+    def test_absent_trees_do_not_crash(self, tmp_path):
+        assert mn.scan_index_completeness(tmp_path) == []
+
+    def test_tree_without_an_index_is_skipped(self, tmp_path):
+        """No INDEX.md means the tree opted out — inventing one file-per-line is
+        not this scanner's call."""
+        (tmp_path / "project").mkdir()
+        (tmp_path / "project" / "project_a.md").write_text("# x\n")
+        assert mn.scan_index_completeness(tmp_path) == []
+
+    def test_unreadable_index_does_not_take_down_the_whole_health_run(self, tmp_path):
+        """🔴 FAIL TOWARD SILENCE, NEVER SILENT-CLEAN. This scanner runs BEFORE every
+        banner prints, so an exception here blanks the entire health output — and all
+        three consumers read a blank run as healthy (pre-commit greps for RED and
+        finds none; mnemos-audit runs `|| true` and greps an allowlist). One
+        unreadable index must cost one scanner, not every gate in the process."""
+        (tmp_path / "MEMORY.md").write_text("# index\n")
+        d = tmp_path / "project"
+        d.mkdir()
+        (d / "project_a.md").write_text("# x\n")
+        (d / "INDEX.md").mkdir()          # IsADirectoryError on read_text
+        assert mn.scan_index_completeness(tmp_path) == []
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            mn.cmd_health(tmp_path, [])
+        assert "All files within threshold" in buf.getvalue()
+
+    def test_every_indexed_tree_is_covered(self, tmp_path):
+        """The Gap 58 lesson verbatim: a scanner that covers one tree reproduces the
+        defect it exists to close. Pin the tree set so dropping one reds a test."""
+        assert {t for t, _, _, _ in mn.INDEX_TREES} == {
+            "feedback", "project", "troubleshooting"}
+
+    def test_health_reports_each_tree_separately(self, tmp_path):
+        (tmp_path / "MEMORY.md").write_text("# index\n")
+        self._tree(tmp_path, "project", "- [a](project_a.md)\n",
+                   ["project_a.md", "project_b.md"])
+        self._tree(tmp_path, "troubleshooting", "- [a](t_a.md)\n",
+                   ["t_a.md", "t_b.md"])
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            mn.cmd_health(tmp_path, [])
+        out = buf.getvalue()
+        assert "INDEX drift in 2 tree(s): 2 file(s) unlisted" in out
+        assert "project/ missing: project_b.md" in out
+        assert "troubleshooting/ missing: t_b.md" in out
+        assert "All files within threshold" not in out
+        assert "RED" not in out          # advisory — never a commit blocker
+
+    def test_health_stays_clean_when_indexes_are_bijections(self, tmp_path):
+        (tmp_path / "MEMORY.md").write_text("# index\n")
+        self._tree(tmp_path, "project", "- [a](project_a.md)\n", ["project_a.md"])
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            mn.cmd_health(tmp_path, [])
+        assert "All files within threshold" in buf.getvalue()
+
+    def test_drift_pat_still_matches_the_banner(self, tmp_path):
+        """mnemos-audit's DRIFT_PAT is an ALLOWLIST that fails SILENT-CLEAN. The
+        banner text changed from 'feedback/INDEX drift' to a per-tree form; the
+        'INDEX drift' fragment must survive or the weekly cron goes blind (the exact
+        12-day outage Gap 57 was opened for). hooks/test-install-drift.sh enumerates
+        this generally — this pins it at the unit level too, since the two travel
+        in different suites."""
+        (tmp_path / "MEMORY.md").write_text("# index\n")
+        self._tree(tmp_path, "project", "- [a](project_a.md)\n",
+                   ["project_a.md", "project_b.md"])
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            mn.cmd_health(tmp_path, [])
+        out = buf.getvalue()
+        assert "INDEX drift" in out
+        assert "missing:" in out         # mnemos-audit greps this to build the report
+
+    def test_ghost_label_survives_for_the_report_grep_too(self, tmp_path):
+        """`ghost:` is the other literal mnemos-audit greps. It sits in a nested
+        print, so hooks/test-install-drift.sh's AST enumeration (top-level ⚡/⚠
+        prints only) cannot see it — rename it and every gate stays green while the
+        weekly report silently drops dangling-link detail."""
+        (tmp_path / "MEMORY.md").write_text("# index\n")
+        self._tree(tmp_path, "project",
+                   "- [a](project_a.md) | [gone](project_gone.md)\n", ["project_a.md"])
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            mn.cmd_health(tmp_path, [])
+        out = buf.getvalue()
+        assert "ghost:" in out
+        assert "project_gone.md" in out

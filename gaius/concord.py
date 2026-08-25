@@ -1144,18 +1144,42 @@ def _active_skill(sid):
     return ""
 
 
+def _handoff_dir():
+    env = (os.environ.get("GAIUS_HANDOFF_DIR") or "").strip()
+    if env:
+        return Path(env).expanduser()
+    return Path.home() / "Projects" / "agent-memory" / "handoffs"
+
+
+def _newest_skill_handoff(skill):
+    try:
+        existing = sorted(_handoff_dir().glob(f"*-{skill}.md"), reverse=True)
+    except OSError:
+        return None
+    return existing[0] if existing else None
+
+
 def _write_handoff(skill, next_steps, sid, severity, body):
     """Best-effort shell-out to gaius-session-handoff (the canonical writer: frontmatter,
     session scrape, attestation mirror). Returns the written path or '' on any failure. The
-    claim→pool transfer is the primary artifact; a missing handoff file never aborts it."""
+    claim→pool transfer is the primary artifact; a missing handoff file never aborts it.
+
+    Implied-replace (2026-08-18) made a --next-only or empty write clobber the newest
+    same-skill HITL file (default skill is `session`). If there is no stdin body and a
+    same-skill file already exists, point at that file and do not write.
+    """
     import shutil
     import subprocess
+    skill = skill or "session"
+    newest = _newest_skill_handoff(skill)
+    if not (body or "").strip() and newest is not None:
+        return str(newest)
     exe = shutil.which("gaius-session-handoff") or os.path.expanduser(
         "~/.local/bin/gaius-session-handoff")
     if not os.path.exists(exe):
         return ""
-    cmd = [exe, "--skill", skill or "session", "--session-id", sid or "",
-           "--severity", severity or "normal"]
+    cmd = [exe, "--skill", skill, "--session-id", sid or "",
+           "--severity", severity or "normal", "--replace"]
     if next_steps and not body:
         cmd += ["--next", next_steps]  # writer prefers a stdin body, ignoring --next when present
     try:

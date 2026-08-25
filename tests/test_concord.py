@@ -198,7 +198,7 @@ def test_steal_surfaces_in_victims_delta(tmp_path, capsys):
 
 
 # ── baton pass: handoff transfers this session's claims → pool, releases as handed-off ─
-#    (--no-handoff on every test → no real handoff file is written / pruned as a side effect)
+#    (--no-handoff on most tests → no real handoff file is written as a side effect)
 
 def _run_handoff(db, monkeypatch, sid="baton-sess", next_steps="", body="", as_json=True,
                  spawn=False):
@@ -303,8 +303,8 @@ def _run_handoff_writer_spy(db, monkeypatch, sid="baton-sess", next_steps="", bo
 
 def test_handoff_noop_does_not_invoke_the_writer(tmp_path, monkeypatch, capsys):
     """Regression (verifier #2): a bare handoff with nothing to hand off must NOT call the
-    writer — the writer ALWAYS writes a file + prunes, so an accidental bare run would litter
-    the handoffs dir and evict real handoffs. no_handoff=False so the writer WOULD run if reached."""
+    writer — a --next-only write used to create+prune, and now would replace. no_handoff=False
+    so the writer WOULD run if reached."""
     db = str(tmp_path / "c.db")
     cc.init_concord(db).close()
     calls = _run_handoff_writer_spy(db, monkeypatch)  # no claims, no next, no body
@@ -453,6 +453,58 @@ def test_handoff_without_spawn_flag_never_launches(tmp_path, monkeypatch):
         db=db, skill="", next="", severity="normal",
         no_handoff=True, no_title=True, spawn=False, json=True))
     assert ran == []
+
+
+def test_write_handoff_skips_existing_when_body_empty(tmp_path, monkeypatch):
+    """--next-only / claims-only must not skeletonize a peer HITL file."""
+    monkeypatch.setenv("GAIUS_HANDOFF_DIR", str(tmp_path))
+    p = tmp_path / "2026-08-18-120000-session.md"
+    p.write_text(
+        "---\nskill: session\ndate: 2026-08-18\ntime: 00:00 UTC\n"
+        "severity: normal\ndestructive_pending: true\n---\n\n"
+        "# Session Handoff: session (2026-08-18)\n\nrich-body\n"
+    )
+    got = cc._write_handoff("session", "do X", "sid", "normal", "")
+    assert got == str(p)
+    text = p.read_text()
+    assert "rich-body" in text
+    assert "do X" not in text
+    assert "destructive_pending: true" in text
+
+
+def test_write_handoff_replace_argv_when_body(tmp_path, monkeypatch):
+    """A stdin body must pass --replace so a fourth file is not created."""
+    import subprocess
+    monkeypatch.setenv("GAIUS_HANDOFF_DIR", str(tmp_path))
+    (tmp_path / "2026-08-18-120000-session.md").write_text(
+        "---\nskill: session\ndate: 2026-08-18\ntime: 00:00 UTC\n"
+        "severity: normal\ndestructive_pending: true\n---\n\nold\n"
+    )
+    seen = {}
+
+    class R:
+        stdout = f"Handoff written: {tmp_path}/2026-08-18-120000-session.md\n"
+        stderr = ""
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        seen["input"] = kw.get("input")
+        return R()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    # _write_handoff gates on os.path.exists(exe), so `which` must resolve to a file
+    # that really is on disk. Point it at a stub under tmp_path: pointing it at the
+    # maintainer's own ~/.local/bin made the test pass only on a box where the tool
+    # was installed, and fail everywhere else — including the published mirror's CI.
+    stub = tmp_path / "gaius-session-handoff"
+    stub.write_text("#!/bin/sh\nexit 0\n")
+    stub.chmod(0o755)
+    monkeypatch.setattr("shutil.which", lambda n: str(stub))
+    got = cc._write_handoff("session", "", "sid", "normal", "## Next\n- [ ] x\n")
+    assert got.endswith("2026-08-18-120000-session.md")
+    assert "--replace" in seen["cmd"]
+    assert "--new" not in seen["cmd"]
+    assert "## Next" in seen["input"]
 
 
 # ── prompt-delta: peer CLAIM acquisition (2026-07-27 gap) ───────────────────────────

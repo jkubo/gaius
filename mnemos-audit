@@ -20,7 +20,7 @@ OUT="$("$MN" health 2>&1 || true)"
 DRIFT_PAT='over limit|over the [0-9]+KB|joined-line defect|approaching limit|runaway line'
 DRIFT_PAT="$DRIFT_PAT"'|INDEX drift|index line\(s\) >|pointer\(s\) do not resolve'
 DRIFT_PAT="$DRIFT_PAT"'|pointer\(s\) RESOLVE but the target|Recent State bullet\(s\) >'
-DRIFT_PAT="$DRIFT_PAT"'|cite the SAME event|ungated file\(s\) over the'
+DRIFT_PAT="$DRIFT_PAT"'|cite the SAME event|ungated file\(s\) over the|summary queue:'
 if echo "$OUT" | grep -qE "$DRIFT_PAT"; then
   TS="$(date +%Y-%m-%d)"
   REP="$MEM/drafts/mnemos-drift-$TS.md"

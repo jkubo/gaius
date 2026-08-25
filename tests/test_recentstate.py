@@ -3,14 +3,17 @@
 Pure-function / tmp_path only; no facts.db, no live MEMORY_DIR.
 
 The gate was REDESIGNED 2026-07-28 (mnemos #123). It is now a single safety
-property — PROVABLE REDUNDANCY — expressed in four fail-closed steps:
+property — PROVABLE REDUNDANCY — expressed in five fail-closed steps:
 
-  (1) an explicit ``📌`` / ``<!--pin-->`` pin → KEEP (⚠️ is NO LONGER a veto),
+  (1) an explicit ``📌`` / ``<!--pin-->`` pin → KEEP (⚠️ is NO LONGER a veto)
+      unless ``ignore_pins=True`` (operator override; homing + INDEX still gate),
   (2) no trailing pointer (``→ <file>`` / ``[label](path)``) → KEEP,
   (3) ``home_text_provider is None`` → KEEP — "cannot verify ⇒ keep", the
       INVERSE of the old contract where omitting it skipped the check,
   (4) otherwise evict iff the pointer target genuinely contains the bullet's
-      signature (``MIN_HOME_HITS`` = 2 tokens, ``HOME_MATCH_FRACTION`` = 0.5).
+      signature (``MIN_HOME_HITS`` = 2 tokens, ``HOME_MATCH_FRACTION`` = 0.5),
+  (5) ``index_reach_provider`` (wired by ``roll_recent_state``) → KEEP if any
+      INDEX_TREE target is unlisted. ``None`` skips (homing-only unit tests).
 
 Age, the done-marker and the per-bullet date NO LONGER GATE ANYTHING;
 ``section_date`` / ``max_age_days`` are accepted for call-site compatibility and
@@ -28,8 +31,13 @@ import pytest
 
 from gaius.recentstate import (
     MIN_HOME_HITS,
+    INDEX_TREES,
+    _LISTED_LEFT,
     should_evict,
     roll_recent_state,
+    cmd_recent_roll,
+    index_lists,
+    _targets_index_reachable,
     _has_trailing_pointer,
     _has_done_marker,
     _has_veto,
@@ -119,6 +127,23 @@ class TestShouldEvictGate:
 
     def test_html_comment_pin_keeps_even_when_homed(self):
         b = "- **F**: <!--pin--> `drbd-socket-guard` pins `flannel-mtu`. → project/f.md"
+        assert should_evict(b, SEC, 7, home_text_provider=_homed(*EVICTABLE_SIG)) is False
+
+    def test_ignore_pins_evicts_homed_pinned_bullet(self):
+        b = "- **F**: 📌 `drbd-socket-guard` pins `flannel-mtu`. → project/f.md"
+        assert should_evict(b, SEC, 7, home_text_provider=_homed(*EVICTABLE_SIG),
+                            ignore_pins=True) is True
+
+    def test_ignore_pins_still_keeps_unhomed(self):
+        # override only skips the glyph; a pinned bullet with no home stays
+        b = "- **F**: 📌 `drbd-socket-guard` pins `flannel-mtu`. → project/f.md"
+        assert should_evict(b, SEC, 7, home_text_provider=_unrelated,
+                            ignore_pins=True) is False
+        assert should_evict(b, SEC, 7, home_text_provider=None,
+                            ignore_pins=True) is False
+
+    def test_ignore_pins_default_false(self):
+        b = "- **F**: 📌 `drbd-socket-guard` pins `flannel-mtu`. → project/f.md"
         assert should_evict(b, SEC, 7, home_text_provider=_homed(*EVICTABLE_SIG)) is False
 
     def test_markdown_link_pointer_evicts(self):
@@ -352,6 +377,73 @@ class TestRollEndToEnd:
         assert mem.read_text() == content
 
 
+class TestIgnorePinsRoll:
+    """--ignore-pins is an operator override for ambient 📌 drift. Default
+    remains fail-closed; the flag only skips _has_pin, not homing."""
+
+    def test_default_roll_keeps_pinned_even_when_homed(self, tmp_path):
+        mem = tmp_path / "MEMORY.md"
+        pinned = TestRollEndToEnd.KEEP_PINNED
+        mem.write_text(_doc(pinned))
+        _write_home(tmp_path, "project/e.md", *EVICTABLE_SIG)
+        content = mem.read_text()
+        res = roll_recent_state(tmp_path / "MEMORY.md", tmp_path / "archive")
+        assert res["evicted"] == []
+        assert mem.read_text() == content
+
+    def test_ignore_pins_evicts_homed_pinned(self, tmp_path):
+        mem = tmp_path / "MEMORY.md"
+        pinned = TestRollEndToEnd.KEEP_PINNED
+        mem.write_text(_doc(EVICTABLE, pinned))
+        _write_home(tmp_path, "project/a.md", *EVICTABLE_SIG)
+        _write_home(tmp_path, "project/e.md", *EVICTABLE_SIG)
+        res = roll_recent_state(mem, tmp_path / "archive", ignore_pins=True)
+        texts = [ln.rstrip("\n") for ln in res["evicted"]]
+        assert EVICTABLE in texts
+        assert pinned in texts
+        after = mem.read_text()
+        assert "**A**" not in after
+        assert "**E**" not in after
+
+    def test_ignore_pins_does_not_evict_unhomed(self, tmp_path):
+        mem = tmp_path / "MEMORY.md"
+        unhomed = TestRollEndToEnd.KEEP_UNHOMED
+        mem.write_text(_doc(unhomed))
+        _write_unrelated_home(tmp_path, "project/c.md")
+        content = mem.read_text()
+        res = roll_recent_state(mem, tmp_path / "archive", ignore_pins=True)
+        assert res["evicted"] == []
+        assert mem.read_text() == content
+
+
+class TestCliMessage:
+    def test_empty_result_does_not_claim_age_or_done_marker(self, tmp_path, capsys):
+        mem = tmp_path / "MEMORY.md"
+        mem.write_text(_doc("- **B**: `mullvad-exit` flapped. → project/missing.md"))
+        rc = cmd_recent_roll(["--dry-run", "--memory-file", str(mem),
+                              "--archive-dir", str(tmp_path / "archive")])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "nothing to evict" in out
+        assert "aged" not in out
+        assert "done-marker" not in out
+        assert "--ignore-pins" in out
+
+    def test_ignore_pins_flag_reaches_roll(self, tmp_path, capsys):
+        mem = tmp_path / "MEMORY.md"
+        pinned = TestRollEndToEnd.KEEP_PINNED
+        mem.write_text(_doc(pinned))
+        _write_home(tmp_path, "project/e.md", *EVICTABLE_SIG)
+        content = mem.read_text()
+        rc = cmd_recent_roll(["--dry-run", "--ignore-pins",
+                              "--memory-file", str(mem),
+                              "--archive-dir", str(tmp_path / "archive")])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "would evict 1" in out
+        assert mem.read_text() == content   # dry-run: no write
+
+
 class TestDryRun:
     def test_dry_run_mutates_nothing(self, tmp_path):
         mem = tmp_path / "MEMORY.md"
@@ -467,3 +559,217 @@ class TestHomingGuard:
         res = roll_recent_state(mem, tmp_path / "archive", max_age_days=7, verify_homing=True)
         assert res["evicted"] == []
         assert "**CI/deploy**" in mem.read_text()
+
+
+def _write_index(root, tree, *names):
+    """Write ``<tree>/INDEX.md`` listing ``names`` as relative markdown links
+    (project/ / troubleshooting/ style). Key-mode trees need their own body."""
+    d = Path(root) / tree
+    d.mkdir(parents=True, exist_ok=True)
+    body = " | ".join(f"[{n}]({n})" for n in names) + "\n"
+    (d / "INDEX.md").write_text(body, encoding="utf-8")
+    return d / "INDEX.md"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gap 60 — INDEX reachability. Homing is necessary, not sufficient: an unlisted
+# troubleshooting/ file is signature-homed but DARK once the MEMORY.md bullet
+# is gone (archive is not injected). The 2026-08-14 --ignore-pins roll stranded
+# 14 files this way. These tests must RED if the provider call is deleted.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestIndexLists:
+    def test_not_an_index_tree_is_none(self, tmp_path):
+        (tmp_path / "domain").mkdir()
+        (tmp_path / "domain" / "security.md").write_text("x\n")
+        assert index_lists(tmp_path, "domain/security.md") is None
+        assert index_lists(tmp_path, "gotchas.md") is None
+
+    def test_missing_index_is_none(self, tmp_path):
+        # tree opted out — same skip as scan_index_completeness
+        _write_home(tmp_path, "project/a.md", "tok")
+        assert index_lists(tmp_path, "project/a.md") is None
+
+    def test_listed_link_is_true(self, tmp_path):
+        _write_home(tmp_path, "troubleshooting/foo.md", "tok")
+        _write_index(tmp_path, "troubleshooting", "foo.md")
+        assert index_lists(tmp_path, "troubleshooting/foo.md") is True
+        assert index_lists(tmp_path, "troubleshooting/foo.md#why") is True
+
+    def test_unlisted_link_is_false(self, tmp_path):
+        _write_home(tmp_path, "troubleshooting/foo.md", "tok")
+        _write_home(tmp_path, "troubleshooting/bar.md", "tok")
+        _write_index(tmp_path, "troubleshooting", "foo.md")
+        assert index_lists(tmp_path, "troubleshooting/bar.md") is False
+
+    def test_substring_filename_does_not_count(self, tmp_path):
+        _write_home(tmp_path, "project/foo.md", "tok")
+        _write_home(tmp_path, "project/xfoo.md", "tok")
+        _write_index(tmp_path, "project", "xfoo.md")
+        assert index_lists(tmp_path, "project/foo.md") is False
+
+    def test_key_mode_uses_stem_minus_prefix(self, tmp_path):
+        _write_home(tmp_path, "feedback/feedback_no_git_stash.md", "tok")
+        _write_home(tmp_path, "feedback/feedback_other.md", "tok")
+        d = tmp_path / "feedback"
+        d.mkdir(exist_ok=True)
+        (d / "INDEX.md").write_text("no_git_stash is the hard gate\n")
+        assert index_lists(tmp_path, "feedback/feedback_no_git_stash.md") is True
+        assert index_lists(tmp_path, "feedback/feedback_other.md") is False
+
+    def test_unreadable_index_is_false(self, tmp_path):
+        _write_home(tmp_path, "project/a.md", "tok")
+        idx = _write_index(tmp_path, "project", "a.md")
+        idx.chmod(0)
+        try:
+            assert index_lists(tmp_path, "project/a.md") is False
+        finally:
+            idx.chmod(0o644)
+
+
+class TestIndexReachProvider:
+    """should_evict honors index_reach_provider. None skips (existing tests)."""
+
+    def test_provider_false_keeps_even_when_homed(self):
+        assert should_evict(EVICTABLE, SEC, 7,
+                            home_text_provider=_homed(*EVICTABLE_SIG),
+                            index_reach_provider=lambda _t: False) is False
+
+    def test_provider_true_evicts_when_homed(self):
+        assert should_evict(EVICTABLE, SEC, 7,
+                            home_text_provider=_homed(*EVICTABLE_SIG),
+                            index_reach_provider=lambda _t: True) is True
+
+    def test_provider_does_not_override_unhomed(self):
+        assert should_evict(EVICTABLE, SEC, 7,
+                            home_text_provider=_unrelated,
+                            index_reach_provider=lambda _t: True) is False
+
+    def test_ignore_pins_still_needs_index(self):
+        b = "- **F**: 📌 `drbd-socket-guard` pins `flannel-mtu`. → project/f.md"
+        assert should_evict(b, SEC, 7, home_text_provider=_homed(*EVICTABLE_SIG),
+                            ignore_pins=True,
+                            index_reach_provider=lambda _t: False) is False
+
+
+class TestIndexReachRoll:
+    """The 08-14 incident: --ignore-pins + homed + unlisted INDEX_TREE target
+    must KEEP. Deleting the index_prov= line in roll_recent_state reds these."""
+
+    UNLISTED = ("- **U**: 📌 `drbd-socket-guard` on `flannel-mtu`. "
+                "→ troubleshooting/unlisted.md")
+    LISTED = ("- **L**: 📌 `drbd-socket-guard` on `flannel-mtu`. "
+              "→ troubleshooting/listed.md")
+
+    def _seed_pair(self, tmp_path):
+        mem = tmp_path / "MEMORY.md"
+        mem.write_text(_doc(self.UNLISTED, self.LISTED))
+        _write_home(tmp_path, "troubleshooting/unlisted.md", *EVICTABLE_SIG)
+        _write_home(tmp_path, "troubleshooting/listed.md", *EVICTABLE_SIG)
+        _write_index(tmp_path, "troubleshooting", "listed.md")
+        return mem
+
+    def test_ignore_pins_keeps_unlisted_troubleshooting_file(self, tmp_path):
+        mem = self._seed_pair(tmp_path)
+        res = roll_recent_state(mem, tmp_path / "archive", ignore_pins=True)
+        texts = [ln.rstrip("\n") for ln in res["evicted"]]
+        assert self.UNLISTED not in texts
+        assert self.LISTED in texts
+        after = mem.read_text()
+        assert "**U**" in after
+        assert "**L**" not in after
+
+    def test_ignore_pins_evicts_once_index_lists_it(self, tmp_path):
+        mem = tmp_path / "MEMORY.md"
+        mem.write_text(_doc(self.UNLISTED))
+        _write_home(tmp_path, "troubleshooting/unlisted.md", *EVICTABLE_SIG)
+        _write_index(tmp_path, "troubleshooting", "unlisted.md")
+        res = roll_recent_state(mem, tmp_path / "archive", ignore_pins=True)
+        assert len(res["evicted"]) == 1
+        assert "**U**" not in mem.read_text()
+
+    def test_domain_target_does_not_need_index(self, tmp_path):
+        b = "- **D**: `drbd-socket-guard` on `flannel-mtu`. → domain/security.md"
+        mem = tmp_path / "MEMORY.md"
+        mem.write_text(_doc(b))
+        _write_home(tmp_path, "domain/security.md", *EVICTABLE_SIG)
+        res = roll_recent_state(mem, tmp_path / "archive")
+        assert len(res["evicted"]) == 1
+
+    def test_compound_pointer_keeps_if_any_target_unlisted(self, tmp_path):
+        b = ("- **C**: `drbd-socket-guard` on `flannel-mtu`. "
+             "→ troubleshooting/listed.md + troubleshooting/unlisted.md")
+        mem = tmp_path / "MEMORY.md"
+        mem.write_text(_doc(b))
+        _write_home(tmp_path, "troubleshooting/listed.md", *EVICTABLE_SIG)
+        _write_home(tmp_path, "troubleshooting/unlisted.md", *EVICTABLE_SIG)
+        _write_index(tmp_path, "troubleshooting", "listed.md")
+        content = mem.read_text()
+        res = roll_recent_state(mem, tmp_path / "archive")
+        assert res["evicted"] == []
+        assert mem.read_text() == content
+
+    def test_no_index_file_still_evicts_homed(self, tmp_path):
+        # existing e2e contract: trees without INDEX.md opted out
+        mem = tmp_path / "MEMORY.md"
+        mem.write_text(_doc(EVICTABLE))
+        _write_home(tmp_path, "project/a.md", *EVICTABLE_SIG)
+        res = roll_recent_state(mem, tmp_path / "archive")
+        assert len(res["evicted"]) == 1
+
+    def test_targets_helper_false_on_unlisted(self, tmp_path):
+        _write_home(tmp_path, "troubleshooting/unlisted.md", *EVICTABLE_SIG)
+        _write_index(tmp_path, "troubleshooting", "other.md")
+        assert _targets_index_reachable(self.UNLISTED, tmp_path) is False
+        _write_index(tmp_path, "troubleshooting", "unlisted.md")
+        assert _targets_index_reachable(self.UNLISTED, tmp_path) is True
+
+
+class TestIndexTreesContract:
+    """Two copies of INDEX_TREES / _LISTED_LEFT. If they drift, the deleter
+    and the health scanner disagree and Gap 60 reopens silently."""
+
+    def _mn(self):
+        from importlib.machinery import SourceFileLoader
+        from importlib.util import spec_from_loader, module_from_spec
+        path = Path(__file__).parent.parent / "mnemosyne"
+        loader = SourceFileLoader("mnemosyne_contract", str(path))
+        spec = spec_from_loader(loader.name, loader)
+        mod = module_from_spec(spec)
+        loader.exec_module(mod)
+        return mod
+
+    def test_index_trees_match_mnemosyne(self):
+        mn = self._mn()
+        assert INDEX_TREES == mn.INDEX_TREES
+        assert _LISTED_LEFT == mn._LISTED_LEFT
+
+    def test_listing_agrees_with_scan(self, tmp_path):
+        mn = self._mn()
+        (tmp_path / "project").mkdir()
+        (tmp_path / "project" / "a.md").write_text("# a\n")
+        (tmp_path / "project" / "b.md").write_text("# b\n")
+        (tmp_path / "project" / "INDEX.md").write_text("- [a](a.md)\n")
+        (tmp_path / "troubleshooting").mkdir()
+        (tmp_path / "troubleshooting" / "foo.md").write_text("# f\n")
+        (tmp_path / "troubleshooting" / "bar.md").write_text("# b\n")
+        (tmp_path / "troubleshooting" / "INDEX.md").write_text("- [foo](foo.md)\n")
+        (tmp_path / "feedback").mkdir()
+        (tmp_path / "feedback" / "feedback_alpha.md").write_text("# a\n")
+        (tmp_path / "feedback" / "feedback_beta.md").write_text("# b\n")
+        (tmp_path / "feedback" / "INDEX.md").write_text("alpha is listed\n")
+
+        missing = {(t, k) for t, k, kind in mn.scan_index_completeness(tmp_path)
+                   if kind == "missing"}
+        assert missing == {
+            ("project", "b.md"),
+            ("troubleshooting", "bar.md"),
+            ("feedback", "beta"),
+        }
+        assert index_lists(tmp_path, "project/a.md") is True
+        assert index_lists(tmp_path, "project/b.md") is False
+        assert index_lists(tmp_path, "troubleshooting/foo.md") is True
+        assert index_lists(tmp_path, "troubleshooting/bar.md") is False
+        assert index_lists(tmp_path, "feedback/feedback_alpha.md") is True
+        assert index_lists(tmp_path, "feedback/feedback_beta.md") is False
+        assert index_lists(tmp_path, "domain/security.md") is None

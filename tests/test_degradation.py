@@ -152,3 +152,16 @@ def test_report_rate_and_compaction_split(tmp_path):
     assert rep["events_by_band"]["YELLOW"] == 1
     assert rep["comp_trig"] == {"manual": 1}
     assert rep["comp_pre"] == [292_000]
+
+
+def test_export_empty_returns_1(tmp_path, monkeypatch, capsys):
+    """#202 leftover: empty export's `return 1` was discarded by main().
+
+    Nightly (`gaius-nightly-sync`) already treats `{}` as no-data via stdout
+    compare, so a real rc=1 is compatible (`if export && nonempty`). The
+    sentinel must stay `{}` — do not emit a zeroed payload.
+    """
+    conn = _conn(tmp_path)
+    monkeypatch.setattr(d, "_get_conn", lambda: conn)
+    assert d.cmd_degradation(["export"]) == 1
+    assert capsys.readouterr().out.strip() == "{}"

@@ -5,3 +5,14 @@ __pycache__/
 dist/
 build/
 .venv/
+
+# uv.lock is deliberately NOT tracked. Nothing consumes it: CI installs with
+# `pip install -e ".[mcp,http]"` and the sdist resolves from pyproject.toml, so the
+# lock's only real effect was pinning contributors who follow CONTRIBUTING.md's
+# `uv sync` onto a stale resolution — which is how a fixed-upstream CVE stayed
+# installable here long after the fix shipped. pyproject.toml is the single source
+# of truth for the dependency surface.
+# This entry is load-bearing, not cosmetic: `uv sync` regenerates the lock, and this
+# tree is swept by a nightly `git add -A`, so without the ignore the file returns on
+# its own within a day and the decision silently reverts.
+uv.lock

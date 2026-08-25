@@ -95,7 +95,23 @@ Pass `harness="claude"` (or `"grok"`) when a consumer only understands one harne
 transcript layout — the baton still spawns Claude successors today, so it filters
 to Claude rather than forking a second `~/.claude/sessions/*.json` scanner.
 
-### 5. Baton pass — hand a saturated session to a fresh successor
+### 5. Context spin — HITL loop when a handoff already exists
+
+At RED/BLACK, if a same-skill handoff is already on disk, **do not** fire
+`gaius concord handoff` just to spin context — that is `gaius spin`.
+`gaius-session-handoff --new` still writes a new file and
+`prune_old_handoffs` deletes `existing[3:]`. Bare session-handoff now
+replaces. `gaius baton` is a tombstone.
+
+```bash
+gaius spin --skill mnemos              # reuse; write nothing; print successor card
+cat body | gaius spin --skill mnemos   # replace newest in place; no prune
+```
+
+The operator starts a fresh `grok`/`claude` and types `/{skill}`. Spin does not
+release claims, hot-stamp, or spawn. Spec: `specs/context-spin.md`.
+
+### 6. Baton pass — hand a saturated session to a fresh successor
 
 ```bash
 gaius concord handoff --next "verify quorum,re-run playbook 03"   # or pipe a full body on stdin
@@ -108,8 +124,9 @@ the "stop now" band above it), pushing more work through a degraded working set 
 plan-drift and confidently-wrong creep in.
 `handoff` passes the baton to a fresh context instead. In one command it:
 
-1. **writes a structured handoff** (via `gaius-session-handoff` — a body on stdin, or a
-   skeleton from `--next`),
+1. **writes a structured handoff** (via `gaius-session-handoff --replace` when stdin
+   has a body; empty/--next against an existing same-skill file reuses that file
+   and does not skeletonize it),
 2. **converts this session's active claims into `baton:<resource>` pool tasks** a fresh
    successor can atomically `take` and re-`claim`. The parent's claims are released with
    reason `handed-off`, so nothing is orphaned and no sibling silently double-owns a lane, and

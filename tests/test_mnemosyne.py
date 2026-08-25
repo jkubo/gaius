@@ -1,5 +1,6 @@
 """mnemosyne test suite — memory file health monitor."""
 import io
+import json
 import sys
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -20,6 +21,15 @@ def _load_script(name, path):
 
 
 mn = _load_script("mnemosyne", _REPO / "mnemosyne")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_gaius_staging(tmp_path, monkeypatch):
+    """Gap 63 scans GAIUS_STAGING_DIR / ~/.gaius/staged. Isolate so the live
+    queue cannot trip 'All files within threshold' in unrelated tests."""
+    d = tmp_path / "_empty_staged"
+    d.mkdir()
+    monkeypatch.setenv("GAIUS_STAGING_DIR", str(d))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -160,30 +170,32 @@ class TestContentDefects:
 
 
 class TestMemoryByteBudget:
-    """MEMORY.md injection-budget check (16KB warn / 20KB error). Regressed once
-    when an installed-only copy was overwritten by source — now tested so it can't
-    silently vanish again. Bodies use <180 short lines to isolate bytes from the
-    line-count and runaway-line checks."""
+    """MEMORY.md injection-budget check. Sizes are derived from
+    MEMORY_BYTE_WARN / MEMORY_BYTE_ERR so a recalibration (16/20 → 20/24
+    on 2026-08-13) cannot leave the suite asserting the superseded pair.
+    Bodies use <180 short lines to isolate bytes from the line-count and
+    runaway-line checks."""
 
     def _write(self, d, total_bytes, line_len=100):
         line = "z" * (line_len - 1) + "\n"
         n = total_bytes // line_len
         (d / "MEMORY.md").write_text(line * n)
 
-    def test_over_16kb_is_yellow_advisory(self, tmp_path, capsys):
-        self._write(tmp_path, 17000)                 # 170 lines, GREEN on lines
+    def test_just_over_warn_is_yellow_advisory(self, tmp_path, capsys):
+        self._write(tmp_path, mn.MEMORY_BYTE_WARN + 512)  # GREEN on lines
         mn.cmd_health(tmp_path, [])
         out = capsys.readouterr().out
         assert "YELLOW" in out and "injection-budget" in out
         assert "within threshold" not in out
 
-    def test_over_20kb_emits_blocking_red_marker(self, tmp_path, capsys):
-        self._write(tmp_path, 22100, line_len=130)   # 170 lines, RED on bytes only
+    def test_at_err_emits_blocking_red_marker(self, tmp_path, capsys):
+        # 150 B/line keeps the line-count GREEN (<180) while crossing 24 KB.
+        self._write(tmp_path, mn.MEMORY_BYTE_ERR + 150, line_len=150)
         mn.cmd_health(tmp_path, [])
         out = capsys.readouterr().out
         assert "\033[31m\033[1mRED\033[0m" in out     # pre-commit hook greps this -> blocks
 
-    def test_under_16kb_clean(self, tmp_path, capsys):
+    def test_under_warn_clean(self, tmp_path, capsys):
         self._write(tmp_path, 5100, line_len=51)     # 100 lines, all GREEN
         mn.cmd_health(tmp_path, [])
         assert "within threshold" in capsys.readouterr().out
@@ -928,6 +940,120 @@ class TestScanUngatedTrees:
         assert "All files within threshold" in buf.getvalue()
 
 
+class TestScanSummaryQueue:
+    """scan_summary_queue — Gap 63. The retire→review SUMMARY queue compounded
+    invisibly because cmd_health never reported it, and surgeons skipped it by
+    applying the facts-pending 'not a drain target' rule to the wrong queue.
+
+    Same constraint as Gap 58: report, do NOT rank. RED is a commit blocker.
+    Alert only when unreviewed-with-signal > 0 (the `gaius batch` filter);
+    leftover no-signal `[-]` summaries must not make all-clean unreachable."""
+
+    def _write(self, staging, name, *, reviewed=False, timestamp="2026-08-13T00:00:00Z",
+               sections=None):
+        staging.mkdir(exist_ok=True)
+        body = {
+            "uuid": name.replace(".json", ""),
+            "reviewed": reviewed,
+            "timestamp": timestamp,
+            "sections": sections if sections is not None else {
+                "key_concepts": "a real finding",
+            },
+        }
+        (staging / name).write_text(json.dumps(body))
+
+    def test_signal_unreviewed_is_counted(self, tmp_path):
+        d = tmp_path / "staged"
+        self._write(d, "a.json", timestamp="2026-08-10T12:00:00Z")
+        got = mn.scan_summary_queue(d)
+        assert got == {"unreviewed": 1, "with_signal": 1, "oldest": "2026-08-10"}
+
+    def test_reviewed_with_signal_is_silent(self, tmp_path):
+        """Near-miss: batch does not list reviewed summaries. Counting them
+        would make the banner a lie about the queue a surgeon can still act on."""
+        d = tmp_path / "staged"
+        self._write(d, "done.json", reviewed=True)
+        assert mn.scan_summary_queue(d) == {"unreviewed": 0, "with_signal": 0, "oldest": ""}
+
+    def test_unreviewed_without_signal_is_not_an_alert(self, tmp_path):
+        """The leftover no-signal `[-]` artifacts. They increment unreviewed
+        but must not fire with_signal — otherwise all-clean is unreachable."""
+        d = tmp_path / "staged"
+        self._write(d, "noise.json", sections={"primary_request": "hi"})
+        got = mn.scan_summary_queue(d)
+        assert got["unreviewed"] == 1
+        assert got["with_signal"] == 0
+        assert got["oldest"] == "2026-08-13"
+
+    def test_oldest_is_the_earliest_unreviewed(self, tmp_path):
+        d = tmp_path / "staged"
+        self._write(d, "new.json", timestamp="2026-08-14T00:00:00Z")
+        self._write(d, "old.json", timestamp="2026-07-26T00:00:00Z")
+        self._write(d, "done.json", reviewed=True, timestamp="2026-01-01T00:00:00Z")
+        assert mn.scan_summary_queue(d)["oldest"] == "2026-07-26"
+
+    def test_missing_dir_is_zeros_not_an_error(self, tmp_path):
+        assert mn.scan_summary_queue(tmp_path / "ghost") == {
+            "unreviewed": 0, "with_signal": 0, "oldest": ""}
+
+    def test_unreadable_json_is_skipped(self, tmp_path):
+        d = tmp_path / "staged"
+        d.mkdir()
+        (d / "broken.json").write_text("{not json")
+        self._write(d, "ok.json")
+        got = mn.scan_summary_queue(d)
+        assert got["with_signal"] == 1
+        assert got["unreviewed"] == 1
+
+    def test_same_uuid_last_file_wins(self, tmp_path):
+        """Rescans leave extra files. Counting files (not uuids) was the live
+        597-vs-12 lie. Sorted glob + last write wins, matching load_staged."""
+        d = tmp_path / "staged"
+        self._write(d, "2026-08-01_deadbeef.json", timestamp="2026-08-01T00:00:00Z")
+        body = json.loads((d / "2026-08-01_deadbeef.json").read_text())
+        body["reviewed"] = True
+        body["timestamp"] = "2026-08-14T00:00:00Z"
+        (d / "2026-08-14_deadbeef.json").write_text(json.dumps(body))
+        # force same uuid as the helper's name-derived uuid would differ
+        for p in d.glob("*.json"):
+            data = json.loads(p.read_text())
+            data["uuid"] = "deadbeef"
+            p.write_text(json.dumps(data))
+        assert mn.scan_summary_queue(d) == {
+            "unreviewed": 0, "with_signal": 0, "oldest": ""}
+
+    def test_health_reports_but_never_ranks(self, tmp_path, monkeypatch):
+        (tmp_path / "MEMORY.md").write_text("# index\n")
+        d = tmp_path / "live-staged"
+        self._write(d, "a.json", timestamp="2026-07-26T00:00:00Z")
+        monkeypatch.setenv("GAIUS_STAGING_DIR", str(d))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            mn.cmd_health(tmp_path, [])
+        out = buf.getvalue()
+        assert "summary queue:" in out
+        assert "1 unreviewed-with-signal" in out
+        assert "oldest 2026-07-26" in out
+        assert "RED" not in out
+        assert "All files within threshold" not in out
+
+    def test_health_stays_clean_when_queue_is_empty(self, tmp_path):
+        """all-clean must remain reachable — a banner that can never go silent
+        is one the next session learns to skim (Gap 57)."""
+        (tmp_path / "MEMORY.md").write_text("# index\n")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            mn.cmd_health(tmp_path, [])
+        assert "All files within threshold" in buf.getvalue()
+        assert "summary queue:" not in buf.getvalue()
+
+    def test_signal_sections_match_gaius_extract(self):
+        """Local copy must stay equal to gaius.extract.SIGNAL_SECTIONS.
+        Importing extract from mnemosyne itself is forbidden (standalone)."""
+        from gaius.extract import SIGNAL_SECTIONS
+        assert set(mn.SUMMARY_SIGNAL_SECTIONS) == set(SIGNAL_SECTIONS)
+
+
 class TestScanIndexCompleteness:
     """scan_index_completeness — Gap 55/59. Built for feedback/ in 2026-07-03 after
     64 rules (incl HARD gates) went invisible in the always-injected awareness layer,
@@ -1171,7 +1297,49 @@ class TestScanIndexCompleteness:
         assert "project/ missing: project_b.md" in out
         assert "troubleshooting/ missing: t_b.md" in out
         assert "All files within threshold" not in out
-        assert "RED" not in out          # advisory — never a commit blocker
+        # 🔴 CONTRACT CHANGED 2026-08-23 (mnemos #253, J-authorised): bijection drift is
+        # BLOCKING, not advisory. The old assertion here was `"RED" not in out`.
+        assert "RED" in out              # blocking — the pre-commit hook must see it
+        assert "BLOCKING, reconcile before commit" in out
+
+    @staticmethod
+    def _red_paths(out):
+        """Reproduce the pre-commit hook's parse EXACTLY (.git/hooks/pre-commit:39-51):
+        ANSI-strip, then take field 1 of any line whose LAST field is exactly `RED`."""
+        import re as _re
+        plain = _re.sub(r"\x1b\[[0-9;]*m", "", out)
+        return sorted({ln.split()[0] for ln in plain.splitlines()
+                       if ln.split() and ln.split()[-1] == "RED"})
+
+    def test_drift_red_rows_are_parseable_paths_that_exist(self, tmp_path):
+        """The two failure modes that make this gate worse than useless.
+
+        (1) FAIL-CLOSED DETONATION: the hook blocks EVERY commit on a RED entry whose
+            field 1 is not `*.md`, so a bare key or a `tree/` token wedges the repo.
+        (2) SILENT NO-OP: a path that IS *.md but does not exist on disk (the
+            `project_orphan.md.md` double-extension bug) matches no staged file and
+            therefore never blocks -- a control that looks armed and is not.
+        Both are invisible to a `"RED" in out` assertion, which is why this exists."""
+        (tmp_path / "MEMORY.md").write_text("# index\n")
+        # key mode (stem minus prefix) and link mode (full filename) carry DIFFERENT
+        # keys -- cover both, plus a ghost, or the mode bug reappears unnoticed.
+        self._tree(tmp_path, "feedback", "- [k](feedback_k.md)\n",
+                   ["feedback_k.md", "feedback_unlisted.md"])
+        self._tree(tmp_path, "project", "- [a](project_a.md)\n",
+                   ["project_a.md", "project_b.md"])
+        self._tree(tmp_path, "troubleshooting", "- [gone](t_ghost.md)\n", ["t_a.md"])
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            mn.cmd_health(tmp_path, [])
+        reds = self._red_paths(buf.getvalue())
+        assert reds, "bijection drift emitted no blocking RED row"
+        for rel in reds:
+            assert rel.endswith(".md"), f"fail-closed detonation: {rel!r} is not *.md"
+            assert "…" in rel or (tmp_path / rel).is_file(), \
+                f"silent no-op: {rel!r} matches no file on disk, so it can never block"
+        assert "feedback/feedback_unlisted.md" in reds   # key mode
+        assert "project/project_b.md" in reds            # link mode
+        assert "troubleshooting/INDEX.md" in reds        # ghost -> the index itself
 
     def test_health_stays_clean_when_indexes_are_bijections(self, tmp_path):
         (tmp_path / "MEMORY.md").write_text("# index\n")
@@ -1212,3 +1380,305 @@ class TestScanIndexCompleteness:
         out = buf.getvalue()
         assert "ghost:" in out
         assert "project_gone.md" in out
+
+
+class TestScanOverviewHeader:
+    """Gap 64 (2026-08-23, mnemos #253): `specs/` is fed to NO content-defect detector,
+    which let specs/system-overview.md's `**Last updated**:` field chain to 76 KB inside
+    a 307 KB file before a human noticed. A blanket specs/ add was measured WRONG (0
+    blocking + 91 advisory findings: gap-table rows are 2.2-13.6 KB by design and the
+    changelog legitimately holds a 75,055-char line), so this scans ONE file, ONE field."""
+
+    @staticmethod
+    def _ov(root, header_body):
+        (root / "specs").mkdir(exist_ok=True)
+        (root / "specs" / "system-overview.md").write_text(
+            "# Map\n\n**Last updated**: " + header_body + "\n\nbody\n")
+
+    def test_fires_over_threshold(self, tmp_path):
+        self._ov(tmp_path, "x" * 25000)
+        hits = mn.scan_overview_header(tmp_path)
+        assert hits and hits[0][0] == 3 and hits[0][1] > 25000
+
+    def test_near_miss_stays_silent(self, tmp_path):
+        """Just under the bar must pass, or the gate is a nag rather than a trigger."""
+        self._ov(tmp_path, "x" * (mn.OVERVIEW_HEADER_WARN - 100))
+        assert mn.scan_overview_header(tmp_path) == []
+
+    def test_weighs_bytes_not_characters(self, tmp_path):
+        """Gap 62's lesson, re-armed: the header is emoji/em-dash dense, so a char-count
+        implementation understates it. 7000 x U+1F4CC is 7018 chars but 28018 bytes --
+        this test passes byte-for-byte and FAILS under `len(line)`."""
+        self._ov(tmp_path, "\U0001F4CC" * 7000)
+        hits = mn.scan_overview_header(tmp_path)
+        assert hits and hits[0][1] > 20 * 1024
+
+    def test_missing_file_fails_toward_silence(self, tmp_path):
+        assert mn.scan_overview_header(tmp_path) == []
+
+    def test_absent_header_field_fails_toward_silence(self, tmp_path):
+        (tmp_path / "specs").mkdir()
+        (tmp_path / "specs" / "system-overview.md").write_text("# Map\n\nno field\n")
+        assert mn.scan_overview_header(tmp_path) == []
+
+    def test_never_emits_the_red_token(self, tmp_path):
+        """ADVISORY by construction. The header is rolled by hand and self-clears, so a
+        hard block would wedge the nightly -- unlike bijection drift, which is caused by
+        the very commit that can fix it."""
+        (tmp_path / "MEMORY.md").write_text("# index\n")
+        self._ov(tmp_path, "x" * 25000)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            mn.cmd_health(tmp_path, [])
+        out = buf.getvalue()
+        assert "Last updated" in out and "Gap 64" not in out.split("Last updated")[0]
+        import re as _re
+        plain = _re.sub(r"\x1b\[[0-9;]*m", "", out)
+        assert not [ln for ln in plain.splitlines()
+                    if ln.split() and ln.split()[-1] == "RED"]
+
+    def test_clean_header_keeps_health_all_clean(self, tmp_path):
+        (tmp_path / "MEMORY.md").write_text("# index\n")
+        self._ov(tmp_path, "2026-08-23 (compact entry)")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            mn.cmd_health(tmp_path, [])
+        assert "All files within threshold" in buf.getvalue()
+
+
+class TestPorcelainContract:
+    """`health --porcelain` — Gap 65. The pre-commit hook used to screen-scrape the
+    HUMAN table: ANSI-strip, then `awk '$NF=="RED"{print $1}'`, trusting positional
+    field 1 as a path. Under that parse every table row that ends in the RED token is
+    a path CLAIM, and the drift rows had to be forged table-shaped to be seen at all.
+
+    The machine contract replaces the scrape:
+      stdout : zero or more `RED\\t<relpath>\\t<reason>` lines, NOTHING else.
+      exit   : 0 clean / 1 blocking / 2 internal error (consumers fail closed on >=2).
+    Human mode is untouched and still exits 0 in every case — unknown consumers run it
+    under `set -e`, and it has never returned anything but 0.
+
+    🔴 The canary that matters is `test_both_modes_name_the_same_paths`: two renderers
+    over one finding set desync silently — the human run stays green while the machine
+    gate emits a row matching no staged file, or blocks on a row no human ever saw."""
+
+    @staticmethod
+    def _tree(root, tree, index_body, files):
+        d = root / tree
+        d.mkdir(exist_ok=True)
+        (d / "INDEX.md").write_text(index_body)
+        for name in files:
+            (d / name).write_text("# x\n")
+
+    @staticmethod
+    def _red_paths(out):
+        """Reproduce the legacy pre-commit parse EXACTLY — the thing porcelain
+        replaces. Kept here so the two renderers are compared through the consumer's
+        own eyes, not through an assertion written to agree with itself."""
+        import re as _re
+        plain = _re.sub(r"\x1b\[[0-9;]*m", "", out)
+        return sorted({ln.split()[0] for ln in plain.splitlines()
+                       if ln.split() and ln.split()[-1] == "RED"})
+
+    def _clean(self, root):
+        (root / "MEMORY.md").write_text("# index\n")
+        self._tree(root, "project", "- [a](project_a.md)\n", ["project_a.md"])
+
+    def _drifted(self, root):
+        """Both blocking classes at once, in every shape they come in: key mode
+        (feedback), link mode (project), a ghost, and the MEMORY.md byte-RED.
+        MEMORY.md is sized from MEMORY_BYTE_ERR at 150 B/line so it crosses the byte
+        ceiling while staying GREEN on lines — isolating the byte finding from the
+        line one, which is NOT blocking and must not leak into the comparison."""
+        n = (mn.MEMORY_BYTE_ERR // 150) + 2          # ~165 lines, < the 180 warn
+        (root / "MEMORY.md").write_text(("z" * 149 + "\n") * n)
+        self._tree(root, "feedback", "- [k](feedback_k.md)\n",
+                   ["feedback_k.md", "feedback_unlisted.md"])
+        self._tree(root, "project", "- [a](project_a.md) | [gone](project_gone.md)\n",
+                   ["project_a.md", "project_b.md"])
+        self._tree(root, "troubleshooting", "- [gone](t_ghost.md)\n", ["t_a.md"])
+
+    @staticmethod
+    def _lines(out):
+        return [ln for ln in out.splitlines() if ln]
+
+    def _run_main(self, monkeypatch, root, argv):
+        """Exercise the real dispatch — the exit STATUS is a main() property, and
+        `cmd_health` returning None is only half the contract."""
+        monkeypatch.setattr(sys, "argv",
+                            ["mnemosyne", "--memory-dir", str(root)] + argv)
+        with pytest.raises(SystemExit) as excinfo:
+            mn.main()
+        return excinfo.value.code
+
+    # ── the contract ─────────────────────────────────────────────────────────
+    def test_clean_tree_is_silent_and_exits_zero(self, tmp_path, capsys):
+        self._clean(tmp_path)
+        rc = mn.cmd_health(tmp_path, ["--porcelain"])
+        assert rc == 0
+        assert capsys.readouterr().out == ""
+
+    def test_drift_emits_one_row_per_finding_and_exits_one(self, tmp_path, capsys):
+        self._drifted(tmp_path)
+        rc = mn.cmd_health(tmp_path, ["--porcelain"])
+        out = capsys.readouterr().out
+        assert rc == 1
+        expected = len(mn.scan_index_completeness(tmp_path)) + 1   # + memory-byte-err
+        assert len(self._lines(out)) == expected
+
+    def test_every_row_is_three_tab_separated_fields(self, tmp_path, capsys):
+        self._drifted(tmp_path)
+        mn.cmd_health(tmp_path, ["--porcelain"])
+        out = capsys.readouterr().out
+        for ln in self._lines(out):
+            fields = ln.split("\t")
+            assert len(fields) == 3, f"not 3 tab-separated fields: {ln!r}"
+            assert fields[0] == "RED"
+            assert fields[2] in mn.BLOCK_REASONS, f"unknown reason slug: {ln!r}"
+
+    def test_every_emitted_path_is_md_and_exists_on_disk(self, tmp_path, capsys):
+        """The two ways this gate becomes worse than useless: a non-`.md` field fails
+        the consumer CLOSED (wedging every commit in the repo), and an `.md` path that
+        exists nowhere matches no staged file (a control that looks armed and is not
+        — the `project_orphan.md.md` double-extension bug)."""
+        self._drifted(tmp_path)
+        mn.cmd_health(tmp_path, ["--porcelain"])
+        rows = [ln.split("\t")[1] for ln in self._lines(capsys.readouterr().out)]
+        assert rows
+        for rel in rows:
+            assert rel.endswith(".md"), f"fail-closed detonation: {rel!r} is not *.md"
+            assert (tmp_path / rel).is_file(), \
+                f"silent no-op: {rel!r} matches no file on disk, so it can never block"
+
+    def test_no_ansi_bytes_anywhere_in_porcelain_stdout(self, tmp_path, capsys):
+        """A colour code inside field 1 makes the path un-openable, and the reason
+        slug unmatchable. The human table shares these constants, so an ANSI leak is
+        one careless f-string away."""
+        self._drifted(tmp_path)
+        mn.cmd_health(tmp_path, ["--porcelain"])
+        assert "\x1b" not in capsys.readouterr().out
+
+    def test_porcelain_prints_no_table_or_banner(self, tmp_path, capsys):
+        """`NOTHING else on stdout` — an advisory banner leaking here is parsed as a
+        finding by anything doing `wc -l`."""
+        self._drifted(tmp_path)
+        mn.cmd_health(tmp_path, ["--porcelain"])
+        out = capsys.readouterr().out
+        for token in ("Threshold", "within threshold", "INDEX drift", "⚡", "⚠"):
+            assert token not in out
+
+    def test_memory_byte_red_is_reported_as_its_own_reason(self, tmp_path, capsys):
+        """Blocking is TWO classes, not one. A porcelain that only knew about drift
+        would silently drop the byte gate the moment the hook stopped scraping."""
+        n = (mn.MEMORY_BYTE_ERR // 150) + 2
+        (tmp_path / "MEMORY.md").write_text(("z" * 149 + "\n") * n)
+        rc = mn.cmd_health(tmp_path, ["--porcelain"])
+        assert rc == 1
+        assert self._lines(capsys.readouterr().out) == [
+            f"RED\tMEMORY.md\t{mn.BLOCK_MEMORY_BYTE_ERR}"]
+
+    # ── human mode is untouched ──────────────────────────────────────────────
+    def test_human_mode_still_prints_the_red_table_rows(self, tmp_path, capsys):
+        self._drifted(tmp_path)
+        mn.cmd_health(tmp_path, [])
+        out = capsys.readouterr().out
+        assert "\033[31m\033[1mRED\033[0m" in out
+        assert "INDEX drift" in out and "BLOCKING, reconcile before commit" in out
+        assert self._red_paths(out)
+
+    def test_human_mode_exits_zero_even_on_blocking_findings(self, tmp_path,
+                                                             monkeypatch, capsys):
+        """Unchanged on purpose: today's rc is 0 in all cases and unknown consumers
+        run `mnemosyne health` under `set -e`. Porcelain is where the status lives."""
+        self._drifted(tmp_path)
+        assert self._run_main(monkeypatch, tmp_path, ["health"]) == 0
+        capsys.readouterr()
+
+    def test_main_exits_one_on_porcelain_drift_and_zero_when_clean(self, tmp_path,
+                                                                   monkeypatch, capsys):
+        self._drifted(tmp_path)
+        assert self._run_main(monkeypatch, tmp_path, ["health", "--porcelain"]) == 1
+        capsys.readouterr()
+        clean = tmp_path / "clean"
+        clean.mkdir()
+        self._clean(clean)
+        assert self._run_main(monkeypatch, clean, ["health", "--porcelain"]) == 0
+        assert capsys.readouterr().out == ""
+
+    # ── the desync canary ────────────────────────────────────────────────────
+    def test_both_modes_name_the_same_paths(self, tmp_path, capsys):
+        """The reason `blocking_findings` exists. Two renderers over one finding set
+        drift apart silently — this compares the machine rows against the consumer's
+        own parse of the human table, so a second copy of the row construction reds
+        here before it ships."""
+        self._drifted(tmp_path)
+        mn.cmd_health(tmp_path, ["--porcelain"])
+        machine = sorted({ln.split("\t")[1]
+                          for ln in self._lines(capsys.readouterr().out)})
+        mn.cmd_health(tmp_path, [])
+        human = self._red_paths(capsys.readouterr().out)
+        assert machine == human
+        assert machine, "both modes reported nothing on a deliberately drifted tree"
+
+    # ── failure direction ────────────────────────────────────────────────────
+    def test_internal_error_exits_two_never_zero(self, tmp_path, monkeypatch, capsys):
+        """🔴 A consumer reads 0 as clean and commits. An unexpected exception must
+        land on 2 (fail closed), not on a silent green — the exact failure the
+        scrape had (a crashed run prints no RED, so the hook passed it)."""
+        def _boom(*a, **kw):
+            raise RuntimeError("scanner exploded")
+        monkeypatch.setattr(mn, "scan_index_completeness", _boom)
+        self._drifted(tmp_path)
+        rc = mn.cmd_health(tmp_path, ["--porcelain"])
+        captured = capsys.readouterr()
+        assert rc == 2
+        assert captured.out == ""
+        assert "scanner exploded" in captured.err
+
+    def test_unbuildable_row_is_dropped_not_emitted(self, tmp_path):
+        """Fail toward silence, never toward detonation — applied in BOTH modes
+        because the guard lives in the shared builder."""
+        self._clean(tmp_path)
+        assert mn.blocking_findings(tmp_path, [
+            ("project", "does_not_exist.md", "missing"),   # *.md, but no such file
+            ("project", "a … b", "missing"),               # unparseable
+        ]) == []
+
+    def test_reason_slugs_are_pinned(self, tmp_path):
+        """Slugs are the contract; renaming one silently reclassifies the finding for
+        every consumer. Add a slug, never rename one."""
+        assert mn.BLOCK_INDEX_BIJECTION == "index-bijection"
+        assert mn.BLOCK_MEMORY_BYTE_ERR == "memory-byte-err"
+        assert mn.BLOCK_FILE_OVER_LIMIT == "file-over-limit"
+        assert set(mn.BLOCK_REASONS) == {
+            "index-bijection", "memory-byte-err", "file-over-limit"}
+
+    def test_porcelain_matches_the_scrape_it_replaced(self, tmp_path):
+        """🔴 REGRESSION GUARD (mnemos #253). Porcelain shipped covering only
+        index-bijection + memory-byte-err, but the hook it replaced screen-scraped EVERY
+        table row ending in the RED token -- so an oversized file DID block a commit and
+        would silently have stopped blocking. A replacement gate must never be weaker
+        than the one it replaces. The fixture MUST contain an over-limit file: the
+        original desync canary passed only because its fixture had none."""
+        (tmp_path / "MEMORY.md").write_text("# index\n")
+        (tmp_path / "common.md").write_text("# common\n")
+        (tmp_path / "domain").mkdir()
+        (tmp_path / "domain" / "big.md").write_text("line\n" * 900)   # past domain err
+        for tree in ("feedback", "project", "troubleshooting"):
+            (tmp_path / tree).mkdir()
+            (tmp_path / tree / "INDEX.md").write_text("# idx\n")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            mn.cmd_health(tmp_path, [])
+        legacy = self._red_paths_from_human(buf.getvalue())
+        porcelain = {r for r, _ in mn.blocking_findings(tmp_path)}
+        assert "domain/big.md" in porcelain, "over-limit file stopped blocking"
+        assert legacy == porcelain, f"gate weakened: scrape={legacy} porcelain={porcelain}"
+
+    @staticmethod
+    def _red_paths_from_human(out):
+        """The pre-porcelain hook parse, kept as the parity oracle."""
+        import re as _re
+        plain = _re.sub(r"\x1b\[[0-9;]*m", "", out)
+        return {ln.split()[0] for ln in plain.splitlines()
+                if ln.split() and ln.split()[-1] == "RED"}

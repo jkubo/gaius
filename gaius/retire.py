@@ -46,7 +46,8 @@ from gaius.extract import (
     classify_procedure, extract_procedure, sample_entry, tag_domains,
     tag_domains_from_specs, extract_delta_lines, load_domain_specs,
     is_gemini_cold, strip_bloat, GEMINI_NOISE_SUBJECTS, GEMINI_CREDENTIAL_PATTERNS,
-    CREDENTIAL_PATTERNS, _is_noise, _seeded_score, _extract_clarified_intent,
+    CREDENTIAL_PATTERNS, has_credential, RE_SECRET_PREFIX, _is_noise,
+    _seeded_score, _extract_clarified_intent,
     DECISION_KEYWORDS, _ERROR_KEYWORDS,
 )
 from gaius.facts import (
@@ -129,6 +130,12 @@ def _mine_session(path: Path) -> dict | None:
                 if _is_noise(text):
                     continue
 
+                # Credential reject — BEFORE scoring, not after. Scoring is
+                # what promotes; a post-score check would still have handed
+                # classify_finding() the material. See test_credential_drop.
+                if has_credential(text):
+                    continue
+
                 # Score the block
                 score = boost_score(text, base_score)
                 _, score = classify_finding(text, entry_type, score)
@@ -146,6 +153,11 @@ def _mine_session(path: Path) -> dict | None:
             content = str(entry.get("content", ""))
             if len(content) < 100:
                 continue
+            # Highest-risk intake path: this branch keeps text *because* it
+            # looks like an error, and a rejected-auth traceback is the most
+            # common way a live token gets pasted into a session.
+            if has_credential(content):
+                continue
             content_lower = content.lower()
             if any(kw in content_lower for kw in _ERROR_KEYWORDS):
                 # Truncate long error outputs
@@ -158,9 +170,10 @@ def _mine_session(path: Path) -> dict | None:
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "text":
                         text = block.get("text", "").strip()
-                        if len(text) > 30:
+                        if len(text) > 30 and not has_credential(text):
                             user_context.append(text)
-            elif isinstance(content, str) and len(content) > 30:
+            elif isinstance(content, str) and len(content) > 30 \
+                    and not has_credential(content):
                 user_context.append(content.strip())
 
     # Need minimum signal to stage
@@ -293,6 +306,19 @@ def _promote_mined_to_facts(conn: sqlite3.Connection, session_stem: str,
             # Skip noise one more time at promotion boundary
             if _is_noise(line):
                 continue
+            # Credential guard — the same boundary every peer parser already
+            # enforces (parsers.py:232/266/292/319/401/528/597). Claude session
+            # prose is mined free-form, so without this a `_TOKEN=`/`password=`
+            # line lands in facts.db, which is S3-synced and injected into every
+            # future session of every agent. CREDENTIAL_PATTERNS was imported at
+            # module top since the split but had zero call sites here.
+            #
+            # 2026-08-14: widened from the bare CREDENTIAL_PATTERNS substrings to
+            # has_credential(), which is that tuple UNIONed with the vendor-shape
+            # regex. The five `key=` substrings match no vendor-issued token, so
+            # ghp_/sk-ant-/AKIA/hvs./tskey- all walked past this guard.
+            if has_credential(line):
+                continue
             blocks.append(line)
 
     for block in blocks:
@@ -369,7 +395,16 @@ def cmd_retire(args):
                 fact_text = ev["signal"]
                 provenance = ev["source"]
                 outcome = ev["outcome"]
-                
+
+                # Credential guard — parse_claude_events (parsers.py:45) filters
+                # boilerplate and _is_noise but NOT credentials, unlike every other
+                # parser in that module. `outcome` is the exposure that matters: it
+                # is up to 2000 chars of raw tool_result, so checking only fact_text
+                # (a 500-char summary line) would let the payload through.
+                # (widened to has_credential 2026-08-14 — see _promote_mined_to_facts)
+                if has_credential(fact_text) or has_credential(outcome or ""):
+                    continue
+
                 # Derive a deterministic key from the signal
                 fact_key = hashlib.sha256(f"{path.stem}:{fact_text}".encode()).hexdigest()[:16]
                 
@@ -1065,6 +1100,15 @@ def process_session(path, sample_rate, index_path, archive=True):
             elif etype.startswith("tool_result"):
                 text = str(entry.get("content", ""))
 
+            # Credential reject — before scoring, and therefore before the
+            # corpus write below. An entry admitted past here is persisted
+            # VERBATIM as strip_bloat(entry) into ~/.gaius/corpus/YYYY-MM/,
+            # which is how a live sk-ant key reached that directory (audit
+            # 2026-08-14). Skipping costs one entry's domain stats; keeping
+            # it costs a credential at rest. See tests/test_credential_drop.
+            if has_credential(text):
+                continue
+
             score = boost_score(text, base_score)
             etype, score = classify_finding(text, etype, score)
             etype, score = classify_procedure(text, etype, score)
@@ -1212,23 +1256,34 @@ def archive_session(path, strip_before_archive=True):
     upload_path = str(path)
     tmp_path = None
 
-    if strip_before_archive:
-        try:
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as tmp:
-                tmp_path = tmp.name
-                with open(path) as src:
-                    for line in src:
-                        try:
-                            entry = json.loads(line)
-                            stripped = strip_bloat(entry)
-                            tmp.write(json.dumps(stripped) + "\n")
-                        except json.JSONDecodeError:
-                            tmp.write(line)
-            upload_path = tmp_path
-        except Exception as e:
-            print(f"  ⚠️  Bloat strip failed, archiving raw: {e}", file=sys.stderr)
-            upload_path = str(path)
-            tmp_path = None
+    # Credential scrub is UNCONDITIONAL — it is not gated on
+    # strip_before_archive, because bloat-stripping and secret-removal are
+    # different jobs and callers disable the former for size, not safety.
+    # This is the third S3 egress path for session bytes (the other two are
+    # the rclone calls in gaius-session-stop / gaius-nightly-sync, both now
+    # routed through hooks/gaius-scrub-upload).
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as tmp:
+            tmp_path = tmp.name
+            with open(path) as src:
+                for line in src:
+                    try:
+                        entry = json.loads(line)
+                        out = json.dumps(strip_bloat(entry) if strip_before_archive else entry)
+                    except json.JSONDecodeError:
+                        out = line.rstrip("\n")
+                    tmp.write(RE_SECRET_PREFIX.sub("«REDACTED-CREDENTIAL»", out) + "\n")
+        upload_path = tmp_path
+    except Exception as e:
+        # FAIL CLOSED. The previous behaviour here was to fall back to
+        # archiving the RAW file on any exception, which would hand this
+        # function a documented path for shipping unscrubbed credentials to
+        # S3 — precisely the leak this scrub exists to stop.
+        print(f"  ⚠️  Scrub/strip failed — archive ABORTED (not archiving raw): {e}",
+              file=sys.stderr)
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        return None
 
     try:
         subprocess.run([

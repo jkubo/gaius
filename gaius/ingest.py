@@ -29,6 +29,18 @@ from gaius._core import (
 from gaius.extract import SECRET_KEYS_RE, load_domain_specs, tag_domains_from_specs
 from gaius.facts import init_db, upsert_fact
 
+# Synthetic session identity for the two infrastructure-ingest paths. These mine a
+# filesystem tree, not an agent session, so there is no real session UUID to thread
+# — same situation as reconcile.py, which passes session_uuid="reconcile".
+#
+# Deliberately CONSTANT, not per-run: upsert_fact's _corroborate appends any unseen
+# session_uuid to the row's `sessions` JSON array, so a timestamped value would grow
+# that array by one entry on every nightly run, on every corroborated fact, forever.
+# A constant keeps it at exactly one entry and still attributes the fact to its source.
+_SESSION_ANSIBLE = "ansible"
+_SESSION_ALIASES = "aliases"
+
+
 def cmd_ansible(args):
     """Scan Ansible inventory and manifests, extract operational facts."""
     parser = argparse.ArgumentParser(prog="gaius ansible")
@@ -105,6 +117,7 @@ def cmd_ansible(args):
                         fact_key=fk,
                         fact_text=fact_text,
                         agent="gaius-ansible",
+                        session_uuid=_SESSION_ANSIBLE,
                         provenance="ansible",
                         score=0.7,
                         model_family="human",
@@ -156,6 +169,7 @@ def cmd_ansible(args):
                                 fact_key=fk,
                                 fact_text=fact_text,
                                 agent="gaius-ansible",
+                                session_uuid=_SESSION_ANSIBLE,
                                 provenance="ansible",
                                 score=0.75,
                                 model_family="human",
@@ -246,6 +260,7 @@ def cmd_aliases(args):
                         fact_key=fk,
                         fact_text=fact_text,
                         agent="gaius-aliases",
+                        session_uuid=_SESSION_ALIASES,
                         provenance="aliases",
                         score=0.65,
                         model_family="human",
@@ -271,6 +286,7 @@ def cmd_aliases(args):
                         fact_key=fk,
                         fact_text=fact_text,
                         agent="gaius-aliases",
+                        session_uuid=_SESSION_ALIASES,
                         provenance="aliases",
                         score=0.6,
                         model_family="human",
@@ -304,6 +320,7 @@ def cmd_aliases(args):
                                 fact_key=fk,
                                 fact_text=fact_text,
                                 agent="gaius-aliases",
+                                session_uuid=_SESSION_ALIASES,
                                 provenance="aliases",
                                 score=0.8,  # Very high confidence from documented corpus
                                 model_family="human",

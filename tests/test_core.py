@@ -949,3 +949,62 @@ class TestSaveStagedPathTraversal:
             "timestamp": "2026-07-16T03:00:00Z", "uuid": "abcd1234ef",
             "sections": {"key_concepts": "y"}, "reviewed": True})
         assert (staging / "2026-07-16T03-00-00_abcd1234.json").exists()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# main() return-code contract (#202 leftover / #206)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestMainHonorsHandlerReturn:
+    """main() used to discard every subcommand return. A `return 1` looked like
+    success. Honor exact int only — None stays implicit 0; bool is a subclass
+    of int and must not become an exit code.
+    """
+
+    def _run(self, monkeypatch, handler, argv):
+        from gaius import _core
+        monkeypatch.setattr(_core, "COMMANDS", {"probe": handler, "completion": handler})
+        monkeypatch.setattr(_core, "init_db", lambda: None)
+        monkeypatch.setattr(sys, "argv", ["gaius"] + argv)
+        _core.main()
+
+    def test_return_1_exits_1(self, monkeypatch):
+        with pytest.raises(SystemExit) as exc:
+            self._run(monkeypatch, lambda _a: 1, ["probe"])
+        assert exc.value.code == 1
+
+    def test_return_0_exits_0(self, monkeypatch):
+        with pytest.raises(SystemExit) as exc:
+            self._run(monkeypatch, lambda _a: 0, ["probe"])
+        assert exc.value.code == 0
+
+    def test_return_none_is_implicit_success(self, monkeypatch):
+        self._run(monkeypatch, lambda _a: None, ["probe"])
+
+    def test_bool_true_is_not_an_exit_code(self, monkeypatch):
+        self._run(monkeypatch, lambda _a: True, ["probe"])
+
+    def test_non_int_is_ignored(self, monkeypatch):
+        self._run(monkeypatch, lambda _a: {"oops": 1}, ["probe"])
+
+    def test_completion_path_also_honors(self, monkeypatch):
+        with pytest.raises(SystemExit) as exc:
+            self._run(monkeypatch, lambda _a: 1, ["completion"])
+        assert exc.value.code == 1
+
+    def test_cli_process_wait_status_interp_missing(self, tmp_path):
+        """PATH-gaius $? — TestMainHonorsHandlerReturn only catches SystemExit
+        from a monkeypatched lambda. Nightly/mine-pillars classify `rc=$?` on a
+        real process. #208 critic: that modality was missing.
+        """
+        import subprocess
+        env = dict(os.environ, HOME=str(tmp_path), GAIUS_CONFIG="/dev/null",
+                   PYTHONPATH=str(_REPO))
+        env.pop("PYTEST_CURRENT_TEST", None)
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; from gaius._core import main; "
+             "sys.argv = ['gaius', 'interp', 'show', 'no-such-sample-xyz']; main()"],
+            capture_output=True, text=True, env=env, cwd=str(_REPO), timeout=120)
+        assert result.returncode == 1
+        assert "no such sample" in (result.stdout + result.stderr)

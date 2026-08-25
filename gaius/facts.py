@@ -214,6 +214,13 @@ def init_db(db_path: Path = None) -> sqlite3.Connection:
         # aggregation counter; kg_indexed_at = incremental-index watermark
         "ALTER TABLE triples ADD COLUMN weight INTEGER DEFAULT 1",
         "ALTER TABLE facts ADD COLUMN kg_indexed_at TEXT",
+
+        # Leitner boxes for `gaius quiz` (v0.2). Weighted-draw scheduler lives
+        # in gaius.leitner; these columns are the per-fact progress record.
+        "ALTER TABLE facts ADD COLUMN leitner_box INTEGER DEFAULT 0",
+        "ALTER TABLE facts ADD COLUMN leitner_seen INTEGER DEFAULT 0",
+        "ALTER TABLE facts ADD COLUMN leitner_correct INTEGER DEFAULT 0",
+        "ALTER TABLE facts ADD COLUMN leitner_wrong INTEGER DEFAULT 0",
     ]:
         try:
             conn.execute(_migration)
@@ -246,6 +253,24 @@ def init_db(db_path: Path = None) -> sqlite3.Connection:
             conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS fact_embeddings USING vec0(embedding float[{_EMBED_DIM}], fact_id integer)")
         except sqlite3.OperationalError:
             pass  # already exists or vec0 not available
+
+    # Memory-file embedding cache (2026-08-22). Facts get their embeddings indexed
+    # once and batch-loaded; memory files never did — the inject semantic gate
+    # re-embedded every surviving candidate LIVE on every call, one unix-socket
+    # round trip each (embed.py `_embed_text`, 2s timeout apiece) across ~360 files.
+    # Measured at ~5.9s of the UserPromptSubmit hook's 8s budget. Memory files are
+    # static between edits, so the vector is a pure function of the embed input.
+    #
+    # Deliberately NOT vec0: this is a keyed lookup by content hash, never an ANN
+    # search, and the memory gate runs even when sqlite-vec is unavailable — so
+    # this table must exist independently of HAS_SQLITE_VEC.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS memory_file_embeddings (
+            content_hash TEXT PRIMARY KEY,
+            embedding    BLOB NOT NULL,
+            created_at   TEXT
+        )
+    """)
 
     conn.commit()
     return conn

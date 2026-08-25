@@ -129,9 +129,73 @@ def test_log_tool_event_unserializable_input(tmp_path, monkeypatch):
     assert len(_rows(tmp_path)) == 1   # default=str fallback, still logged
 
 
+# ── before/after state capture (BA-1, 2026-08-13) ────────────────────────────
+def test_state_and_result_hashes_land(tmp_path, monkeypatch):
+    _fresh(tmp_path, monkeypatch)
+    t.log_tool_event("sess-ba", "Edit", {"file_path": "/x", "old_string": "a"},
+                     event="post", state_sha256="deadbeef" * 8,
+                     result_sha256="cafef00d" * 8)
+    r = _rows(tmp_path)[0]
+    assert r["state_sha256"] == "deadbeef" * 8
+    assert r["result_sha256"] == "cafef00d" * 8
+
+
+def test_state_fields_default_null(tmp_path, monkeypatch):
+    _fresh(tmp_path, monkeypatch)
+    t.log_tool_event("sess-ba2", "Bash", {"command": "ls"})
+    r = _rows(tmp_path)[0]
+    assert r["state_sha256"] is None
+    assert r["result_sha256"] is None
+
+
+def test_migration_adds_columns_to_preexisting_db(tmp_path, monkeypatch):
+    """A DB created before BA-1 (no state/result columns, existing rows) must
+    gain the columns via ALTER TABLE and keep its rows — the real
+    ~/.gaius/telemetry.db has 46k+ pre rows CREATE TABLE IF NOT EXISTS
+    cannot touch."""
+    db = tmp_path / "telemetry.db"
+    c = sqlite3.connect(str(db))
+    c.execute("""CREATE TABLE tool_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts REAL NOT NULL, session_id TEXT, tool_name TEXT,
+        args_sha256 TEXT, args_redacted TEXT,
+        source TEXT DEFAULT 'hook', event TEXT DEFAULT 'pre', project TEXT)""")
+    c.execute("INSERT INTO tool_events (ts, session_id, tool_name) VALUES (1.0, 'old', 'Bash')")
+    c.commit()
+    c.close()
+    _fresh(tmp_path, monkeypatch)
+    t.log_tool_event("sess-mig", "Edit", {"file_path": "/y"},
+                     event="post", state_sha256="abc123", result_sha256="def456")
+    rows = _rows(tmp_path)
+    assert len(rows) == 2                       # pre-existing row survives
+    assert rows[0]["session_id"] == "old"
+    assert rows[0]["state_sha256"] is None      # NULL = "not captured then"
+    assert rows[1]["state_sha256"] == "abc123"
+    assert rows[1]["result_sha256"] == "def456"
+
+
+def test_failed_migration_degrades_to_legacy_insert(tmp_path, monkeypatch):
+    """If the ALTERs never landed (locked/readonly DB at init), rows must still
+    be logged with the legacy column list — NOT silently dropped for the life
+    of the cached connection (the long-lived MCP server never re-inits)."""
+    _fresh(tmp_path, monkeypatch)
+    t.log_tool_event("warm", "Bash", {"command": "true"})   # init schema normally
+    monkeypatch.setattr(t, "_BA1_COLS_OK", False)
+    t.log_tool_event("degraded", "Edit", {"file_path": "/x"},
+                     event="post", state_sha256="zz", result_sha256="yy",
+                     call_id="toolu_x")
+    rows = _rows(tmp_path)
+    assert len(rows) == 2                       # the row landed anyway
+    assert rows[1]["session_id"] == "degraded"
+    assert rows[1]["state_sha256"] is None      # new fields dropped, row kept
+    assert rows[1]["call_id"] is None
+
+
 # ── CLI entry (what gaius-observe pipes into) ────────────────────────────────
-def _run_cli(tmp_path, payload, args=("pre", "proj12345678")):
+def _run_cli(tmp_path, payload, args=("pre", "proj12345678"), extra_env=None):
     env = {**os.environ, "GAIUS_TELEMETRY_DB": str(tmp_path / "telemetry.db")}
+    env.pop("GAIUS_STATE_SHA256", None)   # isolate from any ambient hook env
+    env.update(extra_env or {})
     return subprocess.run(
         [sys.executable, "-m", "gaius.telemetry", "tool-event", *args],
         input=json.dumps(payload).encode(), env=env,
@@ -163,6 +227,54 @@ def test_cli_grok_envelope(tmp_path):
     rows = _rows(tmp_path)
     assert rows[0]["session_id"] == "sess-grok"
     assert rows[0]["tool_name"] == "run_terminal_command"
+
+
+def test_cli_pre_post_pair_share_args_hash(tmp_path):
+    """The BA-1 join contract: a pre row and its post row carry the SAME
+    args_sha256 (hash covers tool_input only — the post envelope's added
+    tool_response must not perturb it), so (session_id, args_sha256) pairs
+    before/after with no new plumbing."""
+    tool_input = {"file_path": "/tmp/f.txt", "content": "hello"}
+    pre_env = {"session_id": "sess-pair", "tool_name": "Write",
+               "tool_input": tool_input, "tool_use_id": "toolu_pair1"}
+    post_env = {**pre_env, "tool_response": {"success": True, "filePath": "/tmp/f.txt"}}
+    assert _run_cli(tmp_path, pre_env, args=("pre", "p1")).returncode == 0
+    assert _run_cli(tmp_path, post_env, args=("post", "p1"),
+                    extra_env={"GAIUS_STATE_SHA256": "f" * 64}).returncode == 0
+    rows = _rows(tmp_path)
+    assert len(rows) == 2
+    pre, post = rows
+    assert (pre["event"], post["event"]) == ("pre", "post")
+    assert pre["args_sha256"] == post["args_sha256"]        # the fallback join key
+    assert pre["call_id"] == post["call_id"] == "toolu_pair1"   # the exact key
+    assert post["result_sha256"] == t.hash_args({"success": True, "filePath": "/tmp/f.txt"})
+    assert post["state_sha256"] == "f" * 64                 # from GAIUS_STATE_SHA256
+    assert pre["result_sha256"] is None                     # no response pre-call
+
+
+def test_cli_response_hashed_never_stored(tmp_path):
+    """tool_response content must never land in the DB — only its sha256."""
+    marker = "UNIQUE-RESPONSE-CONTENT-xyzzy"
+    proc = _run_cli(tmp_path, {
+        "session_id": "s", "tool_name": "Read",
+        "tool_input": {"file_path": "/tmp/r"},
+        "tool_response": {"output": marker},
+    }, args=("post", "p2"))
+    assert proc.returncode == 0
+    r = _rows(tmp_path)[0]
+    assert len(r["result_sha256"]) == 64
+    dump = json.dumps(r)
+    assert marker not in dump
+
+
+def test_cli_grok_camelcase_response(tmp_path):
+    proc = _run_cli(tmp_path, {
+        "sessionId": "sess-grok-post", "toolName": "edit_file",
+        "toolInput": {"path": "/tmp/g"}, "toolResponse": {"ok": True},
+    }, args=("post", "p3"))
+    assert proc.returncode == 0
+    r = _rows(tmp_path)[0]
+    assert r["result_sha256"] == t.hash_args({"ok": True})
 
 
 def test_cli_garbage_stdin_exits_zero(tmp_path):

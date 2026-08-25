@@ -75,6 +75,22 @@ def _fill(usage: dict) -> int:
     )
 
 
+def _cache_split(usage: dict) -> tuple:
+    """(cache_read, cache_creation) — the two components `_fill` sums and then discards.
+
+    Kept separate because their PRICES differ by ~12x (read ≈0.1x base input, write ≈1.25x)
+    and because their RATIO is the health signal, not either number alone. A stable prefix
+    yields a large read against a small write on every turn after the first (measured
+    2026-08-13 on a live session: ~139K read vs ~1.4K written, input_tokens=2). Cache
+    invalidation inverts that at an IDENTICAL `total`, which is exactly why the fuel
+    columns cannot detect it.
+    """
+    return (
+        int(usage.get("cache_read_input_tokens", 0) or 0),
+        int(usage.get("cache_creation_input_tokens", 0) or 0),
+    )
+
+
 def _main_assistant_usage(obj: dict):
     """usage dict of a MAIN (non-sidechain, non-meta) assistant turn, else None.
 
@@ -175,8 +191,10 @@ def detect_events(path):
                         last_request = rid
                         turn += 1
                         f = floor if floor is not None else cur
+                        c_read, c_create = _cache_split(usage)
                         turns.append({"turn_index": turn, "ts": ts,
-                                      "working": max(0, cur - f), "total": cur, "floor": f})
+                                      "working": max(0, cur - f), "total": cur, "floor": f,
+                                      "cache_read": c_read, "cache_creation": c_create})
                     msg = obj.get("message") or {}
                     # record tool_use blocks for later tool_result attribution
                     content = msg.get("content")
@@ -264,6 +282,8 @@ def _init_schema(conn):
             working     INTEGER,   -- raw working-set tokens (total - floor); band derived at read
             total       INTEGER,   -- raw total context fill
             floor       INTEGER,   -- raw session floor (first assistant turn)
+            cache_read  INTEGER,   -- cache_read_input_tokens: prefix served from cache (~0.1x input rate)
+            cache_creation INTEGER,-- cache_creation_input_tokens: prefix WRITTEN to cache (~1.25x)
             scanned_at  REAL,
             PRIMARY KEY (session_id, turn_index)
         );
@@ -285,6 +305,22 @@ def _init_schema(conn):
         CREATE INDEX IF NOT EXISTS idx_degr_session ON degradation_events(session_id);
         CREATE INDEX IF NOT EXISTS idx_turnfuel_session ON turn_fuel(session_id);
     """)
+    # Schema migrations — safe to run on existing DBs (ignore duplicate column errors).
+    #
+    # cache_read/cache_creation added 2026-08-13. `_fill` already parsed BOTH fields and
+    # summed them into `total`, discarding the split — so the one regression that actually
+    # costs money was unobservable by construction: a volatile line entering the cached
+    # prefix (a timestamp in CLAUDE.md, a per-turn injection moved into the system block)
+    # turns a ~140K-token cache READ into a ~140K cache WRITE at ~12x the price, at an
+    # IDENTICAL `total`. Neither `working` nor `total` can see it; only the split can.
+    for _migration in [
+        "ALTER TABLE turn_fuel ADD COLUMN cache_read INTEGER",
+        "ALTER TABLE turn_fuel ADD COLUMN cache_creation INTEGER",
+    ]:
+        try:
+            conn.execute(_migration)
+        except sqlite3.OperationalError:
+            pass  # column already exists
     conn.commit()
 
 
@@ -293,12 +329,17 @@ def store(conn, session_id, turns, events):
     now = time.time()
     for t in turns:
         conn.execute(
-            """INSERT INTO turn_fuel (session_id, turn_index, ts, working, total, floor, scanned_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)
+            """INSERT INTO turn_fuel (session_id, turn_index, ts, working, total, floor,
+                                      cache_read, cache_creation, scanned_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(session_id, turn_index) DO UPDATE SET
                  ts=excluded.ts, working=excluded.working, total=excluded.total,
-                 floor=excluded.floor, scanned_at=excluded.scanned_at""",
-            (session_id, t["turn_index"], t["ts"], t["working"], t["total"], t["floor"], now),
+                 floor=excluded.floor, cache_read=excluded.cache_read,
+                 cache_creation=excluded.cache_creation, scanned_at=excluded.scanned_at""",
+            # .get() not [] — older callers (and the test fixtures) build turn dicts without
+            # the cache keys; a missing key must write NULL, not raise inside the marathon lap.
+            (session_id, t["turn_index"], t["ts"], t["working"], t["total"], t["floor"],
+             t.get("cache_read"), t.get("cache_creation"), now),
         )
     ev_written = 0
     for e in events:
@@ -323,6 +364,155 @@ def _percentile(sorted_vals, p):
     lo = int(k)
     hi = min(lo + 1, len(sorted_vals) - 1)
     return int(sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (k - lo))
+
+
+# ── Prompt-cache health (2026-08-13) ───────────────────────────────────────────
+# WHY A RATIO AND NOT A COUNT: cache_read scales with session length, so a raw total
+# says nothing. What is diagnostic is the SHARE of billed input served from cache.
+# `total` = input + cache_read + cache_creation, so uncached input is derivable.
+CACHE_MIN_TURNS = 20      # short sessions are structurally cold (turn 1 is all write)
+CACHE_HIT_WARN = 0.90     # TODO(J): policy. 0.90 is defensible, not measured-optimal.
+
+# ⚠️ A LOW AGGREGATE IS NOT AUTOMATICALLY A BUG — read it against `comp_trig` first.
+# Measured 2026-08-13 on one live session: steady-state turns ran 99.7–99.9%, but the
+# whole-session aggregate came out 96.1%. The gap is not invalidation, it is COMPACTION:
+# every compact boundary rebuilds the prefix, which bills as cache_creation, and turn 1
+# is all-write by definition. So a heavily-compacted session looks "cold" and is fine.
+# The regression this metric is actually for looks different — a sustained per-turn
+# collapse with NO compact_boundary event to explain it. Alerting on the aggregate alone
+# would page on healthy long sessions, which is the failure mode `pvc-auto-expand` already
+# demonstrates on the alerts channel (see domain/recurring-alerts.md).
+
+
+def cache_stats(conn, min_turns: int = CACHE_MIN_TURNS, window_days=None):
+    """Aggregate + per-session prompt-cache hit rate. None if no scanned rows carry it.
+
+    Rows written before 2026-08-13 have NULL cache columns and are excluded rather than
+    counted as zero — absence of a measurement is not a measurement of zero (same rule the
+    aborted-turn guard applies in `_main_assistant_usage`).
+
+    🔴 `window_days=None` is a LIFETIME cumulative average and is NOT a monitoring signal.
+    `turn_fuel` only ever upserts — it has no retention — so as the table grows the lifetime
+    figure asymptotes and a total cache collapse in one session moves it by ~0. That is the
+    unfirable-evaluator class: a number that cannot show the thing it claims to watch. It is
+    fine for a human reading `report` ("what has my cache done overall"), and it is the WRONG
+    input for an alert or a trend panel. Export windows it (see CACHE_EXPORT_WINDOWS).
+    """
+    where, params = "cache_read IS NOT NULL", []
+    if window_days is not None:
+        where += " AND ts >= ?"
+        params.append(time.time() - window_days * 86400)
+    agg = conn.execute(
+        "SELECT COUNT(*) n, SUM(cache_read) r, SUM(cache_creation) w, "
+        "       SUM(total - cache_read - cache_creation) i "
+        f"FROM turn_fuel WHERE {where}",
+        params,
+    ).fetchone()
+    if not agg or not agg["n"]:
+        return None
+    per = conn.execute(
+        "SELECT session_id, COUNT(*) turns, SUM(cache_read) r, SUM(cache_creation) w, "
+        "       SUM(total - cache_read - cache_creation) i "
+        f"FROM turn_fuel WHERE {where} "
+        "GROUP BY session_id HAVING turns >= ? ORDER BY "
+        "  (1.0 * SUM(cache_read)) / NULLIF(SUM(total), 0) ASC LIMIT 5",
+        (*params, min_turns),
+    ).fetchall()
+    def _rate(r, w, i):
+        billed = (r or 0) + (w or 0) + (i or 0)
+        return (r or 0) / billed if billed else 0.0
+    return {
+        "turns": agg["n"], "read": agg["r"] or 0, "written": agg["w"] or 0,
+        "input": agg["i"] or 0, "hit": _rate(agg["r"], agg["w"], agg["i"]),
+        "worst": [(s["session_id"][:8], s["turns"], _rate(s["r"], s["w"], s["i"])) for s in per],
+    }
+
+
+# ── Export (S3 → in-cluster CronJob → OTLP → Mimir; J's call 2026-08-13) ───────
+# 🔴 COLUMN ALLOWLIST — NOT A TABLE DUMP. This is the only function in gaius that
+# writes telemetry off the machine, and `telemetry.db` also holds `thinking_turns` /
+# `thinking_terms`: raw chain-of-thought text under a hard never-served, never-shipped,
+# never-synced constraint (specs/gaius-modularization-leitner.md). The dict is built
+# field-by-field from this tuple ON PURPOSE, so that exporting anything new requires
+# editing the allowlist rather than widening a query. Do not "generalise" this into a
+# table exporter — that refactor will look reasonable in review and is exactly how CoT
+# text leaves the machine. Session IDs are excluded too (`worst` is deliberately dropped):
+# five integers go out, nothing that identifies a session or its content.
+CACHE_EXPORT_FIELDS = ("turns", "read", "written", "input", "hit")
+
+
+def export_cache_metrics(conn):
+    """The 5 numeric aggregates cleared for export. None if no rows carry cache data."""
+    cs = cache_stats(conn)
+    if cs is None:
+        return None
+    return {k: cs[k] for k in CACHE_EXPORT_FIELDS}
+
+
+# (days, label). None = lifetime. The SHORT windows are the monitoring signal; lifetime rides
+# along only as context — see the cache_stats docstring for why it can never alert.
+CACHE_EXPORT_WINDOWS = ((1, "1d"), (7, "7d"), (None, "lifetime"))
+
+
+def _otlp_point(value, ts_nano, attrs, as_int=False):
+    return {
+        ("asInt" if as_int else "asDouble"): (int(value) if as_int else float(value)),
+        "timeUnixNano": str(ts_nano),
+        "attributes": [
+            {"key": k, "value": {"stringValue": v}} for k, v in attrs.items()
+        ],
+    }
+
+
+def export_cache_otlp(conn):
+    """Windowed cache health as an OTLP/JSON metrics payload. None if nothing to send.
+
+    Shaped HERE, on the workstation, so the in-cluster forwarder is two `curl` calls with no
+    JSON tooling at all (`curlimages/curl` carries no jq). It also keeps the allowlist in one
+    place: every datapoint is built from CACHE_EXPORT_FIELDS, never from a stats dict directly
+    — `cache_stats()["worst"]` carries SESSION IDS and must never reach the wire.
+
+    🔴 timeUnixNano is stamped at EXPORT time, deliberately not at POST time. If the nightly
+    stops producing, the forwarder re-POSTs an old timestamp and the panel goes visibly stale
+    instead of re-stamping stale numbers as fresh. A stale export re-stamped fresh is a lie.
+    """
+    ts_nano = int(time.time() * 1_000_000_000)
+    ratio, tokens, turns = [], [], []
+    for days, label in CACHE_EXPORT_WINDOWS:
+        cs = cache_stats(conn, window_days=days)
+        if cs is None:
+            continue  # no rows in this window: absence of measurement, not a zero
+        m = {k: cs[k] for k in CACHE_EXPORT_FIELDS}
+        ratio.append(_otlp_point(m["hit"], ts_nano, {"window": label}))
+        turns.append(_otlp_point(m["turns"], ts_nano, {"window": label}, as_int=True))
+        for kind in ("read", "written", "input"):
+            tokens.append(
+                _otlp_point(m[kind], ts_nano, {"window": label, "kind": kind}, as_int=True)
+            )
+    if not ratio:
+        return None
+    return {
+        "resourceMetrics": [{
+            "resource": {"attributes": [
+                {"key": "service.name", "value": {"stringValue": "gaius"}},
+                {"key": "service.namespace", "value": {"stringValue": "agent-memory"}},
+            ]},
+            "scopeMetrics": [{
+                "scope": {"name": "gaius.degradation"},
+                "metrics": [
+                    {"name": "gaius_prompt_cache_hit_ratio", "unit": "1",
+                     "description": "cache_read / (cache_read + cache_creation + input)",
+                     "gauge": {"dataPoints": ratio}},
+                    {"name": "gaius_prompt_cache_tokens", "unit": "{token}",
+                     "description": "prompt tokens by billing class",
+                     "gauge": {"dataPoints": tokens}},
+                    {"name": "gaius_prompt_cache_turns", "unit": "{turn}",
+                     "description": "assistant turns carrying cache measurements",
+                     "gauge": {"dataPoints": turns}},
+                ],
+            }],
+        }]
+    }
 
 
 def report(conn):
@@ -361,6 +551,7 @@ def report(conn):
         "band_names": band_names, "event_working": sorted(ev_workings),
         "turn_working": sorted(turns), "by_type": by_type,
         "comp_trig": comp_trig, "comp_pre": sorted(comp_pre),
+        "cache": cache_stats(conn),   # None until a post-2026-08-13 scan populates the columns
     }
 
 
@@ -390,7 +581,19 @@ def cmd_degradation(args):
     ps.add_argument("--since-days", type=float, default=30.0, help="mtime cutoff for --all")
     ps.add_argument("--dry-run", action="store_true", help="detect + count; write nothing")
     sub.add_parser("report", help="per-band event RATE (the falsifiable red-threshold check)")
+    pe = sub.add_parser("export", help="allowlisted prompt-cache aggregates as JSON (for S3 → Mimir)")
+    pe.add_argument("--otlp", action="store_true",
+                    help="emit a windowed OTLP/JSON metrics payload instead of flat aggregates")
     ns = p.parse_args(args)
+
+    if ns.sub == "export":
+        conn = _get_conn()
+        payload = export_cache_otlp(conn) if ns.otlp else export_cache_metrics(conn)
+        if payload is None:
+            print("{}")  # sentinel the nightly hook tests for; do NOT emit a zeroed payload
+            return 1
+        print(json.dumps(payload, separators=(",", ":")))
+        return 0
 
     if ns.sub == "report":
         conn = _get_conn()
@@ -469,6 +672,20 @@ def _print_report(rep):
         vals = sorted(rep["by_type"].get(et, []))
         if vals:
             print(f"    {et:<16} n={len(vals):>4}  p50={_percentile(vals,.5):>7,}  p90={_percentile(vals,.9):>7,}")
+    print()
+    cs = rep.get("cache")
+    if cs is None:
+        print("  prompt cache: no scanned turns carry cache columns yet "
+              "(added 2026-08-13 — re-scan to populate).")
+    else:
+        print(f"  prompt cache ({cs['turns']:,} turns with data):")
+        print(f"    read (~0.1x)  {cs['read']:>14,}    written (~1.25x) {cs['written']:>12,}"
+              f"    uncached (1x) {cs['input']:>10,}")
+        flag = "" if cs["hit"] >= CACHE_HIT_WARN else "   ⚠ BELOW WARN — prefix is being invalidated"
+        print(f"    hit rate      {cs['hit']*100:>13.1f}%{flag}")
+        if cs["worst"]:
+            print(f"    coldest sessions (>={CACHE_MIN_TURNS} turns):  " +
+                  "  ".join(f"{sid}={h*100:.0f}%" for sid, _t, h in cs["worst"]))
     print()
 
     # compaction ceiling markers — a separate TOTAL-fill axis, not working-set

@@ -4,8 +4,11 @@ Event types:
   - prompt_events: every UserPromptSubmit hook invocation
   - enforcement_events: every PreToolUse hard-enforce check
   - session_summaries: aggregated at session stop
-  - tool_events: every tool call (gaius-observe PreToolUse hook + MCP tool
-    decorator) — args stored only as sha256 hash + redacted compact summary
+  - session_profiles: one row per session with kub0.profile.sha256 (BA-6)
+  - tool_events: every tool call (gaius-observe Pre/PostToolUse hooks + MCP
+    tool decorator) — args stored only as sha256 hash + redacted compact
+    summary; pre/post rows pair on (session_id, args_sha256) and carry
+    file-state + tool_response hashes (BA-1, 2026-08-13)
 
 DB lives at ~/.gaius/telemetry.db (separate from facts.db — no schema coupling).
 GAIUS_TELEMETRY_DB env var overrides the path (tests / sandboxes).
@@ -21,6 +24,7 @@ from pathlib import Path
 
 _DB_PATH = Path(os.environ.get("GAIUS_TELEMETRY_DB") or (Path.home() / ".gaius" / "telemetry.db"))
 _conn = None
+_BA1_COLS_OK = True   # set by _init_schema; False => BA-1 migration didn't land
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -96,7 +100,12 @@ def _init_schema(conn: sqlite3.Connection):
             args_redacted TEXT,                   -- compact redacted summary of tool_input
             source TEXT DEFAULT 'hook',           -- 'hook' (gaius-observe) | 'mcp' (mcp_server decorator)
             event TEXT DEFAULT 'pre',             -- 'pre','post'
-            project TEXT                          -- project hash (sha256(git remote)[:12], from gaius-observe)
+            project TEXT,                         -- project hash (sha256(git remote)[:12], from gaius-observe)
+            state_sha256 TEXT,                    -- sha256 of file at tool_input.file_path/notebook_path
+                                                  -- (pre=before, post=after; 'absent'/'over-cap:<bytes>' sentinels)
+            result_sha256 TEXT,                   -- sha256 of canonical-JSON tool_response (post rows)
+            call_id TEXT                          -- harness tool_use_id when provided — exact pre<->post pairing
+                                                  -- (falls back to (session_id, args_sha256) join when NULL)
         );
 
         CREATE TABLE IF NOT EXISTS coaching_tips (
@@ -117,7 +126,38 @@ def _init_schema(conn: sqlite3.Connection):
         CREATE INDEX IF NOT EXISTS idx_skillinj_skill ON skill_injections(skill);
         CREATE INDEX IF NOT EXISTS idx_toolev_ts ON tool_events(ts);
         CREATE INDEX IF NOT EXISTS idx_toolev_session ON tool_events(session_id);
+
+        CREATE TABLE IF NOT EXISTS session_profiles (
+            session_id TEXT PRIMARY KEY,
+            ts REAL NOT NULL,
+            profile_sha256 TEXT NOT NULL,         -- kub0.profile.sha256; digest only
+            cwd TEXT,
+            harness TEXT,                         -- claude | grok | praefectus | unknown
+            model TEXT,
+            source TEXT                           -- hook | wrap | cli
+        );
+        CREATE INDEX IF NOT EXISTS idx_sessprof_ts ON session_profiles(ts);
+        CREATE INDEX IF NOT EXISTS idx_sessprof_hash ON session_profiles(profile_sha256);
     """)
+    # Additive migration (2026-08-13 BA-1): CREATE TABLE IF NOT EXISTS above is
+    # a no-op on a pre-existing DB, so new tool_events columns must be ALTERed
+    # in. ADD COLUMN is metadata-only in SQLite — instant even on 45k+ rows;
+    # old rows read NULL ("state not captured then"). OperationalError is
+    # usually a concurrent hook process winning the ALTER race, but it can also
+    # be a locked/readonly DB — so the post-check below decides, never the
+    # exception: if the columns still aren't there, INSERTs degrade to the
+    # legacy column list rather than silently dropping every row for the life
+    # of a cached connection (the long-lived MCP server never re-inits).
+    global _BA1_COLS_OK
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(tool_events)").fetchall()}
+    for col in ("state_sha256", "result_sha256", "call_id"):
+        if col not in cols:
+            try:
+                conn.execute(f"ALTER TABLE tool_events ADD COLUMN {col} TEXT")
+            except sqlite3.OperationalError:
+                pass
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(tool_events)").fetchall()}
+    _BA1_COLS_OK = {"state_sha256", "result_sha256", "call_id"} <= cols
     # Seed coaching tips if empty
     count = conn.execute("SELECT COUNT(*) FROM coaching_tips").fetchone()[0]
     if count == 0:
@@ -419,10 +459,18 @@ def log_tool_event(
     source: str = "hook",
     event: str = "pre",
     project: str = "",
+    state_sha256: str | None = None,
+    result_sha256: str | None = None,
+    call_id: str | None = None,
 ):
     """Best-effort: one row per tool call (hook or MCP path).
 
-    Stores hash + redacted summary only — never the raw args. Mirrors the
+    Stores hash + redacted summary only — never the raw args. state_sha256 is
+    the on-disk file hash at hook time (pre=before, post=after — computed
+    in-shell by gaius-observe); result_sha256 hashes the canonical-JSON
+    tool_response on post rows. Pre↔post rows pair exactly on call_id (the
+    harness tool_use_id) when provided; fallback join is (session_id,
+    args_sha256) — ambiguous for repeated identical calls. Mirrors the
     try/except pattern of log_skill_injection: a telemetry failure must never
     block or fail the tool call.
     """
@@ -430,16 +478,65 @@ def log_tool_event(
         args_sha256 = hash_args(tool_input)
         args_redacted = redact_args(tool_input)
         conn = _get_conn()
-        conn.execute(
-            """INSERT INTO tool_events
-               (ts, session_id, tool_name, args_sha256, args_redacted, source, event, project)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (time.time(), session_id, tool_name, args_sha256, args_redacted,
-             source, event, project),
-        )
+        if _BA1_COLS_OK:
+            conn.execute(
+                """INSERT INTO tool_events
+                   (ts, session_id, tool_name, args_sha256, args_redacted, source,
+                    event, project, state_sha256, result_sha256, call_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (time.time(), session_id, tool_name, args_sha256, args_redacted,
+                 source, event, project, state_sha256, result_sha256, call_id),
+            )
+        else:
+            # BA-1 migration didn't land (locked/readonly DB at init) — log the
+            # pre-BA1 row rather than silently dropping every event.
+            conn.execute(
+                """INSERT INTO tool_events
+                   (ts, session_id, tool_name, args_sha256, args_redacted, source, event, project)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (time.time(), session_id, tool_name, args_sha256, args_redacted,
+                 source, event, project),
+            )
         conn.commit()
     except Exception:
         pass  # telemetry must never break a tool call
+
+
+def log_session_profile(
+    session_id: str,
+    profile_sha256: str,
+    cwd: str = "",
+    harness: str = "",
+    model: str = "",
+    source: str = "hook",
+):
+    """Best-effort upsert of the session's profile digest. Fail-open.
+
+    Digest only — the canonical profile document never touches this table.
+    Resume/compact SessionStart overwrites so the row tracks the live profile.
+    """
+    try:
+        if not session_id or session_id in ("unknown", "null"):
+            return
+        if not profile_sha256:
+            return
+        conn = _get_conn()
+        conn.execute(
+            """INSERT INTO session_profiles
+               (session_id, ts, profile_sha256, cwd, harness, model, source)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(session_id) DO UPDATE SET
+                 ts=excluded.ts,
+                 profile_sha256=excluded.profile_sha256,
+                 cwd=excluded.cwd,
+                 harness=excluded.harness,
+                 model=excluded.model,
+                 source=excluded.source""",
+            (session_id, time.time(), profile_sha256, cwd, harness, model, source),
+        )
+        conn.commit()
+    except Exception:
+        pass
 
 
 def _cli_tool_event(argv: list) -> int:
@@ -460,8 +557,20 @@ def _cli_tool_event(argv: list) -> int:
         tool_name = payload.get("tool_name") or payload.get("toolName") or "unknown"
         tool_input = payload.get("tool_input") if "tool_input" in payload \
             else payload.get("toolInput")
+        # BA-1: file-state hash computed synchronously in-shell by gaius-observe
+        # (TOCTOU — a backgrounded hash races the tool call), handed over via env.
+        state_sha256 = os.environ.get("GAIUS_STATE_SHA256") or None
+        # Post envelopes carry tool_response (Claude) / toolResponse (Grok);
+        # hash the canonical JSON — never store the response itself.
+        tool_response = payload.get("tool_response") if "tool_response" in payload \
+            else payload.get("toolResponse")
+        result_sha256 = hash_args(tool_response) if tool_response is not None else None
+        # Exact pre<->post pairing when the harness sends a per-call id
+        call_id = payload.get("tool_use_id") or payload.get("toolUseId") or None
         log_tool_event(session_id, tool_name, tool_input,
-                       source="hook", event=event, project=project)
+                       source="hook", event=event, project=project,
+                       state_sha256=state_sha256, result_sha256=result_sha256,
+                       call_id=call_id)
     except Exception:
         pass  # never fail the hook
     return 0
@@ -569,9 +678,101 @@ def get_violations(limit: int = 50) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def _infer_harness(payload: dict) -> str:
+    if "sessionId" in payload or "toolName" in payload or "workspaceRoot" in payload:
+        return "grok"
+    if "session_id" in payload or "tool_name" in payload:
+        return "claude"
+    if os.environ.get("GROK_SESSION_ID"):
+        return "grok"
+    if os.environ.get("CLAUDE_SESSION_ID"):
+        return "claude"
+    return "unknown"
+
+
+def _cli_session_start(argv: list) -> int:
+    """`python3 -m gaius.telemetry session-start` — SessionStart hook entry.
+
+    Reads the Claude/Grok envelope on stdin, hashes the local profile, upserts
+    session_profiles. Always exits 0, prints nothing (fail-open hook contract).
+    """
+    import sys
+    try:
+        payload = json.load(sys.stdin)
+        if not isinstance(payload, dict):
+            return 0
+        session_id = (payload.get("session_id") or payload.get("sessionId")
+                      or os.environ.get("CLAUDE_SESSION_ID")
+                      or os.environ.get("GROK_SESSION_ID") or "")
+        cwd = payload.get("cwd") or payload.get("workspaceRoot") or os.getcwd()
+        model = payload.get("model") or None
+        from gaius.profile import profile_sha256
+        digest = profile_sha256(cwd=cwd, model=model)
+        log_session_profile(
+            session_id, digest, cwd=str(cwd),
+            harness=_infer_harness(payload),
+            model=model or "",
+            source="hook",
+        )
+    except Exception:
+        pass
+    return 0
+
+
+def _cli_profile(argv: list) -> int:
+    """profile-hash | profile-env | profile — operator / wrapper entry.
+
+    profile-hash: prints the 64-char digest only.
+    profile-env:  prints a merged OTEL_RESOURCE_ATTRIBUTES value (no export=).
+    profile:      digest + inventory (names/counts, never file bodies).
+    """
+    import argparse
+    import sys
+    from gaius.profile import (
+        build_profile, inventory_lines, merge_otel_resource, profile_sha256,
+    )
+
+    mode = argv[0] if argv else "profile"
+    rest = argv[1:] if argv else []
+    p = argparse.ArgumentParser(prog=f"gaius.telemetry {mode}")
+    p.add_argument("--cwd", default=os.getcwd())
+    p.add_argument("--model", default=None)
+    try:
+        ns, _ = p.parse_known_args(rest)
+    except SystemExit:
+        return 0
+    try:
+        pinned = os.environ.get("KUB0_PROFILE_SHA256") or ""
+        from gaius.profile import is_digest
+        if is_digest(pinned):
+            digest = pinned.strip()
+        else:
+            digest = profile_sha256(cwd=ns.cwd, model=ns.model)
+    except Exception:
+        return 0
+    if mode == "profile-hash":
+        sys.stdout.write(digest + "\n")
+        return 0
+    if mode == "profile-env":
+        merged = merge_otel_resource(
+            os.environ.get("OTEL_RESOURCE_ATTRIBUTES", ""), digest)
+        sys.stdout.write(merged + "\n")
+        return 0
+    try:
+        doc = build_profile(cwd=ns.cwd, model=ns.model)
+        sys.stdout.write(inventory_lines(doc, digest))
+    except Exception:
+        sys.stdout.write(f"kub0.profile.sha256={digest}\n")
+    return 0
+
+
 if __name__ == "__main__":
     import sys
     _args = sys.argv[1:]
     if _args and _args[0] == "tool-event":
         sys.exit(_cli_tool_event(_args[1:]))
+    if _args and _args[0] == "session-start":
+        sys.exit(_cli_session_start(_args[1:]))
+    if _args and _args[0] in ("profile", "profile-hash", "profile-env"):
+        sys.exit(_cli_profile(_args))
     sys.exit(0)

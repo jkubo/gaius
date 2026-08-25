@@ -3,9 +3,16 @@ the always-injected MEMORY.md into a non-injected archive changelog.
 
 The gate is REDUNDANCY, not age. A bullet is evicted iff ALL of:
 
-  (1) it is not explicitly pinned with ``📌`` (``PIN_MARK``),
-  (2) it ends in a trailing pointer (``→ <file>`` or a ``[label](path)`` link), and
-  (3) that pointer's target PROVABLY contains the bullet's signature tokens.
+  (1) it is not explicitly pinned with ``📌`` (``PIN_MARK``) — unless
+      ``--ignore-pins`` / ``ignore_pins=True`` is set (operator override for
+      ambient-glyph drift; homing and INDEX reachability still gate),
+  (2) it ends in a trailing pointer (``→ <file>`` or a ``[label](path)`` link),
+  (3) that pointer's target PROVABLY contains the bullet's signature tokens, and
+  (4) every pointer target that lives in an indexed tree (``INDEX_TREES``) is
+      listed in that tree's ``INDEX.md`` — Gap 60. Homing without an index
+      path is how ``--ignore-pins`` stranded 14 ``troubleshooting/`` files
+      on 2026-08-14: the archive is not injected, so an unlisted home is
+      dark once the MEMORY.md bullet is gone.
 
 🔴 **``⚠️`` is NOT a veto and has not been one since 2026-07-28 (mnemos #123).** It was
 retired precisely because it is ambient on nearly every Recent-State bullet, which made
@@ -203,6 +210,74 @@ def _is_homed(text: str, home_text: str) -> bool:
     return hits >= MIN_HOME_HITS and (hits / len(sig)) >= HOME_MATCH_FRACTION
 
 
+# ── INDEX reachability (Gap 60) ──────────────────────────────────────────────
+# Must match mnemosyne.INDEX_TREES + _LISTED_LEFT. Pinned by
+# test_index_trees_match_mnemosyne + test_listing_agrees_with_scan.
+# Two copies because mnemosyne is a standalone script (no gaius package import)
+# and a deleter must not load a 1k-line health tool to refuse a write.
+INDEX_TREES = (
+    ("feedback",        "INDEX.md", "key",  "feedback_"),
+    ("project",         "INDEX.md", "link", ""),
+    ("troubleshooting", "INDEX.md", "link", ""),
+)
+_LISTED_LEFT = r"(?<![A-Za-z0-9])"
+
+
+def index_lists(memory_dir, rel_path):
+    """Is ``rel_path`` listed in its tree INDEX?
+
+    ``True``  — tree has a readable INDEX and the file is listed.
+    ``False`` — tree has a readable INDEX and the file is unlisted, OR the
+                INDEX exists but cannot be read (deleter must KEEP).
+    ``None``  — check does not apply: not an INDEX_TREE path, or the tree
+                has no INDEX.md (opted out — same skip as scan_index_completeness).
+
+    Listing uses the same matcher as ``scan_index_completeness@mnemosyne``
+    (link mode = exact filename; key mode = stem minus prefix; ``_LISTED_LEFT``
+    not ``\\b``). Membership, not transitive reachability — J 2026-08-07:
+    an INDEX is an index.
+    """
+    rel = str(rel_path).replace("\\", "/").lstrip("./")
+    rel = rel.split("#", 1)[0].split("?", 1)[0]
+    parts = [p for p in rel.split("/") if p]
+    if len(parts) < 2:
+        return None
+    tree, name = parts[0], parts[-1]
+    spec = next((t for t in INDEX_TREES if t[0] == tree), None)
+    if spec is None:
+        return None
+    _, index_name, mode, prefix = spec
+    idxp = Path(memory_dir) / tree / index_name
+    if not idxp.is_file():
+        return None
+    try:
+        idx = idxp.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    if mode == "link":
+        return bool(re.search(_LISTED_LEFT + re.escape(name), idx))
+    stem = Path(name).stem
+    key = stem[len(prefix):] if prefix and stem.startswith(prefix) else stem
+    return bool(re.search(_LISTED_LEFT + re.escape(key) + r"\b", idx))
+
+
+def _targets_index_reachable(text: str, memory_dir) -> bool:
+    """True iff no pointer target would be stranded by eviction.
+
+    A target outside INDEX_TREES, or in a tree with no INDEX.md, is N/A.
+    ANY indexed-tree target that is unlisted (or whose INDEX is unreadable)
+    → False → KEEP. No extracted targets → False (fail-closed; the pointer
+    gate should have already stopped us)."""
+    paths = _pointer_target_paths(text)
+    if not paths:
+        return False
+    for rel in paths:
+        listed = index_lists(memory_dir, rel)
+        if listed is False:
+            return False
+    return True
+
+
 def _has_veto(text: str) -> bool:
     return VETO_MARK in text
 
@@ -277,9 +352,11 @@ def _bullet_date(text: str, section_date) -> "_dt.date | None":
 
 
 def should_evict(text: str, section_date=None, max_age_days: int = 0,
-                 home_text_provider=None) -> bool:
-    """Evict iff the bullet is PROVABLY REDUNDANT: it ends in a durable pointer AND that
-    pointer's target genuinely contains the bullet's signature. Nothing else.
+                 home_text_provider=None, ignore_pins: bool = False,
+                 index_reach_provider=None) -> bool:
+    """Evict iff the bullet is PROVABLY REDUNDANT: trailing pointer, home contains
+    the signature, AND (when a provider is passed) every indexed-tree target is
+    listed in its INDEX. Nothing else.
 
     REDESIGNED 2026-07-28 (mnemos #123). The previous gate made four PROXIES mandatory —
     non-veto (any ``⚠`` pinned the bullet), a done-marker, a per-bullet date, and
@@ -289,24 +366,40 @@ def should_evict(text: str, section_date=None, max_age_days: int = 0,
     the proxy gate evicted **0 of 18** bullets while this gate evicts **7 (2,206 B)**.
     🔑 The proxies were proxies FOR homing; homing is the ground truth, so it is now the
     gate. A bullet whose fact is provably present in its pointer target loses nothing by
-    leaving the index — that, and only that, is what makes an automatic delete safe.
+    leaving the index — that is necessary, not sufficient.
+
+    Gap 60 (2026-08-14): homing does not imply the home is *findable*. ``--ignore-pins``
+    evicted 31 bullets whose ``troubleshooting/`` targets were signature-homed but
+    unlisted in ``INDEX.md``; the archive is not injected, so those files went dark.
+    ``index_reach_provider`` is that check. ``None`` skips it (homing-only unit tests);
+    ``roll_recent_state`` always passes a real provider when ``verify_homing`` is True.
 
     ``section_date`` / ``max_age_days`` are retained for call-site compatibility and are
     deliberately NOT consulted.
 
-    FAIL-CLOSED at every step — pinned, no pointer, no provider, unreadable home, or a
-    signature we cannot positively match → KEEP the bullet.
+    FAIL-CLOSED at every step — pinned (unless ``ignore_pins``), no pointer, no provider,
+    unreadable home, a signature we cannot positively match, or an unlisted INDEX-tree
+    target → KEEP the bullet.
+
+    ``ignore_pins`` is the operator override for ambient 📌 drift (08-14: 55/55 Recent
+    State bullets carried the glyph as convention, which made the veto inert the same
+    way ⚠️ did). Default False. Homing and INDEX reachability still gate; this only
+    skips ``_has_pin``.
 
     ⚠️ ``home_text_provider=None`` now means "cannot verify ⇒ KEEP", the INVERSE of the
     old contract where it meant "skip the check". A caller that omits it evicts nothing,
     which is the safe direction for an automated deleter."""
-    if _has_pin(text):
+    if not ignore_pins and _has_pin(text):
         return False
     if not _has_trailing_pointer(text):
         return False
     if home_text_provider is None:
         return False
-    return _is_homed(text, home_text_provider(text))
+    if not _is_homed(text, home_text_provider(text)):
+        return False
+    if index_reach_provider is not None and not index_reach_provider(text):
+        return False
+    return True
 
 
 # ── atomic MEMORY.md rewrite ────────────────────────────────────────────────
@@ -329,7 +422,7 @@ def _atomic_write(path: Path, content: str) -> None:
 # ── core roll ────────────────────────────────────────────────────────────────
 
 def roll_recent_state(mem_path, archive_dir, max_age_days: int = 7, dry_run: bool = False,
-                      verify_homing: bool = True, _probe=None):
+                      verify_homing: bool = True, ignore_pins: bool = False, _probe=None):
     """Evict eligible ``## Recent State`` bullets from ``mem_path`` into
     ``archive_dir/recent-state-YYYY-MM.md`` (YYYY-MM = section-header month).
 
@@ -371,12 +464,21 @@ def roll_recent_state(mem_path, archive_dir, max_age_days: int = 7, dry_run: boo
                 end = j
                 break
         out = lines[: start + 1]
-        provider = (lambda body: _resolve_home_text(body, mem_path.parent)) if verify_homing else None
+        mem_root = mem_path.parent
+        provider = (lambda body: _resolve_home_text(body, mem_root)) if verify_homing else None
+        # Gap 60: same verify_homing flag — if we cannot check homes we cannot
+        # check INDEX either. A missing INDEX.md is N/A (opt-out); an existing
+        # INDEX that does not list the target is a KEEP.
+        index_prov = (
+            (lambda body, root=mem_root: _targets_index_reachable(body, root))
+            if verify_homing else None
+        )
         for j in range(start + 1, end):
             raw = lines[j]
             body = raw.rstrip("\n")
             if body.lstrip().startswith(("-", "*")) and should_evict(
-                    body, section_date, max_age_days, home_text_provider=provider):
+                    body, section_date, max_age_days, home_text_provider=provider,
+                    ignore_pins=ignore_pins, index_reach_provider=index_prov):
                 evicted.append(raw if raw.endswith("\n") else raw + "\n")
             else:
                 out.append(raw)
@@ -415,9 +517,14 @@ def cmd_recent_roll(args):
     parser = argparse.ArgumentParser(prog="gaius recent-roll")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print what would be evicted; write nothing")
+    parser.add_argument("--ignore-pins", action="store_true",
+                        help="Override the 📌 / <!--pin--> veto. Homing and INDEX "
+                             "reachability still gate. Use only when the pin glyph "
+                             "is ambient convention drift, not a deliberate keep. "
+                             "Dry-run first.")
     parser.add_argument("--max-age-days", type=int, default=7,
-                        help="Evict eligible bullets whose newest date-stamp is older than "
-                             "this, relative to the section-header date (default: 7)")
+                        help="Retained for call-site compatibility. NOT consulted — "
+                             "homing is the gate. The default (7) is unused.")
     parser.add_argument("--memory-file", default=None,
                         help="Path to MEMORY.md (default: <MEMORY_DIR>/MEMORY.md)")
     parser.add_argument("--archive-dir", default=None,
@@ -443,15 +550,18 @@ def cmd_recent_roll(args):
     result = roll_recent_state(mem_path, archive_dir,
                                max_age_days=parsed.max_age_days,
                                dry_run=parsed.dry_run,
-                               verify_homing=True)
+                               verify_homing=True,
+                               ignore_pins=parsed.ignore_pins)
     if result.get("skipped_concurrent"):
         print("[recent-roll] SKIPPED: MEMORY.md changed under us (concurrent write) "
               "— wrote nothing; the next run retries.")
         return 0
     evicted = result["evicted"]
     if not evicted:
-        print(f"[recent-roll] nothing to evict (0 bullets aged >{parsed.max_age_days}d "
-              "+ done-marker + trailing-pointer + non-veto).")
+        pin_note = (" (📌 veto still on; pass --ignore-pins to override)"
+                    if not parsed.ignore_pins else "")
+        print("[recent-roll] nothing to evict — no homed, pointered bullet "
+              f"survived the gate{pin_note}.")
         return 0
     verb = "would evict" if parsed.dry_run else "evicted"
     print(f"[recent-roll] {verb} {len(evicted)} bullet(s) -> {result['archive_path']}")

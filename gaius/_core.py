@@ -37,6 +37,7 @@ Commands:
   done ID     Mark a summary as reviewed (ID = uuid prefix, min 4 chars)
   rescan ID   Force re-extraction for a session (ID = uuid prefix, min 4 chars)
   stats       Show extraction and corpus statistics (includes facts.db)
+  quiz        Leitner HITL review over corpus facts (`--report` is read-only)
   batch         Show unreviewed summaries by section (bulk scan mode)
 """
 
@@ -835,7 +836,7 @@ from gaius.review import (  # noqa: E402,F401  re-export (review split 2026-08-1
     cmd_show, _promote_event, _rewrite_staging,
     cmd_next_staged_facts, cmd_next_gemini, _cmd_next_pending_fact,
     cmd_next, cmd_done, _resolve_fact_id,
-    cmd_confirm, cmd_reject, cmd_defer, cmd_agent_review,
+    cmd_confirm, cmd_reject, cmd_defer, cmd_agent_review, cmd_quiz,
     cmd_stats, cmd_rescan, cmd_batch,
 )
 from gaius.retire import (  # noqa: E402,F401  re-export (retire split 2026-08-13)
@@ -914,6 +915,10 @@ from gaius.degradation import (  # noqa: E402,F401  re-export (degradation split
     band_for, cmd_degradation,
 )
 
+from gaius.interp import (  # noqa: E402,F401  curated behaviour case studies (2026-08-14)
+    cmd_interp, BEHAVIOR_CLASSES, add_sample as add_interp_sample,
+)
+
 from gaius.corpus_audit import (  # noqa: E402,F401  re-export (corpus_audit split 2026-07-01)
     REPETITION_THRESHOLD, CONTRADICTION_ENFORCE_MIN_CC, repetition_candidates,
     corpus_audit_stats, enforce_demote, route_suggest, cmd_corpus_audit, cmd_route_suggest,
@@ -955,6 +960,13 @@ from gaius.recentstate import (  # noqa: E402,F401  re-export (Recent State auto
 from gaius.concord import (  # noqa: E402,F401  re-export (cross-session coordination, 2026-07-17 — OSS-included)
     cmd_concord, init_concord,
 )
+# baton ships as of the v0.2 boundary (reclassified to OSS): it is the author
+# LIBRARY that spin calls, and `cmd_baton` is the tombstone verb pointing at spin.
+# These were inside one `optional-baton` strip block, which meant excluding baton
+# also stripped SPIN's registration — so the mirror shipped gaius/spin.py while
+# `"spin" in COMMANDS` was False, i.e. a v0.2 feature no user could invoke.
+from gaius.baton import cmd_baton  # noqa: E402,F401  tombstone (2026-08-18) — HITL verb is spin
+from gaius.spin import cmd_spin  # noqa: E402,F401  re-export (HITL context-spin, 2026-08-15)
 
 
 def cmd_completion(args):
@@ -1068,6 +1080,7 @@ COMMANDS = {
     "reject":     cmd_reject,
     "defer":      cmd_defer,
     "agent-review": cmd_agent_review,
+    "quiz":       cmd_quiz,
     "rescan":     cmd_rescan,
     "stats":      cmd_stats,
     "batch":      cmd_batch,
@@ -1098,15 +1111,32 @@ COMMANDS = {
     "rescore":         cmd_rescore,
     "ingest-outcomes": cmd_ingest_outcomes,
     "degradation":     cmd_degradation,
+    "interp":          cmd_interp,
     "corpus-audit":    cmd_corpus_audit,
     "route-suggest":   cmd_route_suggest,
     "reconcile":       cmd_reconcile,
     "concord":         cmd_concord,
+    "baton":           cmd_baton,  # tombstone; HITL verb is spin
+    "spin":            cmd_spin,
     "completion":      cmd_completion,
 }
 
 
 SUPPORTED_FORMATS = {"claude", "gemini", "ollama", "vllm", "pentagi", "grok", "codex"}
+
+
+def _exit_from_handler(rc):
+    """Honor integer handler returns so `return 1` is a real process failure.
+
+    main() used to discard every subcommand return (`COMMANDS[command](cmd_argv)`
+    with no sys.exit). Handlers that wanted a nonzero exit had to sys.exit()
+    themselves; a `return 1` looked like success to any caller (degradation
+    export's empty-payload sentinel, interp show-missing, recent-roll missing
+    MEMORY.md). Only exact `int` — bool is a subclass, and `return True` must
+    not become exit 1. None / other types stay implicit 0.
+    """
+    if type(rc) is int:
+        sys.exit(rc)
 
 
 def main():
@@ -1178,13 +1208,13 @@ def main():
     # `completion` emits a static script from the in-memory COMMANDS registry —
     # no DB or session scan needed. Skip init_db() to keep it fast/side-effect-free.
     if command == "completion":
-        COMMANDS[command](cmd_argv)
+        _exit_from_handler(COMMANDS[command](cmd_argv))
         return
 
     # Ensure facts.db is initialized on every run
     init_db()
 
-    COMMANDS[command](cmd_argv)
+    _exit_from_handler(COMMANDS[command](cmd_argv))
 
 
 if __name__ == "__main__":

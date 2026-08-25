@@ -134,9 +134,18 @@ def gaius_search(query: str, domain: str = "", limit: int = 10) -> str:
         "WHERE tombstoned_at IS NULL AND (outcome IS NULL OR outcome != 'rejected')"
     ).fetchall()
 
+    # Credential exclusion at candidate selection. The KNN branch below only
+    # annotates sem_score on items already in `scored` — it introduces no new
+    # facts — so filtering here covers the semantic path too, and a fact carrying
+    # credential material can never reach the `fact_text[:300]` formatter that
+    # returns rows to the MCP client.
+    from gaius.extract import has_credential
+
     scored = []
     for fact in facts:
         if domain and fact["domain"] != domain:
+            continue
+        if has_credential(fact["fact_text"] or ""):
             continue
         text = (fact["fact_text"] or "").lower()
         kw_score = sum(1 for t in terms if t in text) / max(len(terms), 1)

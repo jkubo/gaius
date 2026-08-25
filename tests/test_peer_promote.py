@@ -97,6 +97,28 @@ def test_tag_domains_ranks_by_hit_count():
     assert tag_domains_from_specs("nothing relevant here", specs) == []
 
 
+def _iter_package_calls(func_name):
+    """Yield (relpath, ast.Call) for every call to `func_name` across the WHOLE package.
+
+    Deliberately not a single file. The original version of the guard below ASTed only
+    ``_core.py``; when cmd_ansible/cmd_aliases moved to ``ingest.py`` in the 2026-08
+    modularization the walk started matching zero Call nodes, so its `bad` list was
+    always empty and the assert went permanently, silently green. A refactor must not
+    be able to un-audit the boundary it moved — hence package-wide, plus the
+    anti-vacuity assertions in each caller.
+    """
+    import ast
+    from pathlib import Path
+
+    pkg_dir = Path(_gaius_mod.__file__).parent
+    for path in sorted(pkg_dir.glob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == func_name):
+                yield f"{path.name}:{node.lineno}", node
+
+
 def test_all_tag_domains_callers_pass_two_args():
     """Source guard: every tag_domains_from_specs(...) call must supply domain_specs.
 
@@ -104,15 +126,50 @@ def test_all_tag_domains_callers_pass_two_args():
     their live (non-dry-run) upsert path (the function has two required params and no
     defaults). Fixed 2026-06-19; this keeps the whole call class honest.
     """
-    import ast
-    from pathlib import Path
+    seen, bad = [], []
+    for site, node in _iter_package_calls("tag_domains_from_specs"):
+        seen.append(site)
+        has_specs = (len(node.args) >= 2
+                     or any(kw.arg == "domain_specs" for kw in node.keywords))
+        if not has_specs:
+            bad.append(site)
+    assert seen, "guard matched 0 call sites — it has gone VACUOUS, repoint it"
+    assert not bad, f"tag_domains_from_specs called with <2 args at {bad}"
 
-    tree = ast.parse(Path(_gaius_mod.__file__).read_text())
-    bad = []
-    for node in ast.walk(tree):
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                and node.func.id == "tag_domains_from_specs"):
-            has_specs = len(node.args) >= 2 or any(kw.arg == "domain_specs" for kw in node.keywords)
-            if not has_specs:
-                bad.append(node.lineno)
-    assert not bad, f"tag_domains_from_specs called with <2 args at _core.py lines {bad}"
+
+def test_all_upsert_fact_callers_bind():
+    """Source guard: every upsert_fact(...) call must satisfy the real signature.
+
+    Guards GA-01 (2026-08-13): ``upsert_fact`` gained a required positional
+    ``session_uuid`` at slot 6, but all five ingest.py call sites passed their args
+    by keyword and omitted it. Nothing failed at import — each site raised TypeError
+    only when reached, and two of them (the playbook-summary and gen_corpus legs) sat
+    inside ``except Exception: pass``, so ``gaius ansible`` / ``gaius aliases`` printed
+    "Extracted N facts" and exited 0 while writing zero rows. ``--dry-run`` skips the
+    call entirely and so masked it.
+
+    Bind-checks against ``inspect.signature`` rather than a hardcoded arg list, so it
+    keeps holding when the signature changes again.
+    """
+    import ast
+    import inspect
+
+    from gaius._core import upsert_fact
+
+    sig = inspect.signature(upsert_fact)
+    seen, bad, skipped = [], [], []
+    for site, node in _iter_package_calls("upsert_fact"):
+        # *args / **kwargs unpacking cannot be resolved statically — record, don't guess.
+        if any(isinstance(a, ast.Starred) for a in node.args) or \
+           any(kw.arg is None for kw in node.keywords):
+            skipped.append(site)
+            continue
+        seen.append(site)
+        try:
+            sig.bind(*[None] * len(node.args),
+                     **{kw.arg: None for kw in node.keywords})
+        except TypeError as e:
+            bad.append(f"{site} ({e})")
+    assert seen, "guard matched 0 call sites — it has gone VACUOUS, repoint it"
+    assert not bad, ("upsert_fact call sites do not match its signature: "
+                     + "; ".join(bad))

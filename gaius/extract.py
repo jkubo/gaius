@@ -64,6 +64,79 @@ GEMINI_NOISE_SUBJECTS = frozenset([
 # Patterns in discovery outputs that indicate credential/secret leakage.
 GEMINI_CREDENTIAL_PATTERNS = ("FORGEJO_TOKEN=", "forgejo_token=", "_TOKEN=", "password=", "secret=")
 
+# Vendor-issued credential shapes that cannot plausibly be anything else, so
+# they are rejected unconditionally with no surrounding-context gate. Mirrors
+# the tier-1 predicate validated in gaius_praetorium.voice; kept as a separate
+# copy on purpose — gaius must not import gaius_praetorium (the dependency runs
+# the other way, see gaius_praetorium/__init__: _core merges ITS commands in).
+#
+# Deliberately NOT included: bare high-entropy blobs with no vendor prefix. A
+# 40-char git SHA, an image digest and a Forgejo PAT are shape-identical, and
+# rejecting that class destroys every commit hash in the corpus. Context-gated
+# tier-2 matching is voice.py's job on user prose; here the corpus wins.
+RE_SECRET_PREFIX = re.compile(
+    r"("
+    # ── git forges / CI ──
+    r"gh[pousr]_[A-Za-z0-9]{20,}"                     # github classic pat/oauth/app/refresh
+    r"|github_pat_[A-Za-z0-9_]{20,}"                  # github fine-grained pat
+    r"|glpat-[A-Za-z0-9_-]{16,}"                      # gitlab pat
+    r"|gto_[A-Za-z0-9]{20,}"                          # forgejo/gitea oauth secret
+    r"|glsa_[A-Za-z0-9_]{16,}"                        # grafana service account
+    # ── payments / SaaS ──
+    r"|[sr]k_(live|test)_[A-Za-z0-9]{16,}"            # stripe secret/restricted (UNDERSCORE)
+    r"|whsec_[A-Za-z0-9]{16,}"                        # stripe webhook signing secret
+    r"|sk-[A-Za-z0-9_-]{20,}"                         # openai / anthropic (HYPHEN), incl. sk-ant-
+    r"|xai-[A-Za-z0-9]{20,}"                          # xai / grok — the estate's OWN provider
+    r"|SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}"    # sendgrid
+    r"|shpat_[a-f0-9]{32}"                            # shopify admin
+    r"|EAAA[A-Za-z0-9_-]{20,}"                        # square
+    r"|key-[a-f0-9]{32}"                              # mailgun
+    r"|npm_[A-Za-z0-9]{30,}"                          # npm
+    r"|pypi-[A-Za-z0-9_-]{16,}"                       # pypi upload
+    r"|tk_[A-Za-z0-9]{20,}"                           # ntfy access token
+    r"|xox[baprse]-[A-Za-z0-9-]{10,}"                 # slack (incl. xoxe refresh, xoxs)
+    # ── cloud / infra ──
+    r"|(AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}"             # aws key ids (not just AKIA)
+    r"|AIza[A-Za-z0-9_-]{30,}"                        # google api key
+    r"|GOCSPX-[A-Za-z0-9_-]{20,}"                     # google oauth client secret
+    r"|1//[A-Za-z0-9_-]{20,}"                         # google oauth refresh (never expires)
+    r"|dop_v1_[a-f0-9]{40,}"                          # digitalocean pat
+    r"|8Q~[A-Za-z0-9._~-]{30,}"                       # azure client secret (new format)
+    r"|[A-Za-z0-9]{14,}\.atlasv1\.[A-Za-z0-9_-]{40,}" # terraform cloud
+    # ── this estate ──
+    r"|hv[sb]\.[A-Za-z0-9_-]{20,}"                    # openbao / vault service+batch tokens
+    r"|tskey-(auth|api|client)-[A-Za-z0-9-]{10,}"     # tailscale / headscale
+    r"|K10[a-f0-9]{40,}"                              # k3s node token
+    r"|\$ANSIBLE_VAULT;"                              # ansible vault blob header
+    # ── structural ──
+    r"|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}"     # JWT (dotted)
+    r"|eyJ[A-Za-z0-9+/=]{100,}"                       # dotless base64 JSON blob = cf tunnel token
+    r"|-----BEGIN [A-Z ]*PRIVATE KEY"
+    r"|AGE-SECRET-KEY-1[A-Z0-9]{40,}"
+    r"|hooks\.slack\.com/services/"                   # webhook URLs are bearer creds
+    r"|discord(app)?\.com/api/webhooks/"
+    r"|[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]+:[^/\s:@]+@"  # basic-auth in a URL
+    r")"
+)
+
+
+def has_credential(text: str) -> bool:
+    """True if text carries credential MATERIAL (not merely talk about one).
+
+    Union of the vendor-shape regex and the legacy GEMINI_CREDENTIAL_PATTERNS
+    `key=` substrings, so existing callers keep their old coverage and gain the
+    vendor prefixes they never had.
+
+    Prose describing a leak ("the token was visible in kubectl describe") is
+    deliberately NOT a match — that text is the valuable finding and carries no
+    secret. Only the material itself is rejected.
+    """
+    if not text:
+        return False
+    if RE_SECRET_PREFIX.search(text):
+        return True
+    return any(pat in text for pat in GEMINI_CREDENTIAL_PATTERNS)
+
 
 DECISION_KEYWORDS = frozenset([
     "decided", "fixed", "mistake", "discovered", "gotcha",
@@ -71,9 +144,16 @@ DECISION_KEYWORDS = frozenset([
 ])
 
 FINDING_PATTERNS = [
-    # Credential leakage
+    # Credential leakage — DESCRIPTIONS ONLY. Never put a credential *shape*
+    # here: classify_finding() returns max(score, FINDING_BASE_SCORE)=0.85
+    # against MINE_SCORE_THRESHOLD=0.50, so a shape in this list does not
+    # merely retain the block, it GUARANTEES it clears the staging bar and is
+    # stored verbatim into facts.db (0644, rclone'd to S3). `ghp_[A-Za-z0-9]`
+    # lived here until 2026-08-14 and was the one place in the pipeline where
+    # credential material was a promotion signal. Material is now rejected by
+    # has_credential(); the prose below carries no secret and stays.
     r"exposed in", r"visible in kubectl describe", r"plaintext in pod args",
-    r"ghp_[A-Za-z0-9]", r"token.*plaintext", r"secret.*leaked",
+    r"token.*plaintext", r"secret.*leaked",
     # Infrastructure incidents
     r"CrashLoopBackOff", r"LMDB corruption", r"quorum lost",
     r"OOMKill", r"ImagePullBackOff", r"node NotReady",

@@ -16,6 +16,11 @@ jobs:
     steps:
       # Pin full commit SHAs (mutable tags rejected by supply-chain residual).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: the push-range scan below diffs the newly-pushed commits,
+          # and the default fetch-depth of 1 has no parent objects to diff against.
+          # This does NOT weaken the worktree scan — that step excludes .git.
+          fetch-depth: 0
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -128,3 +133,113 @@ jobs:
             exit 1
           fi
           echo "OK: no internal references found"
+
+      - name: Check newly-pushed commits for internal references
+        run: |
+          # WHY THIS EXISTS, SEPARATELY FROM THE WORKTREE SCAN ABOVE.
+          # The step above scans the CHECKED-OUT TREE. That is the right unit for "is what
+          # we publish clean", and it is the only unit that matters for the sdist. But it is
+          # structurally blind to git HISTORY: a commit that adds an internal string and a
+          # later commit that removes it leaves a clean worktree and a permanently public
+          # blob. GitHub keeps unreachable commits SHA-addressable, force-push does not
+          # retract, and mirrors/archives copy them — so by the time the worktree scan is
+          # green the disclosure is already unretractable.
+          #
+          # SCOPE IS DELIBERATELY *NEW COMMITS ONLY*, AND *ADDED LINES ONLY*.
+          # This repo's existing history carries unmarked hits. A gate that scanned all of
+          # history would be red on every run from the day it landed, and a permanently-red
+          # gate gets deleted or --no-verify'd within a week — which is strictly worse than
+          # no gate, because the red is then read as "known noise" and a REAL hit hides in
+          # it. Existing history is a separate, accepted, documented exposure; rewriting it
+          # was evaluated and rejected (rewrites every SHA, breaks tags/releases, and still
+          # does not retract). This gate's job is to stop the NEXT one.
+          #
+          # Same content-withholding rule as above: print file:line, NEVER the matched text.
+          # Actions logs on a public repo are world-readable for ~90 days, so a gate that
+          # echoed its own match would be the disclosure it exists to prevent.
+          PATFILE=.github/leak-patterns.b64
+          if [ ! -s "$PATFILE" ]; then
+            echo "FAIL: $PATFILE missing or empty — refusing to scan with no denylist"
+            exit 1
+          fi
+          INTERNAL=$(sed -n 's/^core=//p' "$PATFILE" | base64 -d)
+          if [ -z "$INTERNAL" ]; then
+            echo "FAIL: could not decode a core pattern from $PATFILE — not the same as clean"
+            exit 1
+          fi
+
+          # Establish the range. push: what this push added. pull_request: what the PR adds
+          # (three-dot, from the merge-base — two-dot would also drag in main-side commits
+          # the PR did not author and blame the PR for them).
+          case "${{ github.event_name }}" in
+            pull_request)
+              BASE="${{ github.event.pull_request.base.sha }}"
+              TIP="${{ github.event.pull_request.head.sha }}"
+              SPEC="$BASE...$TIP" ;;
+            push)
+              BASE="${{ github.event.before }}"
+              TIP="${{ github.sha }}"
+              SPEC="$BASE..$TIP" ;;
+            *)
+              echo "FAIL: unsupported event ${{ github.event_name }} — refusing to guess a range"
+              exit 1 ;;
+          esac
+
+          ZERO=0000000000000000000000000000000000000000
+          if [ "$BASE" = "$ZERO" ] || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            # Branch creation, or a force-push that orphaned the old tip. Degrade to the head
+            # commit alone and SAY SO — a narrowed scan reported as a pass is the failure mode
+            # this repo has already been bitten by (a gate that errored and read as "clean").
+            echo "NOTE: base $BASE is unresolvable (branch creation or force-push)."
+            echo "      Degrading to the head commit alone. THIS SCANS LESS THAN THE FULL RANGE."
+            if git rev-parse --verify -q "${TIP}^" >/dev/null; then
+              DIFF=$(git diff --unified=0 "${TIP}^" "$TIP")
+            else
+              DIFF=$(git show --format= --unified=0 "$TIP")   # root commit
+            fi
+          else
+            DIFF=$(git diff --unified=0 "$SPEC")
+          fi
+
+          if [ -z "$DIFF" ]; then
+            echo "OK: no added lines in range ($SPEC)"
+            exit 0
+          fi
+
+          # Attribute every ADDED line to file:line by tracking the +++ header and the hunk
+          # header's new-side start. -U0 means no context lines, so only +/- and headers.
+          # Emit file:line:content and let grep -E apply the pattern, so the regex engine is
+          # byte-identical to the worktree scan above (pattern parity is the whole point —
+          # two gates with two engines is two different denylists).
+          added=$(printf '%s\n' "$DIFF" | awk '
+            /^\+\+\+ /  { f = substr($0, 7); next }
+            /^@@ /      { m = $3; sub(/^\+/, "", m); split(m, a, ","); ln = a[1] + 0; next }
+            /^\+/       { print f ":" ln ":" substr($0, 2); ln++; next }
+          ')
+
+          set +e
+          out=$(printf '%s\n' "$added" | grep -E "$INTERNAL")
+          rc=$?
+          set -e
+          # grep rc: 0=match, 1=no match, >=2=error. Only 1 is "clean".
+          if [ "$rc" -ge 2 ]; then
+            echo "FAIL: range scan errored (rc=$rc). Not the same as clean."
+            exit 1
+          fi
+
+          allow=$(printf '%s\n' "$out" | grep -F 'leak-scan:allow' || true)
+          hits=$(printf '%s\n' "$out" | grep -Fv 'leak-scan:allow' | grep -v '^$' || true)
+          if [ -n "$allow" ]; then
+            echo "ALLOWLISTED in this range (marker present — re-review each; file:line only):"
+            printf '%s\n' "$allow" | sed -E 's/^([^:]+:[0-9]+):.*/\1/' | sort | uniq -c
+          fi
+          if [ -n "$hits" ]; then
+            echo "INTERNAL REFS ADDED BY THIS PUSH (file:line only — content withheld):"
+            printf '%s\n' "$hits" | sed -E 's/^([^:]+:[0-9]+):.*/\1/' | sort | uniq -c
+            n=$(printf '%s\n' "$hits" | grep -c . || true)
+            echo "FAIL: $n internal reference(s) introduced in $SPEC"
+            echo "      Do NOT 'fix' this by adding a follow-up commit that deletes the line —"
+            echo "      the blob stays public and SHA-addressable. Rewrite the branch before merge."
+            exit 1
+          fi
+          echo "OK: no internal references introduced in $SPEC"

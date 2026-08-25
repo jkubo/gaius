@@ -70,6 +70,11 @@ format-specific retires, then **pending facts** in `facts.db`, then session
 summaries. `--facts` shows only pending facts; `--summaries` skips straight to
 summaries.
 
+`gaius quiz` is the scheduled loop over the same corpus: a weighted draw
+across Leitner boxes, human-only on the mutating path. See [quiz.md](quiz.md).
+The pending queue is not a drain target; quiz converts it into a budgeted
+sitting instead of a FIFO slog.
+
 `show` marks summaries with `★` when they contain signal sections and tags which
 are present: `K` = key concepts, `E` = errors/fixes, `P` = pending tasks.
 

@@ -3,7 +3,8 @@
 Owns load_staged/save_staged (path-traversal-hardened), display_uid, the review
 walk (show/next/done/batch/rescan), the verdict verbs (confirm/reject/defer/
 agent-review — `gaius confirm` is HUMAN-ONLY, the corpus_audit trust anchor),
-and cmd_stats. This is the module the v0.2 Leitner quiz (`gaius quiz`) lands in.
+and cmd_stats. Owns `gaius quiz` (Leitner HITL loop — the legitimate producer
+of `confidence_source='human'`).
 
 Facade convention (see ARCHITECTURE.md): runtime-rebindable / test-patched hub
 paths (STAGING_DIR, PROJECT_DIR, DB_PATH, CORPUS_DIR, MEMORY_DIR) are read at
@@ -13,6 +14,7 @@ monkeypatch them on gaius._core.
 import argparse
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -32,7 +34,51 @@ from gaius.extract import (
     count_domain_hits, tag_domains_from_specs, extract_section,
 )
 from gaius.facts import init_db, upsert_fact
+from gaius.leitner import (
+    box_histogram,
+    draw,
+    grade,
+    item_weight,
+)
 from gaius.scoring import load_domain_stats, BOOTSTRAP_THRESHOLD
+
+# Agent harnesses set these. `gaius quiz` writes confidence_source='human' on
+# confirm, so an agent running it forges the corpus_audit trust anchor.
+_AGENT_ENV = (
+    "GROK_AGENT",
+    "GROK_SESSION_ID",
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+)
+
+# One sitting. Default is 10; the flag had no ceiling, so `--budget` equal to
+# the eligible-corpus size would walk every fact in a single invocation.
+QUIZ_BUDGET_MAX = 50
+
+
+def running_as_agent() -> bool:
+    return any(os.environ.get(k) for k in _AGENT_ENV)
+
+
+def require_human(action: str) -> None:
+    """Refuse mutating confirm/quiz from an agent shell or a non-tty.
+
+    Honest bound (same class as tessera's tty gate): a determined agent can
+    still forge this on a single-uid box. The product is that it is not the
+    default path, and that `gaius agent-review` exists as the machine verb.
+    """
+    if running_as_agent():
+        print(
+            f"gaius {action} is human-only — an agent running it would forge "
+            "confidence_source='human' (corpus_audit trust anchor). "
+            "Use `gaius quiz --report` (read-only) or `gaius agent-review`.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if not sys.stdin.isatty():
+        print(f"gaius {action} requires a tty. Use --report for a read-only summary.",
+              file=sys.stderr)
+        sys.exit(2)
 
 def load_staged() -> dict:
     """Return all staged summaries keyed by uuid."""
@@ -563,8 +609,10 @@ def cmd_confirm(args):
     """Mark a pending fact as confirmed by a human reviewer.
 
     Sets confidence=1.0, confidence_source='human', review_state='confirmed'.
+    Human-only: require_human('confirm') refuses an agent shell or non-tty.
     Usage: gaius confirm <fact-id>
     """
+    require_human("confirm")
     fact_id = _resolve_fact_id(args, 'confirm')
     conn = init_db()
     row = conn.execute("SELECT id, fact_text, domain FROM facts WHERE id = ?", (fact_id,)).fetchone()
@@ -585,8 +633,11 @@ def cmd_reject(args):
 
     Sets review_state='rejected'. The fact is retained in facts.db for audit but
     excluded from inject queries.
+    Human-only: an agent rejecting facts would curate the quiz pool and
+    thereby control which rows can be stamped confidence_source='human'.
     Usage: gaius reject <fact-id>
     """
+    require_human("reject")
     fact_id = _resolve_fact_id(args, 'reject')
     conn = init_db()
     row = conn.execute("SELECT id, fact_text FROM facts WHERE id = ?", (fact_id,)).fetchone()
@@ -656,6 +707,169 @@ def cmd_agent_review(args):
     conn.commit()
     pending = conn.execute("SELECT COUNT(*) FROM facts WHERE review_state='pending'").fetchone()[0]
     print(f"⤷ Agent-reviewed: [{fact_id}] {row['fact_text'][:80]}  |  {pending} pending remaining")
+
+
+def _quiz_eligible(conn) -> list:
+    """Active, non-live, non-rejected facts with Leitner columns filled."""
+    return conn.execute(
+        """
+        SELECT id, fact_text, domain, score, review_state, confidence_source,
+               COALESCE(leitner_box, 0) AS leitner_box,
+               COALESCE(leitner_seen, 0) AS leitner_seen,
+               COALESCE(leitner_correct, 0) AS leitner_correct,
+               COALESCE(leitner_wrong, 0) AS leitner_wrong
+        FROM facts
+        WHERE tombstoned_at IS NULL
+          AND (outcome IS NULL OR outcome != 'rejected')
+          AND COALESCE(fact_type, 'operational') != 'live'
+        """
+    ).fetchall()
+
+
+def _quiz_progress(rows) -> dict:
+    out = {}
+    for r in rows:
+        out[str(r["id"])] = {
+            "b": int(r["leitner_box"] or 0),
+            "n": int(r["leitner_seen"] or 0),
+            "c": int(r["leitner_correct"] or 0),
+            "w": int(r["leitner_wrong"] or 0),
+        }
+    return out
+
+
+def _quiz_write_progress(conn, fact_id: int, rec: dict) -> None:
+    conn.execute(
+        "UPDATE facts SET leitner_box=?, leitner_seen=?, leitner_correct=?, "
+        "leitner_wrong=? WHERE id=?",
+        (rec["b"], rec["n"], rec["c"], rec["w"], fact_id),
+    )
+
+
+def cmd_quiz(args):
+    """Leitner review loop over corpus facts. Human-only when mutating.
+
+    Usage:
+      gaius quiz [--budget N] [--domain D]     interactive (tty, not an agent)
+      gaius quiz --report [--domain D]         read-only calibration summary
+    """
+    parser = argparse.ArgumentParser(
+        prog="gaius quiz",
+        description="Spaced-repetition human review over corpus facts",
+    )
+    parser.add_argument("--budget", type=int, default=10,
+                        help=f"max facts in one sitting (default 10, max {QUIZ_BUDGET_MAX})")
+    parser.add_argument("--domain", default="",
+                        help="restrict to one domain")
+    parser.add_argument("--report", action="store_true",
+                        help="print box histogram + miss rate; do not write")
+    parsed = parser.parse_args(args or [])
+
+    conn = init_db()
+    rows = _quiz_eligible(conn)
+    if parsed.domain:
+        rows = [r for r in rows if r["domain"] == parsed.domain]
+    progress = _quiz_progress(rows)
+
+    if parsed.report:
+        ids = [str(r["id"]) for r in rows]
+        hist = box_histogram(progress, ids)
+        unseen = sum(1 for i in ids if int(progress.get(i, {}).get("n") or 0) == 0)
+        seen = len(ids) - unseen
+        wrong = sum(int(progress[i].get("w") or 0) for i in ids if i in progress)
+        attempts = sum(int(progress[i].get("n") or 0) for i in ids if i in progress)
+        by_domain: dict[str, list[int]] = {}
+        for r in rows:
+            rec = progress[str(r["id"])]
+            n, w = int(rec.get("n") or 0), int(rec.get("w") or 0)
+            if n == 0:
+                continue
+            d = r["domain"] or "?"
+            slot = by_domain.setdefault(d, [0, 0])
+            slot[0] += n
+            slot[1] += w
+        print("gaius quiz — calibration report (read-only)")
+        print(f"  eligible: {len(ids)}  seen: {seen}  unseen: {unseen}")
+        print("  boxes:    " + "  ".join(f"b{i}={n}" for i, n in enumerate(hist)))
+        rate = (wrong / attempts) if attempts else 0.0
+        print(f"  attempts: {attempts}  misses: {wrong}  miss-rate: {rate:.2%}")
+        if by_domain:
+            print("  miss-rate by domain:")
+            for d, (n, w) in sorted(by_domain.items(), key=lambda kv: -kv[1][1] / max(kv[1][0], 1)):
+                print(f"    {d:<22} {w}/{n}  ({w / n:.0%})")
+        return
+
+    require_human("quiz")
+    if parsed.budget < 1:
+        print("--budget must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if parsed.budget > QUIZ_BUDGET_MAX:
+        print(
+            f"--budget must be <= {QUIZ_BUDGET_MAX} (one sitting), got {parsed.budget}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    ids = [str(r["id"]) for r in rows]
+    by_id = {str(r["id"]): r for r in rows}
+    session = draw(ids, progress, k=parsed.budget)
+    if not session:
+        print("No eligible facts to quiz. Run: gaius retire")
+        return
+
+    print(f"gaius quiz — {len(session)} of {len(ids)} eligible  (y=still true, n=reject, s=skip)")
+    print("A miss drops the box to 0. First 'y' writes confidence_source='human'; repeats only move the box.")
+    print()
+
+    answered = 0
+    for item_id in session:
+        row = by_id[item_id]
+        rec = progress[item_id]
+        print("=" * 68)
+        print(f"[{row['domain']}] id={row['id']}  box={rec['b']}  seen={rec['n']}  weight={item_weight(rec)}")
+        print("=" * 68)
+        print("source:")
+        print(row["fact_text"])
+        print()
+        try:
+            raw = input("still true? [y/n/s] ").strip().lower()
+        except EOFError:
+            print("\n(interrupted)")
+            break
+        if raw in ("s", "skip", ""):
+            print("  skipped — box unchanged")
+            continue
+        if raw in ("n", "no"):
+            new = grade(rec, False)
+            _quiz_write_progress(conn, row["id"], new)
+            conn.execute(
+                "UPDATE facts SET review_state='rejected', outcome='rejected' WHERE id=?",
+                (row["id"],),
+            )
+            conn.commit()
+            progress[item_id] = new
+            answered += 1
+            print("  rejected + box 0")
+            continue
+        if raw in ("y", "yes"):
+            new = grade(rec, True)
+            _quiz_write_progress(conn, row["id"], new)
+            # First confirm writes the human anchor. Repeats only move the box —
+            # box promotion must not inflate inject rank by repetition alone.
+            if row["confidence_source"] != "human":
+                conn.execute(
+                    "UPDATE facts SET review_state='confirmed', confidence=1.0, "
+                    "confidence_source='human' WHERE id=?",
+                    (row["id"],),
+                )
+            conn.commit()
+            progress[item_id] = new
+            answered += 1
+            print(f"  confirmed  box {rec['b']} → {new['b']}")
+            continue
+        print("  unrecognized — skipped")
+
+    print(f"\n✓ {answered} verdicts this sitting. `gaius quiz --report` for calibration.")
 
 
 # cmd_kg extracted to gaius/kg.py (2026-06-28); re-imported at bottom of file.

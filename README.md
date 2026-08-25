@@ -33,6 +33,7 @@ pip install gaius-memory
 ```
 gaius retire      # scan sessions → stage summaries
 gaius batch       # (optional) review + correct — facts inject by default
+gaius quiz        # Leitner HITL loop — the only legitimate `confidence_source='human'`
 gaius inject --task "what you're working on"   # inject context into active session
 ```
 
@@ -115,6 +116,7 @@ recovers the recall naive whole-session embedding loses to the 256-token cap: ch
 | Feature | Description |
 |---------|-------------|
 | **Review & correction loop** | `retire → stage → promote` runs unattended and facts inject by default; `reject`/`defer`/`confirm` plus decay, dedup, and mnemosyne health let you *correct* the corpus without a human in the hot path. |
+| **Leitner human review (`gaius quiz`)** | Spaced-repetition boxes over corpus facts. The only legitimate producer of `confidence_source='human'`; `--report` is the calibration view (disagreement-rate by domain). Agents are refused on the mutating path. |
 | **Multi-agent corroboration** | Facts confirmed by multiple AI agents (Claude + Gemini) get a 1.5× score boost. Cross-model verification for higher confidence. |
 | **Session-type behavioral priming** | Load different skill sets based on what you're doing: ops, trading, security, code review. |
 | **Hard enforcement gates** | Memory that *prevents actions*. `exit:2` blocks force-push, live trading without confirmation, critical resource deletion. |

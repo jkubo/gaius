@@ -193,3 +193,131 @@ def test_stdio_lifecycle_across_two_session_uuids(tmp_path):
     assert {event[1] for event in events} == {"mcp"}
     assert {event[2] for event in events} == set(uuids)
     assert {event[0] for event in events} >= {"gaius_stats", "gaius_fact_add"}
+
+
+CONCURRENT_FACT = (
+    "The queue drain interval is forty seconds in the concurrent profile."
+)
+STATS_PER_BATCH = 20
+CONCURRENT_BATCHES = 3
+
+
+def _input_schema(tool) -> dict:
+    schema = _first_attr(tool, "input_schema", "inputSchema")
+    assert isinstance(schema, dict), schema
+    return schema
+
+
+def _assert_registered_schemas(by_name):
+    """Names, required fields, and defaults survive the async registration adapter."""
+    stats = _input_schema(by_name["gaius_stats"])
+    assert not stats.get("required"), stats
+
+    search = _input_schema(by_name["gaius_search"])
+    assert search["properties"]["domain"]["default"] == ""
+    assert search["properties"]["limit"]["default"] == 10
+    assert "query" in search["required"]
+
+    fact = _input_schema(by_name["gaius_fact_add"])
+    assert fact["properties"]["source"]["default"] == "session"
+    assert fact["properties"]["fact_type"]["default"] == "operational"
+    assert set(fact["required"]) == {"fact_text", "domain"}
+
+
+async def _concurrent_stdio_batches(db_path: Path, telemetry_path: Path, session_uuid: str, fact_text: str):
+    """Three batches of parallel stdio calls on one ClientSession."""
+    env = _child_env(db_path.parent / f"scratch-{session_uuid}", db_path, telemetry_path, session_uuid)
+    server = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "gaius.mcp_server"],
+        env=env,
+        cwd=str(REPO),
+    )
+    fact_results = []
+    async with stdio_client(server) as streams:
+        async with ClientSession(*streams) as session:
+            init = await session.initialize()
+            assert _first_attr(init, "server_info", "serverInfo").name == "gaius"
+
+            listed = await session.list_tools()
+            by_name = {tool.name: tool for tool in listed.tools}
+            assert set(by_name) == TOOL_NAMES
+            _assert_registered_schemas(by_name)
+
+            async def _stats():
+                result = await session.call_tool("gaius_stats", {})
+                assert not _tool_failed(result), _tool_text(result)
+                assert "facts" in _tool_text(result).lower()
+
+            async def _add():
+                result = await session.call_tool(
+                    "gaius_fact_add",
+                    {"fact_text": fact_text, "domain": "general", "source": ""},
+                )
+                assert not _tool_failed(result), _tool_text(result)
+                text = _tool_text(result)
+                assert "reject" not in text.lower()
+                return text
+
+            for _batch in range(CONCURRENT_BATCHES):
+                outcomes = await asyncio.gather(
+                    *(_stats() for _ in range(STATS_PER_BATCH)),
+                    _add(),
+                )
+                fact_results.append(outcomes[-1])
+    return fact_results
+
+
+def test_concurrent_stdio_records_every_telemetry_row(tmp_path):
+    """Parallel read and fact calls each keep a source=mcp row for this session UUID.
+
+    A sequential probe misses the SDK 2 worker-thread dispatch. Empty source on
+    fact_add falls through to GAIUS_SESSION_UUID, and the three serial batches
+    make the confirmation count exact.
+    """
+    from gaius.facts import init_db
+
+    db_path = tmp_path / "facts.db"
+    telemetry_path = tmp_path / "telemetry.db"
+    init_db(db_path).close()
+    session_uuid = "mcp-session-concurrent"
+
+    fact_results = asyncio.run(
+        asyncio.wait_for(
+            _concurrent_stdio_batches(db_path, telemetry_path, session_uuid, CONCURRENT_FACT),
+            timeout=90,
+        )
+    )
+
+    assert len(fact_results) == CONCURRENT_BATCHES
+    assert "Fact recorded" in fact_results[0]
+    assert "confirmations: 2" in fact_results[1]
+    assert "confirmations: 3" in fact_results[2]
+
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT agents, sessions, confirmation_count, source FROM facts WHERE fact_text = ?",
+            (CONCURRENT_FACT,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None, "fact_add did not write the temporary database"
+    assert json.loads(row[0]) == ["mcp-compat"]
+    assert json.loads(row[1]) == [session_uuid]
+    assert row[2] == CONCURRENT_BATCHES
+    assert row[3] == ""
+
+    expected = CONCURRENT_BATCHES * (STATS_PER_BATCH + 1)
+    telem = sqlite3.connect(telemetry_path)
+    try:
+        events = telem.execute(
+            "SELECT tool_name, source, session_id FROM tool_events ORDER BY id"
+        ).fetchall()
+    finally:
+        telem.close()
+    assert len(events) == expected, events
+    assert {event[1] for event in events} == {"mcp"}
+    assert {event[2] for event in events} == {session_uuid}
+    assert [event[0] for event in events].count("gaius_stats") == CONCURRENT_BATCHES * STATS_PER_BATCH
+    assert [event[0] for event in events].count("gaius_fact_add") == CONCURRENT_BATCHES

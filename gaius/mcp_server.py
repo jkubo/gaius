@@ -99,7 +99,14 @@ _plain_tool = mcp.tool
 
 
 def _observed_tool(*t_args, **t_kwargs):
-    """Wrap the server tool decorator so each call is logged to telemetry."""
+    """Wrap the server tool decorator so each call is logged to telemetry.
+
+    SDK 2 runs a synchronous tool on a worker thread. Telemetry keeps one
+    sqlite connection with default thread affinity, so those calls drop
+    events. Register a native async adapter that calls the sync helper
+    inline on the event-loop thread. Return that helper so direct Python
+    calls stay synchronous.
+    """
     register = _plain_tool(*t_args, **t_kwargs)
 
     def _register(fn):
@@ -122,7 +129,12 @@ def _observed_tool(*t_args, **t_kwargs):
                 pass  # telemetry must never break an MCP tool call
             return fn(*args, **kwargs)
 
-        return register(wrapped)
+        @functools.wraps(wrapped)
+        async def registered(*args, **kwargs):
+            return wrapped(*args, **kwargs)
+
+        register(registered)
+        return wrapped
 
     return _register
 

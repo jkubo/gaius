@@ -15,6 +15,7 @@ Tools (write):
   gaius_fact_add       — record a fact during session (direct to facts.db, skips staging)
 """
 
+import importlib
 import json
 import math
 import os
@@ -25,7 +26,20 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from mcp.server.fastmcp import FastMCP
+# SDK 2 publishes MCPServer on mcp.server. SDK 1 does not; its server class
+# stays mcp.server.fastmcp.FastMCP. Import the package first so a missing
+# dependency or a missing mcp install raises. Only the absent MCPServer
+# attribute selects the SDK 1 class. Do not alias FastMCP to MCPServer and
+# do not patch sdk modules in memory.
+_mcp_server_api = importlib.import_module("mcp.server")
+if hasattr(_mcp_server_api, "MCPServer"):
+    from mcp.server import MCPServer
+
+    _Server = MCPServer
+else:
+    from mcp.server.fastmcp import FastMCP
+
+    _Server = FastMCP
 
 # ── Import gaius internals ───────────────────────────────────────────────────
 # When run as `python3 -m gaius.mcp_server` or installed via pip, gaius is
@@ -62,7 +76,7 @@ def _get_db():
 
 # ── MCP Server ───────────────────────────────────────────────────────────────
 
-mcp = FastMCP("gaius", instructions="""
+mcp = _Server("gaius", instructions="""
 gaius is an ops memory lifecycle manager for AI coding agents.
 It stores facts extracted from past Claude Code and Gemini CLI sessions.
 Use gaius_search to find relevant facts by meaning (semantic) or keywords.
@@ -85,7 +99,14 @@ _plain_tool = mcp.tool
 
 
 def _observed_tool(*t_args, **t_kwargs):
-    """Drop-in replacement for FastMCP.tool() that logs each call to telemetry."""
+    """Wrap the server tool decorator so each call is logged to telemetry.
+
+    SDK 2 runs a synchronous tool on a worker thread. Telemetry keeps one
+    sqlite connection with default thread affinity, so those calls drop
+    events. Register a native async adapter that calls the sync helper
+    inline on the event-loop thread. Return that helper so direct Python
+    calls stay synchronous.
+    """
     register = _plain_tool(*t_args, **t_kwargs)
 
     def _register(fn):
@@ -108,7 +129,12 @@ def _observed_tool(*t_args, **t_kwargs):
                 pass  # telemetry must never break an MCP tool call
             return fn(*args, **kwargs)
 
-        return register(wrapped)
+        @functools.wraps(wrapped)
+        async def registered(*args, **kwargs):
+            return wrapped(*args, **kwargs)
+
+        register(registered)
+        return wrapped
 
     return _register
 
@@ -486,7 +512,7 @@ def main():
     `uvx --from gaius-memory[mcp] gaius-mcp`, which is how the Claude Code
     plugin's .mcp.json starts it.
     """
-    mcp.run()
+    mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":
